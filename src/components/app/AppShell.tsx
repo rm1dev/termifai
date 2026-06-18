@@ -2271,7 +2271,6 @@ function HostsList({
             <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}</div>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <span className="rounded border border-border px-1.5 py-0.5">{h.os}</span>
             <button
               title="Edit"
               onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
@@ -2287,6 +2286,7 @@ function HostsList({
               <Trash2 className="h-3.5 w-3.5" />
             </button>
             <PanelRightOpen className="h-4 w-4 opacity-0 transition-opacity group-hover:opacity-100" />
+            <span className="rounded border border-border px-1.5 py-0.5">{h.os}</span>
           </div>
         </div>
       ))}
@@ -2454,6 +2454,7 @@ function HostModal({
   const [password, setPassword] = useState(host?.password ?? "");
   const [showPass, setShowPass] = useState(false);
   const [sshKeyId, setSshKeyId] = useState<string | null>(host?.sshKeyId ?? null);
+  const [os, setOs] = useState<import("./types").OsKind>(host?.os ?? "ubuntu");
   const [groupId, setGroupId] = useState<string | null>(host?.groupId ?? defaultGroupId);
   const [tags, setTags] = useState<string[]>(host?.tags ?? []);
   const [tagInput, setTagInput] = useState("");
@@ -2549,6 +2550,21 @@ function HostModal({
                 dir="ltr"
                 className="h-8 w-16 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
               />
+            </HostModalRow>
+            <HostModalRow label="OS">
+              <select
+                value={os}
+                onChange={(e) => setOs(e.target.value as import("./types").OsKind)}
+                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+              >
+                <option value="ubuntu">Ubuntu</option>
+                <option value="debian">Debian</option>
+                <option value="centos">CentOS</option>
+                <option value="alpine">Alpine</option>
+                <option value="macos">macOS</option>
+                <option value="windows">Windows</option>
+                <option value="other">Other</option>
+              </select>
             </HostModalRow>
           </div>
           <div className="px-4 pb-2 pt-1.5">
@@ -2685,7 +2701,7 @@ function HostModal({
                 hostname: hostname.trim(),
                 port,
                 user: user.trim(),
-                os: "ubuntu",
+                os,
                 groupId,
                 tags,
                 password,

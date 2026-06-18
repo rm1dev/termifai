@@ -45,6 +45,7 @@ pub enum OsKind {
     Alpine,
     Macos,
     Windows,
+    Other,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
