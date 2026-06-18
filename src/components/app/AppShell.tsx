@@ -2893,15 +2893,23 @@ function SshKeysView() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showGenerate, setShowGenerate] = useState(false);
   const [removing, setRemoving] = useState<string[] | null>(null);
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [viewMode, setViewMode] = useState<"grid" | "list">(() => {
+    const saved = localStorage.getItem("sshkeys-view-mode");
+    return saved === "list" ? "list" : "grid";
+  });
   const [viewOpen, setViewOpen] = useState(false);
-  const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
+  const [sortDir, setSortDir] = useState<"desc" | "asc">(() => {
+    const saved = localStorage.getItem("sshkeys-sort-dir");
+    return saved === "asc" ? "asc" : "desc";
+  });
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
   const [sshKeyError, setSshKeyError] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
+  useEffect(() => { localStorage.setItem("sshkeys-view-mode", viewMode); }, [viewMode]);
+  useEffect(() => { localStorage.setItem("sshkeys-sort-dir", sortDir); }, [sortDir]);
   useEffect(() => {
     let cancelled = false;
 
