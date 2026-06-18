@@ -1,4 +1,4 @@
-export type OsKind = "ubuntu" | "debian" | "centos" | "alpine" | "macos" | "windows";
+export type OsKind = "ubuntu" | "debian" | "centos" | "alpine" | "macos" | "windows" | "other";
 
 export interface Host {
   id: string;
