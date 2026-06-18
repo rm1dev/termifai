@@ -14,6 +14,7 @@ export interface Host {
   password?: string;
   sshKeyId?: string | null;
   showStatusInDashboard?: boolean;
+  workingDirectory?: string;
   defaultSftpPath?: string;
 }
 
@@ -40,6 +41,12 @@ export interface AppTab {
   title: string;
   closable: boolean;
   sessionId?: string; // for terminal tabs to preserve session across switches
+  initialCommand?: string;
+  initialPassword?: string;
+  readyMarker?: string;
+  connectionLabel?: string;
+  connectionTitle?: string;
+  hostId?: string; // present for SSH host tabs — used to distinguish from local terminal
 }
 
 export interface Snippet {

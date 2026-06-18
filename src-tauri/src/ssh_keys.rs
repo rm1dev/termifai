@@ -211,6 +211,18 @@ pub fn remove_ssh_keys(app: &AppHandle, ids: Vec<String>) -> Result<(), String> 
     Ok(())
 }
 
+pub fn private_key_path(app: &AppHandle, id: &str) -> Result<String, String> {
+    if !is_valid_key_id(id) {
+        return Err("Invalid SSH key id".to_string());
+    }
+
+    let contents = fs::read_to_string(metadata_path(app, id)?)
+        .map_err(|e| format!("Failed to read SSH key metadata: {}", e))?;
+    let key: SshKey = serde_json::from_str(&contents)
+        .map_err(|e| format!("Failed to parse SSH key metadata: {}", e))?;
+    Ok(key.private_key_path)
+}
+
 fn build_key_metadata(
     id: String,
     name: String,

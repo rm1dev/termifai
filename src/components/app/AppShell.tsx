@@ -47,7 +47,6 @@ import {
   
   Gauge,
 } from "lucide-react";
-import { sampleHosts } from "./data";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -130,6 +129,48 @@ export function AppShell() {
     const title =
       kind === "terminal" ? "Local Terminal" : kind === "sftp" ? "SFTP" : "Hosts";
     setTabs((t) => [...t, { id, kind, title, closable: true }]);
+    setActiveTab(id);
+  };
+  const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const openSshTerminal = async (host: Host) => {
+    const id = `t-ssh-${host.id}-${Date.now()}`;
+    let keyArg = "";
+    if (host.sshKeyId) {
+      try {
+        const keys = await invoke<SshKey[]>("list_ssh_keys");
+        const key = keys.find((item) => item.id === host.sshKeyId);
+        if (key?.privateKeyPath) keyArg = ` -i ${shellQuote(key.privateKeyPath)}`;
+      } catch {
+        /* SSH can still use agent/default keys. */
+      }
+    }
+    const portArg = host.port && host.port !== 22 ? ` -p ${host.port}` : "";
+    const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
+    const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
+    const remoteBootstrap = `printf '${readyMarker}\\n'; ${cdPart}exec ` + "${SHELL:-/bin/sh}" + " -i";
+    const command = `ssh -v -tt${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+
+    // Count existing tabs for this host to generate a numbered title
+    const baseTitle = host.name || host.hostname;
+    setTabs((currentTabs) => {
+      const existingCount = currentTabs.filter((t) => t.hostId === host.id).length;
+      const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
+      return [
+        ...currentTabs,
+        {
+          id,
+          kind: "terminal",
+          title,
+          closable: true,
+          initialCommand: command,
+          initialPassword: host.password,
+          readyMarker,
+          connectionLabel: `${host.user}@${host.hostname}:${host.port}`,
+          connectionTitle: host.name || host.hostname,
+          hostId: host.id,
+        },
+      ];
+    });
     setActiveTab(id);
   };
 
@@ -282,6 +323,12 @@ export function AppShell() {
             >
               <XTerminal
                 sessionId={t.sessionId}
+                initialCommand={t.initialCommand}
+                initialPassword={t.initialPassword}
+                readyMarker={t.readyMarker}
+                connectionLabel={t.connectionLabel}
+                connectionTitle={t.connectionTitle}
+                onClose={() => closeTab(t.id)}
                 onSessionCreated={(sid) => updateTabSession(t.id, sid)}
               />
             </div>
@@ -301,7 +348,7 @@ export function AppShell() {
                 <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
                 <main className="flex min-w-0 flex-1 flex-col">
                   {activeSidebar === "dashboard" && <DashboardView />}
-                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={() => newTab("sftp")} />}
+                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={() => newTab("sftp")} onConnectHost={(host) => void openSshTerminal(host)} />}
                   {activeSidebar === "port-forwarding" && <PortForwardingView />}
                   {activeSidebar === "snippets" && <SnippetsView />}
                   {activeSidebar === "ssh-keys" && <SshKeysView />}
@@ -445,10 +492,12 @@ const BaseTabChip = forwardRef<HTMLDivElement, BaseTabChipProps>(function BaseTa
   };
 
   const icon =
-    tab.kind === "terminal" ? (
+    tab.kind === "terminal" && tab.hostId ? (
+      <Server className="h-3.5 w-3.5 text-[var(--color-brand-orange)]" />
+    ) : tab.kind === "terminal" ? (
       <TerminalSquare className="h-3.5 w-3.5 text-[var(--color-brand-green)]" />
     ) : tab.kind === "sftp" ? (
-      <Folder className="h-3.5 w-3.5 text-muted-foreground" />
+      <Folder className="h-3.5 w-3.5 text-[var(--color-brand-cyan)]" />
     ) : (
       <LayoutGrid className="h-3.5 w-3.5 text-muted-foreground" />
     );
@@ -1693,35 +1742,128 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
 
 /* ---------------- Hosts view ---------------- */
 
-function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; onNewSftp?: () => void }) {
+function HostsView({
+  onNewTerminal,
+  onNewSftp,
+  onConnectHost,
+}: {
+  onNewTerminal?: () => void;
+  onNewSftp?: () => void;
+  onConnectHost: (host: Host) => void;
+}) {
   const [query, setQuery] = useState("");
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
-  const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
+  const [viewMode, setViewMode] = useState<"grid" | "list">(() => {
+    const saved = localStorage.getItem("hosts-view-mode");
+    return saved === "list" ? "list" : "grid";
+  });
+  const [sortDir, setSortDir] = useState<"desc" | "asc">(() => {
+    const saved = localStorage.getItem("hosts-sort-dir");
+    return saved === "asc" ? "asc" : "desc";
+  });
   const [viewOpen, setViewOpen] = useState(false);
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [tagMenuOpen, setTagMenuOpen] = useState(false);
 
-  const [hosts, setHosts] = useState<Host[]>(sampleHosts);
+  const [hosts, setHosts] = useState<Host[]>([]);
   const [groups, setGroups] = useState<HostGroup[]>([]);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [loading, setLoading] = useState(true);
+  const [hostsError, setHostsError] = useState<string | null>(null);
 
   const [hostModal, setHostModal] = useState<{ open: boolean; groupId: string | null }>({ open: false, groupId: null });
-  const [groupModal, setGroupModal] = useState<{ open: boolean; parentId: string | null }>({ open: false, parentId: null });
+  const [editingHost, setEditingHost] = useState<Host | null>(null);
+  const [groupModal, setGroupModal] = useState<{ open: boolean; parentId: string | null; group?: HostGroup | null }>({ open: false, parentId: null, group: null });
+  const [removingHostId, setRemovingHostId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    invoke<{ hosts: Host[]; groups: HostGroup[] }>("list_hosts")
+      .then((vault) => {
+        if (!cancelled) {
+          setHosts(vault.hosts);
+          setGroups(vault.groups);
+          setHostsError(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setHostsError(String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("hosts-view-mode", viewMode);
+  }, [viewMode]);
+
+  useEffect(() => {
+    localStorage.setItem("hosts-sort-dir", sortDir);
+  }, [sortDir]);
 
   const toggleCollapse = (id: string) =>
     setCollapsed((c) => ({ ...c, [id]: !c[id] }));
 
-  const addGroup = (name: string, parentId: string | null) => {
-    const id = `g-${Date.now()}`;
-    setGroups((g) => [...g, { id, name, parentId }]);
+  const upsertGroup = async (name: string, parentId: string | null, id?: string) => {
+    try {
+      const group = await invoke<HostGroup>("save_host_group", {
+        request: { id: id ?? null, name, parentId },
+      });
+      setGroups((curr) => [group, ...curr.filter((item) => item.id !== group.id)]);
+      setHostsError(null);
+      setGroupModal({ open: false, parentId: null, group: null });
+    } catch (err) {
+      setHostsError(String(err));
+    }
   };
-  const addHost = (h: Omit<Host, "id">) => {
-    const id = `h-${Date.now()}`;
-    setHosts((hs) => [{ ...h, id, lastUsed: new Date().toISOString() }, ...hs]);
+  const upsertHost = async (h: Omit<Host, "id">, id?: string) => {
+    try {
+      const host = await invoke<Host>("save_host", { request: { ...h, id: id ?? null } });
+      setHosts((curr) => [host, ...curr.filter((item) => item.id !== host.id)]);
+      setHostsError(null);
+      setHostModal({ open: false, groupId: null });
+      setEditingHost(null);
+    } catch (err) {
+      setHostsError(String(err));
+    }
+  };
+  const removeHost = async (id: string) => {
+    try {
+      await invoke("remove_hosts", { ids: [id] });
+      setHosts((curr) => curr.filter((host) => host.id !== id));
+      setHostsError(null);
+      toast.success("Host deleted");
+    } catch (err) {
+      setHostsError(String(err));
+      toast.error("Delete host failed", { description: String(err) });
+    }
+  };
+  const removeGroup = async (id: string) => {
+    try {
+      await invoke("remove_host_group", { id });
+      const descendants = descendantGroupIds(groups, id);
+      setGroups((curr) => curr.filter((group) => group.id !== id && !descendants.includes(group.id)));
+      setHosts((curr) =>
+        curr.filter((host) => !host.groupId || (host.groupId !== id && !descendants.includes(host.groupId)))
+      );
+      setHostsError(null);
+      toast.success("Group deleted");
+    } catch (err) {
+      setHostsError(String(err));
+      toast.error("Delete group failed", { description: String(err) });
+    }
   };
 
   const filteredHosts = hosts
     .filter((h) =>
       `${h.name} ${h.user}@${h.hostname}`.toLowerCase().includes(query.toLowerCase()),
     )
+    .filter((h) => !tagFilter || (h.tags ?? []).includes(tagFilter))
     .sort((a, b) => {
       const da = a.lastUsed ? new Date(a.lastUsed).getTime() : 0;
       const db = b.lastUsed ? new Date(b.lastUsed).getTime() : 0;
@@ -1730,6 +1872,7 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
 
   const rootHosts = filteredHosts.filter((h) => !h.groupId);
   const rootGroups = groups.filter((g) => !g.parentId);
+  const connectTarget = filteredHosts[0] ?? null;
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
@@ -1745,7 +1888,8 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
           />
         </div>
         <button
-          disabled={!query}
+          disabled={!query.trim() || !connectTarget}
+          onClick={() => query.trim() && connectTarget && onConnectHost(connectTarget)}
           className="h-9 rounded-md border border-border bg-[var(--color-surface)] px-4 text-sm font-medium text-muted-foreground disabled:cursor-not-allowed disabled:opacity-60 hover:enabled:bg-[var(--color-surface-2)] hover:enabled:text-foreground"
         >
           Connect
@@ -1799,7 +1943,43 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
             )}
           </div>
 
-          <IconButton icon={<Tag className="h-4 w-4" />} title="Tags" />
+          <div className="relative">
+            <button
+              onClick={() => setTagMenuOpen((v) => !v)}
+              className={[
+                "flex h-7 w-7 items-center justify-center rounded-md hover:bg-[var(--color-surface-2)] hover:text-foreground",
+                tagFilter ? "text-foreground" : "text-muted-foreground",
+              ].join(" ")}
+              title="Filter by tag"
+            >
+              <Tag className="h-4 w-4" />
+            </button>
+            {tagMenuOpen && (
+              <div
+                className="absolute right-0 top-full z-30 mt-1 w-44 overflow-hidden rounded-lg border border-border bg-popover shadow-2xl"
+                onMouseLeave={() => setTagMenuOpen(false)}
+              >
+                <button
+                  onClick={() => { setTagFilter(null); setTagMenuOpen(false); }}
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[var(--color-surface-2)] ${!tagFilter ? "text-foreground font-medium" : "text-muted-foreground"}`}
+                >
+                  All tags
+                </button>
+                {Array.from(new Set(hosts.flatMap((h) => h.tags ?? []))).sort().map((tag) => (
+                  <button
+                    key={tag}
+                    onClick={() => { setTagFilter(tag); setTagMenuOpen(false); }}
+                    className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[var(--color-surface-2)] ${tagFilter === tag ? "text-foreground font-medium" : "text-muted-foreground"}`}
+                  >
+                    {tag}
+                  </button>
+                ))}
+                {hosts.every((h) => !(h.tags ?? []).length) && (
+                  <div className="px-3 py-2 text-xs text-muted-foreground">No tags defined</div>
+                )}
+              </div>
+            )}
+          </div>
           <button
             onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}
             className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
@@ -1812,47 +1992,92 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-4">
+        {hostsError && (
+          <div className="mb-3 rounded-md border border-[oklch(0.55_0.2_25)]/40 bg-[oklch(0.55_0.2_25)]/10 px-3 py-2 text-xs text-[oklch(0.72_0.18_25)]">
+            {hostsError}
+          </div>
+        )}
         <h2 className="mb-3 text-sm font-semibold text-foreground">Hosts</h2>
 
-        {/* Root-level groups (recursive) */}
-        {rootGroups.map((g) => (
-          <GroupNode
-            key={g.id}
-            group={g}
-            depth={0}
-            groups={groups}
-            hosts={filteredHosts}
-            viewMode={viewMode}
-            collapsed={collapsed}
-            onToggle={toggleCollapse}
-            onAddSubgroup={(parentId) => setGroupModal({ open: true, parentId })}
-            onAddHost={(groupId) => setHostModal({ open: true, groupId })}
-          />
-        ))}
+        {loading ? (
+          <div className="flex min-h-40 items-center justify-center text-sm text-muted-foreground">
+            Loading hosts…
+          </div>
+        ) : hosts.length === 0 && groups.length === 0 && !query ? (
+          <div className="flex min-h-80 flex-col items-center justify-center px-6 text-center">
+            <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-[var(--color-surface-2)]">
+              <Server className="h-9 w-9 text-muted-foreground" strokeWidth={1.5} />
+            </div>
+            <h3 className="mt-5 text-base font-semibold text-foreground">Create host</h3>
+            <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+              Add SSH hosts and organize them into groups for quick terminal and SFTP access.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Root-level groups (recursive) */}
+            {rootGroups.map((g) => (
+              <GroupNode
+                key={g.id}
+                group={g}
+                depth={0}
+                groups={groups}
+                hosts={filteredHosts}
+                viewMode={viewMode}
+                collapsed={collapsed}
+                onToggle={toggleCollapse}
+                onAddSubgroup={(parentId) => setGroupModal({ open: true, parentId, group: null })}
+                onAddHost={(groupId) => setHostModal({ open: true, groupId })}
+                onEditGroup={(group) => setGroupModal({ open: true, parentId: group.parentId, group })}
+                onDeleteGroup={removeGroup}
+                onEditHost={setEditingHost}
+                onDeleteHost={setRemovingHostId}
+                onConnectHost={onConnectHost}
+              />
+            ))}
 
-        {/* Root-level hosts */}
-        <HostsList hosts={rootHosts} viewMode={viewMode} query={query} />
+            {/* Root-level hosts */}
+            <HostsList
+              hosts={rootHosts}
+              viewMode={viewMode}
+              query={query}
+              onConnectHost={onConnectHost}
+              onEditHost={setEditingHost}
+              onDeleteHost={setRemovingHostId}
+            />
+          </>
+        )}
       </div>
 
-      {hostModal.open && (
+      {(hostModal.open || editingHost) && (
         <HostModal
           groups={groups}
-          defaultGroupId={hostModal.groupId}
-          onClose={() => setHostModal({ open: false, groupId: null })}
-          onSubmit={(h) => {
-            addHost(h);
+          existingTags={Array.from(new Set(hosts.flatMap((host) => host.tags ?? []))).sort()}
+          defaultGroupId={editingHost?.groupId ?? hostModal.groupId}
+          host={editingHost}
+          onClose={() => {
             setHostModal({ open: false, groupId: null });
+            setEditingHost(null);
           }}
+          onSubmit={(h) => void upsertHost(h, editingHost?.id)}
         />
       )}
       {groupModal.open && (
         <GroupModal
           groups={groups}
           defaultParentId={groupModal.parentId}
-          onClose={() => setGroupModal({ open: false, parentId: null })}
-          onSubmit={(name, parentId) => {
-            addGroup(name, parentId);
-            setGroupModal({ open: false, parentId: null });
+          group={groupModal.group}
+          onClose={() => setGroupModal({ open: false, parentId: null, group: null })}
+          onSubmit={(name, parentId) => void upsertGroup(name, parentId, groupModal.group?.id)}
+        />
+      )}
+      {removingHostId && (
+        <RemoveHostModal
+          hostName={hosts.find((h) => h.id === removingHostId)?.name || hosts.find((h) => h.id === removingHostId)?.hostname || "this host"}
+          onClose={() => setRemovingHostId(null)}
+          onConfirm={() => {
+            void removeHost(removingHostId);
+            setRemovingHostId(null);
           }}
         />
       )}
@@ -1862,7 +2087,7 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
 
 /* ---- Group rendering (recursive) ---- */
 function GroupNode({
-  group, depth, groups, hosts, viewMode, collapsed, onToggle, onAddSubgroup, onAddHost,
+  group, depth, groups, hosts, viewMode, collapsed, onToggle, onAddSubgroup, onAddHost, onEditGroup, onDeleteGroup, onEditHost, onDeleteHost, onConnectHost,
 }: {
   group: HostGroup;
   depth: number;
@@ -1873,6 +2098,11 @@ function GroupNode({
   onToggle: (id: string) => void;
   onAddSubgroup: (parentId: string) => void;
   onAddHost: (groupId: string) => void;
+  onEditGroup: (group: HostGroup) => void;
+  onDeleteGroup: (id: string) => void;
+  onEditHost: (host: Host) => void;
+  onDeleteHost: (id: string) => void;
+  onConnectHost: (host: Host) => void;
 }) {
   const isOpen = !collapsed[group.id];
   const children = groups.filter((g) => g.parentId === group.id);
@@ -1907,6 +2137,20 @@ function GroupNode({
           >
             <FolderPlus className="h-3.5 w-3.5" />
           </button>
+          <button
+            title="Edit group"
+            onClick={() => onEditGroup(group)}
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+          >
+            <Settings className="h-3.5 w-3.5" />
+          </button>
+          <button
+            title="Delete group"
+            onClick={() => onDeleteGroup(group.id)}
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-[oklch(0.72_0.18_25)]"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
 
@@ -1924,10 +2168,22 @@ function GroupNode({
               onToggle={onToggle}
               onAddSubgroup={onAddSubgroup}
               onAddHost={onAddHost}
+              onEditGroup={onEditGroup}
+              onDeleteGroup={onDeleteGroup}
+              onEditHost={onEditHost}
+              onDeleteHost={onDeleteHost}
+              onConnectHost={onConnectHost}
             />
           ))}
           {groupHosts.length > 0 && (
-            <HostsList hosts={groupHosts} viewMode={viewMode} query="" />
+            <HostsList
+              hosts={groupHosts}
+              viewMode={viewMode}
+              query=""
+              onConnectHost={onConnectHost}
+              onEditHost={onEditHost}
+              onDeleteHost={onDeleteHost}
+            />
           )}
         </div>
       )}
@@ -1935,7 +2191,21 @@ function GroupNode({
   );
 }
 
-function HostsList({ hosts, viewMode, query }: { hosts: Host[]; viewMode: "grid" | "list"; query: string }) {
+function HostsList({
+  hosts,
+  viewMode,
+  query,
+  onConnectHost,
+  onEditHost,
+  onDeleteHost,
+}: {
+  hosts: Host[];
+  viewMode: "grid" | "list";
+  query: string;
+  onConnectHost: (host: Host) => void;
+  onEditHost: (host: Host) => void;
+  onDeleteHost: (id: string) => void;
+}) {
   if (hosts.length === 0 && query) {
     return (
       <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
@@ -1949,17 +2219,37 @@ function HostsList({ hosts, viewMode, query }: { hosts: Host[]; viewMode: "grid"
     return (
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         {hosts.map((h) => (
-          <button
+          <div
             key={h.id}
-            className="group flex items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
+            role="button"
+            tabIndex={0}
+            onClick={() => onConnectHost(h)}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onConnectHost(h); } }}
+            className="group flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
           >
             <OsBadge os={h.os} />
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-medium text-foreground">{h.name}</div>
               <div className="truncate text-xs text-muted-foreground">ssh, {h.user}</div>
             </div>
-            <PanelRightOpen className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-          </button>
+            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+              <button
+                title="Edit"
+                onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
+                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-foreground"
+              >
+                <Settings className="h-3.5 w-3.5" />
+              </button>
+              <button
+                title="Delete"
+                onClick={(e) => { e.stopPropagation(); onDeleteHost(h.id); }}
+                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-[oklch(0.72_0.18_25)]"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+              <PanelRightOpen className="h-4 w-4 text-muted-foreground" />
+            </div>
+          </div>
         ))}
       </div>
     );
@@ -1967,9 +2257,13 @@ function HostsList({ hosts, viewMode, query }: { hosts: Host[]; viewMode: "grid"
   return (
     <div className="flex flex-col gap-2">
       {hosts.map((h) => (
-        <button
+        <div
           key={h.id}
-          className="group flex items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
+          role="button"
+          tabIndex={0}
+          onClick={() => onConnectHost(h)}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onConnectHost(h); } }}
+          className="group flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
         >
           <OsBadge os={h.os} />
           <div className="min-w-0 flex-1">
@@ -1978,9 +2272,23 @@ function HostsList({ hosts, viewMode, query }: { hosts: Host[]; viewMode: "grid"
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
             <span className="rounded border border-border px-1.5 py-0.5">{h.os}</span>
+            <button
+              title="Edit"
+              onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
+              className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-foreground group-hover:opacity-100"
+            >
+              <Settings className="h-3.5 w-3.5" />
+            </button>
+            <button
+              title="Delete"
+              onClick={(e) => { e.stopPropagation(); onDeleteHost(h.id); }}
+              className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-[oklch(0.72_0.18_25)] group-hover:opacity-100"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
             <PanelRightOpen className="h-4 w-4 opacity-0 transition-opacity group-hover:opacity-100" />
           </div>
-        </button>
+        </div>
       ))}
     </div>
   );
@@ -1998,20 +2306,39 @@ function groupPath(groups: HostGroup[], id: string | null): string {
   return parts.join(" › ");
 }
 
+function descendantGroupIds(groups: HostGroup[], id: string): string[] {
+  const descendants: string[] = [];
+  const stack = [id];
+
+  while (stack.length > 0) {
+    const parentId = stack.pop()!;
+    groups
+      .filter((group) => group.parentId === parentId)
+      .forEach((group) => {
+        descendants.push(group.id);
+        stack.push(group.id);
+      });
+  }
+
+  return descendants;
+}
+
 /* ---- Modal: New Group ---- */
 function GroupModal({
-  groups, defaultParentId, onClose, onSubmit,
+  groups, defaultParentId, group, onClose, onSubmit,
 }: {
   groups: HostGroup[];
   defaultParentId: string | null;
+  group?: HostGroup | null;
   onClose: () => void;
   onSubmit: (name: string, parentId: string | null) => void;
 }) {
-  const [name, setName] = useState("");
-  const [parentId, setParentId] = useState<string | null>(defaultParentId);
+  const [name, setName] = useState(group?.name ?? "");
+  const [parentId, setParentId] = useState<string | null>(group?.parentId ?? defaultParentId);
+  const invalidParentIds = group ? [group.id, ...descendantGroupIds(groups, group.id)] : [];
 
   return (
-    <ModalShell title="New group" onClose={onClose}>
+    <ModalShell title={group ? "Edit group" : "New group"} onClose={onClose}>
       <Field label="Name">
         <input
           autoFocus
@@ -2028,7 +2355,7 @@ function GroupModal({
           className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
         >
           <option value="">— (root)</option>
-          {groups.map((g) => (
+          {groups.filter((g) => !invalidParentIds.includes(g.id)).map((g) => (
             <option key={g.id} value={g.id}>{groupPath(groups, g.id)}</option>
           ))}
         </select>
@@ -2040,36 +2367,14 @@ function GroupModal({
           if (n) onSubmit(n, parentId);
         }}
         confirmDisabled={!name.trim()}
-        confirmLabel="Create group"
+        confirmLabel={group ? "Save group" : "Create group"}
       />
     </ModalShell>
   );
 }
 
-/* ---- Modal: New Host ---- */
-function HostModal({
-  groups, defaultGroupId, onClose, onSubmit,
-}: {
-  groups: HostGroup[];
-  defaultGroupId: string | null;
-  onClose: () => void;
-  onSubmit: (h: Omit<Host, "id">) => void;
-}) {
-  const [name, setName] = useState("");
-  const [hostname, setHostname] = useState("");
-  const [port, setPort] = useState(22);
-  const [user, setUser] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPass, setShowPass] = useState(false);
-  const [sshKeyId, setSshKeyId] = useState<string | null>(null);
-  const [groupId, setGroupId] = useState<string | null>(defaultGroupId);
-  const [tags, setTags] = useState<string[]>([]);
-  const [showStatus, setShowStatus] = useState(true);
-  const [sftpPath, setSftpPath] = useState("/");
-
-  const valid = name.trim() && hostname.trim() && user.trim();
-
-  const SectionTitle = ({ icon, title }: { icon: React.ReactNode; title: string }) => (
+function HostModalSectionTitle({ icon, title }: { icon: React.ReactNode; title: string }) {
+  return (
     <div className="flex items-center gap-2 px-4 py-3">
       <span className="flex h-5 w-5 items-center justify-center text-muted-foreground">
         {icon}
@@ -2077,8 +2382,18 @@ function HostModal({
       <span className="text-sm font-semibold text-foreground">{title}</span>
     </div>
   );
+}
 
-  const Row = ({ label, children, rightText }: { label: string; children: React.ReactNode; rightText?: string }) => (
+function HostModalRow({
+  label,
+  children,
+  rightText,
+}: {
+  label: string;
+  children: React.ReactNode;
+  rightText?: string;
+}) {
+  return (
     <div className="flex items-center justify-between border-t border-border px-4 py-2.5">
       <span className="text-sm text-foreground">{label}</span>
       <div className="flex items-center gap-2">
@@ -2087,8 +2402,10 @@ function HostModal({
       </div>
     </div>
   );
+}
 
-  const Input = (props: React.InputHTMLAttributes<HTMLInputElement>) => (
+function HostModalInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
+  return (
     <input
       {...props}
       dir="ltr"
@@ -2098,18 +2415,10 @@ function HostModal({
       ].filter(Boolean).join(" ")}
     />
   );
+}
 
-  const SelectButton = ({ label, icon, onClick }: { label: string; icon: React.ReactNode; onClick?: () => void }) => (
-    <button
-      onClick={onClick}
-      className="flex h-7 items-center gap-1.5 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-[var(--color-surface)]"
-    >
-      <span>{label}</span>
-      {icon}
-    </button>
-  );
-
-  const Toggle = ({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) => (
+function HostModalToggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
     <button
       onClick={() => onChange(!checked)}
       className={[
@@ -2125,6 +2434,84 @@ function HostModal({
       />
     </button>
   );
+}
+
+/* ---- Modal: New Host ---- */
+function HostModal({
+  groups, existingTags, defaultGroupId, host, onClose, onSubmit,
+}: {
+  groups: HostGroup[];
+  existingTags: string[];
+  defaultGroupId: string | null;
+  host?: Host | null;
+  onClose: () => void;
+  onSubmit: (h: Omit<Host, "id">) => void;
+}) {
+  const [name, setName] = useState(host?.name ?? "");
+  const [hostname, setHostname] = useState(host?.hostname ?? "");
+  const [port, setPort] = useState(host?.port ?? 22);
+  const [user, setUser] = useState(host?.user ?? "");
+  const [password, setPassword] = useState(host?.password ?? "");
+  const [showPass, setShowPass] = useState(false);
+  const [sshKeyId, setSshKeyId] = useState<string | null>(host?.sshKeyId ?? null);
+  const [groupId, setGroupId] = useState<string | null>(host?.groupId ?? defaultGroupId);
+  const [tags, setTags] = useState<string[]>(host?.tags ?? []);
+  const [tagInput, setTagInput] = useState("");
+  const [showStatus, setShowStatus] = useState(host?.showStatusInDashboard ?? true);
+  const [workingDir, setWorkingDir] = useState(host?.workingDirectory ?? "");
+  const [sftpPath, setSftpPath] = useState(host?.defaultSftpPath ?? "/");
+  const [sshKeys, setSshKeys] = useState<SshKey[]>([]);
+  const [testing, setTesting] = useState(false);
+
+  const valid = name.trim() && hostname.trim() && user.trim();
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<SshKey[]>("list_ssh_keys")
+      .then((items) => {
+        if (!cancelled) setSshKeys(items);
+      })
+      .catch(() => {
+        if (!cancelled) setSshKeys([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const addTag = (tag: string) => {
+    const normalized = tag.trim();
+    if (!normalized) return;
+    setTags((curr) => (curr.includes(normalized) ? curr : [...curr, normalized]));
+    setTagInput("");
+  };
+  const removeTag = (tag: string) => {
+    setTags((curr) => curr.filter((item) => item !== tag));
+  };
+  const testConnection = async () => {
+    if (!hostname.trim() || !user.trim()) return;
+    setTesting(true);
+
+    try {
+      const result = await invoke<{ ok: boolean; message: string }>("test_host_connection", {
+        request: {
+          hostname: hostname.trim(),
+          user: user.trim(),
+          port,
+          password,
+          sshKeyId,
+          timeoutSecs: 5,
+        },
+      });
+      if (result.ok) toast.success("Connection test passed", { description: result.message });
+      else toast.error("Connection test failed", { description: result.message });
+    } catch (err) {
+      const message = String(err);
+      toast.error("Connection test failed", { description: message });
+    } finally {
+      setTesting(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
@@ -2134,7 +2521,7 @@ function HostModal({
       >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-border bg-[var(--color-sidebar)] px-5 py-3">
-          <h3 className="text-sm font-semibold text-foreground">Create New Machine</h3>
+          <h3 className="text-sm font-semibold text-foreground">{host ? "Edit Machine" : "Create New Machine"}</h3>
           <button
             onClick={onClose}
             className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition hover:bg-[var(--color-surface-2)] hover:text-foreground"
@@ -2146,15 +2533,15 @@ function HostModal({
         {/* Body */}
         <div className="flex-1 overflow-y-auto">
           {/* Machine Information */}
-          <SectionTitle icon={<Info className="h-4 w-4" />} title="Machine Information" />
+          <HostModalSectionTitle icon={<Info className="h-4 w-4" />} title="Machine Information" />
           <div className="border-t border-border">
-            <Row label="Name">
-              <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" />
-            </Row>
-            <Row label="Host">
-              <Input value={hostname} onChange={(e) => setHostname(e.target.value)} placeholder="IP or Hostname" />
-            </Row>
-            <Row label="Port" rightText="22">
+            <HostModalRow label="Name">
+              <HostModalInput autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" />
+            </HostModalRow>
+            <HostModalRow label="Host">
+              <HostModalInput value={hostname} onChange={(e) => setHostname(e.target.value)} placeholder="IP or Hostname" />
+            </HostModalRow>
+            <HostModalRow label="Port" rightText="22">
               <input
                 type="number"
                 value={port}
@@ -2162,21 +2549,21 @@ function HostModal({
                 dir="ltr"
                 className="h-8 w-16 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
               />
-            </Row>
+            </HostModalRow>
           </div>
           <div className="px-4 pb-2 pt-1.5">
             <p className="text-right text-[11px] text-muted-foreground">If Name is empty, Host will be used as Name.</p>
           </div>
 
           {/* Authentication */}
-          <SectionTitle icon={<Lock className="h-4 w-4" />} title="Authentication" />
+          <HostModalSectionTitle icon={<Lock className="h-4 w-4" />} title="Authentication" />
           <div className="border-t border-border">
-            <Row label="Username">
-              <Input value={user} onChange={(e) => setUser(e.target.value)} placeholder="Username" />
-            </Row>
-            <Row label="Password">
+            <HostModalRow label="Username">
+              <HostModalInput value={user} onChange={(e) => setUser(e.target.value)} placeholder="Username" />
+            </HostModalRow>
+            <HostModalRow label="Password">
               <div className="relative">
-                <Input
+                <HostModalInput
                   className="pr-7"
                   type={showPass ? "text" : "password"}
                   value={password}
@@ -2190,49 +2577,88 @@ function HostModal({
                   {showPass ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
                 </button>
               </div>
-            </Row>
-            <Row label="SSH Key">
-              <SelectButton
-                label={sshKeyId ? "Selected" : "Select Key"}
-                icon={<KeyRound className="h-3.5 w-3.5" />}
-              />
-            </Row>
-          </div>
-          <div className="mx-4 my-2 rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-2">
-            <button className="rounded-md bg-[var(--color-surface)] px-3 py-1 text-xs font-medium text-muted-foreground hover:text-foreground">
-              Test Connection
-            </button>
-          </div>
-          <div className="px-4 pb-2 pt-1">
-            <p className="text-right text-[11px] text-muted-foreground">It is recommended to test connection before saving.</p>
+            </HostModalRow>
+            <HostModalRow label="SSH Key">
+              <select
+                value={sshKeyId ?? ""}
+                onChange={(e) => setSshKeyId(e.target.value || null)}
+                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+              >
+                <option value="">No key</option>
+                {sshKeys.map((key) => (
+                  <option key={key.id} value={key.id}>
+                    {key.name}
+                  </option>
+                ))}
+              </select>
+            </HostModalRow>
           </div>
 
           {/* Categorization */}
-          <SectionTitle icon={<Tag className="h-4 w-4" />} title="Categorization" />
+          <HostModalSectionTitle icon={<Tag className="h-4 w-4" />} title="Categorization" />
           <div className="border-t border-border">
-            <Row label="Group">
-              <SelectButton
-                label={groupId ? groupPath(groups, groupId) : "Select Group"}
-                icon={<LayoutGrid className="h-3.5 w-3.5" />}
-              />
-            </Row>
-            <Row label="Tags">
-              <SelectButton
-                label={tags.length > 0 ? `${tags.length} tags` : "Edit Tags"}
-                icon={<Tag className="h-3.5 w-3.5" />}
-              />
-            </Row>
+            <HostModalRow label="Group">
+              <select
+                value={groupId ?? ""}
+                onChange={(e) => setGroupId(e.target.value || null)}
+                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+              >
+                <option value="">Root</option>
+                {groups.map((group) => (
+                  <option key={group.id} value={group.id}>
+                    {groupPath(groups, group.id)}
+                  </option>
+                ))}
+              </select>
+            </HostModalRow>
+            <HostModalRow label="Tags">
+              <div className="flex w-64 flex-col items-end gap-2">
+                <div className="flex w-full flex-wrap justify-end gap-1">
+                  {tags.map((tag) => (
+                    <button
+                      key={tag}
+                      onClick={() => removeTag(tag)}
+                      className="rounded border border-border bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                    >
+                      {tag} ×
+                    </button>
+                  ))}
+                </div>
+                <input
+                  list="host-tag-options"
+                  value={tagInput}
+                  onChange={(e) => setTagInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === ",") {
+                      e.preventDefault();
+                      addTag(tagInput.replace(",", ""));
+                    }
+                  }}
+                  onBlur={() => addTag(tagInput)}
+                  placeholder="Add tag"
+                  className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+                />
+                <datalist id="host-tag-options">
+                  {existingTags.map((tag) => (
+                    <option key={tag} value={tag} />
+                  ))}
+                </datalist>
+              </div>
+            </HostModalRow>
           </div>
 
           {/* Preferences */}
-          <SectionTitle icon={<Settings className="h-4 w-4" />} title="Preferences" />
+          <HostModalSectionTitle icon={<Settings className="h-4 w-4" />} title="Preferences" />
           <div className="border-t border-border">
-            <Row label="Show Status in Dashboard">
-              <Toggle checked={showStatus} onChange={setShowStatus} />
-            </Row>
-            <Row label="Default SFTP Path">
-              <Input value={sftpPath} onChange={(e) => setSftpPath(e.target.value)} placeholder="/" />
-            </Row>
+            <HostModalRow label="Show Status in Dashboard">
+              <HostModalToggle checked={showStatus} onChange={setShowStatus} />
+            </HostModalRow>
+            <HostModalRow label="Working Directory">
+              <HostModalInput value={workingDir} onChange={(e) => setWorkingDir(e.target.value)} placeholder="e.g. /home/user/project" />
+            </HostModalRow>
+            <HostModalRow label="Default SFTP Path">
+              <HostModalInput value={sftpPath} onChange={(e) => setSftpPath(e.target.value)} placeholder="/" />
+            </HostModalRow>
           </div>
         </div>
 
@@ -2243,6 +2669,13 @@ function HostModal({
             className="rounded-md px-4 py-1.5 text-sm font-medium text-muted-foreground transition hover:bg-[var(--color-surface-2)] hover:text-foreground"
           >
             Cancel
+          </button>
+          <button
+            disabled={!hostname.trim() || !user.trim() || testing}
+            onClick={() => void testConnection()}
+            className="rounded-md border border-border bg-[var(--color-surface)] px-4 py-1.5 text-sm font-medium text-foreground transition disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:bg-[var(--color-surface-2)]"
+          >
+            {testing ? "Testing..." : "Test Connection"}
           </button>
           <button
             onClick={() =>
@@ -2257,14 +2690,16 @@ function HostModal({
                 tags,
                 password,
                 sshKeyId,
+                authMethod: sshKeyId ? "key" : password ? "password" : undefined,
                 showStatusInDashboard: showStatus,
+                workingDirectory: workingDir.trim() || undefined,
                 defaultSftpPath: sftpPath,
               })
             }
             disabled={!valid}
             className="rounded-md bg-[var(--color-brand-orange)] px-4 py-1.5 text-sm font-semibold text-[var(--color-primary-foreground)] disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"
           >
-            Create host
+            {host ? "Save host" : "Create host"}
           </button>
         </div>
       </div>
@@ -3502,6 +3937,49 @@ function RemoveSnippetModal({
         <div className="px-5 py-6">
           <p className="text-sm text-foreground">
             Are you sure you want to remove {count} snippet{count > 1 ? "s" : ""}?
+          </p>
+          <div className="mt-6 flex items-center justify-end">
+            <button
+              onClick={onConfirm}
+              className="cursor-pointer rounded-md bg-[oklch(0.68_0.17_25)] px-5 py-1.5 text-sm font-semibold text-white transition hover:opacity-90"
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RemoveHostModal({
+  hostName, onClose, onConfirm,
+}: {
+  hostName: string;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="w-[480px] max-w-[92vw] overflow-hidden rounded-lg border border-border bg-[var(--color-surface)] shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-border bg-[var(--color-sidebar)] px-5 py-3">
+          <h3 className="text-sm font-semibold text-foreground">Remove host</h3>
+          <button
+            onClick={onClose}
+            className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-muted-foreground transition hover:bg-[var(--color-surface-2)] hover:text-foreground"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        <div className="px-5 py-6">
+          <p className="text-sm text-foreground">
+            Are you sure you want to remove <span className="font-semibold">{hostName}</span>?
           </p>
           <div className="mt-6 flex items-center justify-end">
             <button

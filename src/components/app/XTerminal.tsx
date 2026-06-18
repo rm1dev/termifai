@@ -1,4 +1,4 @@
-import { useEffect, useRef, useLayoutEffect } from "react";
+import { useEffect, useRef, useLayoutEffect, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -22,15 +22,49 @@ import {
 
 interface Props {
   sessionId?: string;
+  initialCommand?: string;
+  initialPassword?: string;
+  readyMarker?: string;
+  connectionLabel?: string;
+  connectionTitle?: string;
+  onClose?: () => void;
   onSessionCreated?: (sessionId: string) => void;
 }
 
-export function XTerminal({ sessionId, onSessionCreated }: Props) {
+type ConnectionStage = "connecting" | "handshaking" | "authenticating" | "shell";
+type ConnectionStatus = "active" | "done" | "failed";
+
+interface ConnectionStatusPayload {
+  stage: ConnectionStage;
+  status: ConnectionStatus;
+  message: string;
+  log?: string | null;
+}
+
+const connectionSteps: Array<{ key: ConnectionStage; label: string; icon: string }> = [
+  { key: "connecting", label: "Connecting", icon: "↗" },
+  { key: "handshaking", label: "Handshaking", icon: "👋" },
+  { key: "authenticating", label: "Authenticating", icon: "🔐" },
+  { key: "shell", label: "Opening shell", icon: ">_" },
+];
+
+const initialConnectionStatus: ConnectionStatusPayload = {
+  stage: "connecting",
+  status: "active",
+  message: "Opening TCP connection to SSH server...",
+};
+
+export function XTerminal({ sessionId, initialCommand, initialPassword, readyMarker, connectionLabel, connectionTitle, onClose, onSessionCreated }: Props) {
   const ref = useRef<HTMLDivElement>(null);
+  const [isConnecting, setIsConnecting] = useState(Boolean(readyMarker && !sessionId));
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
+  const [connectionLogs, setConnectionLogs] = useState<string[]>([]);
+  const [showConnectionLogs, setShowConnectionLogs] = useState(false);
   const termRef = useRef<Terminal | null>(null);
   const sessionRef = useRef<string | null>(sessionId ?? null);
   const unlistenOutputRef = useRef<UnlistenFn | null>(null);
   const unlistenExitRef = useRef<UnlistenFn | null>(null);
+  const unlistenConnectionRef = useRef<UnlistenFn | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const isInitializedRef = useRef(false);
   const mountCountRef = useRef(0);
@@ -153,9 +187,36 @@ export function XTerminal({ sessionId, onSessionCreated }: Props) {
     // Create PTY session and subscribe to output
     const setup = async () => {
       try {
+        if (readyMarker) {
+          unlistenConnectionRef.current = await listen<ConnectionStatusPayload>(
+            `term:${readyMarker}:connection-status`,
+            (event) => {
+              if (event.payload.log) {
+                setConnectionLogs((logs) => [...logs.slice(-80), event.payload.log as string]);
+              }
+              setConnectionStatus({
+                stage: event.payload.stage,
+                status: event.payload.status,
+                message: event.payload.message,
+              });
+              if (event.payload.status === "done") {
+                setTimeout(() => setIsConnecting(false), 350);
+              } else if (event.payload.status === "failed") {
+                setIsConnecting(true);
+                setShowConnectionLogs(true);
+              }
+            }
+          );
+        }
+
         let sid = sessionRef.current;
         if (!sid) {
-          const info = await invoke<{ id: string; label: string }>("create_session", { cwd: "" });
+          const info = await invoke<{ id: string; label: string }>("create_session", {
+            cwd: "",
+            initialCommand: initialCommand ?? null,
+            initialPassword: initialPassword ?? null,
+            readyMarker: readyMarker ?? null,
+          });
           sid = info.id;
           sessionRef.current = sid;
           notifiedSessionRef.current = sid;
@@ -166,6 +227,7 @@ export function XTerminal({ sessionId, onSessionCreated }: Props) {
         unlistenOutputRef.current = await listen<string>(
           `term:${sid}:output`,
           (event) => {
+            if (!readyMarker) setIsConnecting(false);
             term.write(event.payload);
           }
         );
@@ -174,6 +236,7 @@ export function XTerminal({ sessionId, onSessionCreated }: Props) {
         unlistenExitRef.current = await listen<boolean>(
           `term:${sid}:exited`,
           () => {
+            if (!readyMarker) setIsConnecting(false);
             term.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
           }
         );
@@ -184,6 +247,12 @@ export function XTerminal({ sessionId, onSessionCreated }: Props) {
           await invoke("resize_session", { sessionId: sid, cols: term.cols, rows: term.rows });
         }
       } catch (err) {
+        setConnectionStatus({
+          stage: "connecting",
+          status: "failed",
+          message: `Failed to start shell: ${err}`,
+        });
+        setShowConnectionLogs(true);
         term.write(`\r\n\x1b[31mFailed to start shell: ${err}\x1b[0m\r\n`);
       }
     };
@@ -212,8 +281,10 @@ export function XTerminal({ sessionId, onSessionCreated }: Props) {
       resizeDisp.dispose();
       unlistenOutputRef.current?.();
       unlistenExitRef.current?.();
+      unlistenConnectionRef.current?.();
       unlistenOutputRef.current = null;
       unlistenExitRef.current = null;
+      unlistenConnectionRef.current = null;
       fitAddonRef.current = null;
       termRef.current = null;
       isInitializedRef.current = false;
@@ -228,6 +299,17 @@ export function XTerminal({ sessionId, onSessionCreated }: Props) {
     }
   }, [sessionId]);
 
+  const closeConnection = () => {
+    const sid = sessionRef.current;
+    if (sid) {
+      invoke("close_session", { sessionId: sid }).catch(() => {});
+    }
+    onClose?.();
+  };
+
+  const activeIndex = connectionSteps.findIndex((step) => step.key === connectionStatus.stage);
+  const safeActiveIndex = activeIndex >= 0 ? activeIndex : 0;
+  const failedIndex = connectionStatus.status === "failed" ? safeActiveIndex : -1;
   // Notify parent when session is created
   useEffect(() => {
     const sid = sessionRef.current;
@@ -252,5 +334,102 @@ export function XTerminal({ sessionId, onSessionCreated }: Props) {
     return () => observer.disconnect();
   }, []);
 
-  return <div ref={ref} className="xterm-wrapper h-full w-full pl-1 pt-1" />;
+  // Focus terminal when connection overlay is dismissed
+  useEffect(() => {
+    if (!isConnecting && termRef.current) {
+      setTimeout(() => {
+        fitAddonRef.current?.fit();
+        termRef.current?.focus();
+      }, 50);
+    }
+  }, [isConnecting]);
+
+  return (
+    <div className="relative h-full w-full bg-background">
+      {isConnecting && (
+        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-background px-4 text-center">
+          <div className="w-full max-w-2xl">
+            <div className="mb-8 flex items-center gap-3 text-left">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-foreground text-background">
+                <span className="font-mono text-sm font-bold">&gt;_</span>
+              </div>
+              <div>
+                <h3 className="text-lg font-bold text-foreground">{connectionTitle ?? "SSH Session"}</h3>
+                <p className="mt-0.5 text-sm font-medium text-muted-foreground">{connectionLabel}</p>
+              </div>
+            </div>
+
+            <div className="mb-7 flex items-center">
+              {connectionSteps.map((step, index) => {
+                const isDone = index < safeActiveIndex || connectionStatus.status === "done";
+                const isActive = index === safeActiveIndex && connectionStatus.status === "active";
+                const isFailed = index === failedIndex;
+                const lineDone = index < safeActiveIndex && connectionStatus.status !== "failed";
+                return (
+                  <div key={step.key} className="contents">
+                    <div
+                      className={[
+                        "flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-bold",
+                        isFailed
+                          ? "bg-red-500 text-white"
+                          : isDone
+                            ? "bg-[var(--color-brand-green)] text-white"
+                            : isActive
+                              ? "border-[3px] border-border bg-[var(--color-surface-2)] text-foreground"
+                              : "border-[3px] border-border text-muted-foreground",
+                      ].join(" ")}
+                      title={step.label}
+                    >
+                      {isFailed ? "!" : isDone ? "✓" : isActive ? <div className="h-4 w-4 animate-spin rounded-full border-2 border-muted-foreground border-t-[var(--color-brand-orange)]" /> : step.icon}
+                    </div>
+                    {index < connectionSteps.length - 1 && (
+                      <div className={`h-0.5 flex-1 ${lineDone ? "bg-[var(--color-brand-green)]" : "bg-border"}`} />
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+
+            <div className="rounded-2xl bg-[var(--color-surface)] px-5 py-4 text-left">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <span className="block text-base font-bold text-foreground">
+                    {connectionSteps[safeActiveIndex]?.label ?? "Connecting"}
+                  </span>
+                  <span className={`mt-1 block text-xs ${connectionStatus.status === "failed" ? "text-red-400" : "text-muted-foreground"}`}>
+                    {connectionStatus.message}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowConnectionLogs((show) => !show)}
+                  className="rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-1 text-xs font-semibold text-muted-foreground hover:text-foreground"
+                >
+                  {showConnectionLogs ? "Hide Logs" : "Show Logs"}
+                </button>
+              </div>
+              {showConnectionLogs && (
+                <div className="mt-3 max-h-28 overflow-auto rounded-lg border border-border bg-background/60 p-2 font-mono text-[10px] leading-4 text-muted-foreground">
+                  {connectionLogs.length ? connectionLogs.map((log, index) => <div key={`${index}-${log}`}>{log}</div>) : "Waiting for SSH logs..."}
+                </div>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={closeConnection}
+              className="mt-6 h-9 w-full rounded-md border border-border bg-[var(--color-surface-2)] text-sm font-semibold text-foreground hover:bg-[var(--color-surface)]"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+      <div
+        ref={ref}
+        className="xterm-wrapper h-full w-full pl-1 pt-1"
+        style={{ visibility: isConnecting ? "hidden" : "visible" }}
+      />
+    </div>
+  );
 }

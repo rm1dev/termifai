@@ -1,6 +1,11 @@
+mod hosts;
 mod pty_manager;
 mod ssh_keys;
 
+use hosts::{
+    Host, HostGroup, HostsVault, SaveHostGroupRequest, SaveHostRequest, TestHostConnectionRequest,
+    TestHostConnectionResult,
+};
 use pty_manager::{PtyManager, TabInfo};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,9 +25,18 @@ fn create_session(
     app: tauri::AppHandle,
     state: State<AppState>,
     cwd: String,
+    initial_command: Option<String>,
+    initial_password: Option<String>,
+    ready_marker: Option<String>,
 ) -> Result<TabInfo, String> {
     let manager = state.pty_manager.lock().unwrap();
-    manager.create_session(&app, &cwd)
+    manager.create_session(
+        &app,
+        &cwd,
+        initial_command.as_deref(),
+        initial_password.as_deref(),
+        ready_marker.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -100,6 +114,42 @@ fn remove_ssh_keys(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String
     ssh_keys::remove_ssh_keys(&app, ids)
 }
 
+#[tauri::command]
+fn list_hosts(app: tauri::AppHandle) -> Result<HostsVault, String> {
+    hosts::list_hosts(&app)
+}
+
+#[tauri::command]
+fn save_host(app: tauri::AppHandle, request: SaveHostRequest) -> Result<Host, String> {
+    hosts::save_host(&app, request)
+}
+
+#[tauri::command]
+fn remove_hosts(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
+    hosts::remove_hosts(&app, ids)
+}
+
+#[tauri::command]
+fn save_host_group(
+    app: tauri::AppHandle,
+    request: SaveHostGroupRequest,
+) -> Result<HostGroup, String> {
+    hosts::save_host_group(&app, request)
+}
+
+#[tauri::command]
+fn remove_host_group(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    hosts::remove_host_group(&app, id)
+}
+
+#[tauri::command]
+fn test_host_connection(
+    app: tauri::AppHandle,
+    request: TestHostConnectionRequest,
+) -> Result<TestHostConnectionResult, String> {
+    hosts::test_host_connection(&app, request)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -122,6 +172,12 @@ pub fn run() {
             generate_ssh_key,
             import_ssh_key,
             remove_ssh_keys,
+            list_hosts,
+            save_host,
+            remove_hosts,
+            save_host_group,
+            remove_host_group,
+            test_host_connection,
         ])
         .setup(|app| {
             // Build custom application menu
