@@ -1,8 +1,10 @@
 mod pty_manager;
+mod ssh_keys;
 
 use pty_manager::{PtyManager, TabInfo};
-use std::sync::Mutex;
+use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_window_state::StateFlags;
@@ -24,7 +26,11 @@ fn create_session(
 }
 
 #[tauri::command]
-fn write_to_session(state: State<AppState>, session_id: String, data: String) -> Result<(), String> {
+fn write_to_session(
+    state: State<AppState>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
     let manager = state.pty_manager.lock().unwrap();
     manager.write_to_session(&session_id, &data)
 }
@@ -57,7 +63,9 @@ fn new_window(app: tauri::AppHandle) -> Result<(), String> {
         .min_inner_size(800.0, 600.0)
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition::new(12.0, 16.0)))
+        .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+            12.0, 16.0,
+        )))
         .build()
         .map_err(|e| format!("Failed to create window: {}", e))?;
 
@@ -69,12 +77,37 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
     open_settings_window_inner(&app)
 }
 
+#[tauri::command]
+fn list_ssh_keys(app: tauri::AppHandle) -> Result<Vec<SshKey>, String> {
+    ssh_keys::list_ssh_keys(&app)
+}
+
+#[tauri::command]
+fn generate_ssh_key(
+    app: tauri::AppHandle,
+    request: GenerateSshKeyRequest,
+) -> Result<SshKey, String> {
+    ssh_keys::generate_ssh_key(&app, request)
+}
+
+#[tauri::command]
+fn import_ssh_key(app: tauri::AppHandle, request: ImportSshKeyRequest) -> Result<SshKey, String> {
+    ssh_keys::import_ssh_key(&app, request)
+}
+
+#[tauri::command]
+fn remove_ssh_keys(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
+    ssh_keys::remove_ssh_keys(&app, ids)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_window_state::Builder::new()
-            .with_state_flags(StateFlags::all())
-            .build())
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(StateFlags::all())
+                .build(),
+        )
         .manage(AppState {
             pty_manager: Mutex::new(PtyManager::new()),
         })
@@ -85,6 +118,10 @@ pub fn run() {
             close_session,
             new_window,
             open_settings_window,
+            list_ssh_keys,
+            generate_ssh_key,
+            import_ssh_key,
+            remove_ssh_keys,
         ])
         .setup(|app| {
             // Build custom application menu
@@ -129,16 +166,14 @@ pub fn run() {
 
             // Handle custom menu events
             let handle = app.handle().clone();
-            app.on_menu_event(move |_app_handle, event| {
-                match event.id().as_ref() {
-                    "new-terminal" => {
-                        let _ = handle.emit("menu-new-terminal", ());
-                    }
-                    "open-settings" => {
-                        let _ = open_settings_window_inner(&handle);
-                    }
-                    _ => {}
+            app.on_menu_event(move |_app_handle, event| match event.id().as_ref() {
+                "new-terminal" => {
+                    let _ = handle.emit("menu-new-terminal", ());
                 }
+                "open-settings" => {
+                    let _ = open_settings_window_inner(&handle);
+                }
+                _ => {}
             });
 
             if cfg!(debug_assertions) {

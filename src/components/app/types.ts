@@ -60,4 +60,7 @@ export interface SshKey {
   remark?: string;
   hasPassphrase?: boolean;
   createdAt: string; // ISO date string
+  publicKey?: string;
+  publicKeyPath?: string;
+  privateKeyPath?: string;
 }

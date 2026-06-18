@@ -103,6 +103,7 @@ import {
   arrayMove,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { toast } from "sonner";
 
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
@@ -2452,30 +2453,8 @@ function EmptyState({
 
 /* ---------------- SSH Keys view ---------------- */
 
-const initialSshKeys: SshKey[] = [
-  {
-    id: "k-prod",
-    name: "production",
-    type: "ed25519",
-    fingerprint: "SHA256:7c4ZbX9qP1mE2nYdR0vKsT3uVoLpQwHgJfA8cMxYbI",
-    remark: "Production servers",
-    hasPassphrase: true,
-    createdAt: "2025-03-12T09:24:00Z",
-  },
-  {
-    id: "k-staging",
-    name: "staging-rsa",
-    type: "rsa",
-    size: 4096,
-    fingerprint: "SHA256:2aPmNcVxK9LtR0bYhZqWdSjF3uXoTgEnHvJfA7cMxYb",
-    remark: "Staging cluster",
-    hasPassphrase: false,
-    createdAt: "2025-05-04T18:02:00Z",
-  },
-];
-
 function SshKeysView() {
-  const [keys, setKeys] = useState<SshKey[]>(initialSshKeys);
+  const [keys, setKeys] = useState<SshKey[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showGenerate, setShowGenerate] = useState(false);
   const [removing, setRemoving] = useState<string[] | null>(null);
@@ -2484,22 +2463,77 @@ function SshKeysView() {
   const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sshKeyError, setSshKeyError] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
+  useEffect(() => {
+    let cancelled = false;
+
+    invoke<SshKey[]>("list_ssh_keys")
+      .then((items) => {
+        if (!cancelled) {
+          setKeys(items);
+          setSshKeyError(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setSshKeyError(String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const toggleSelect = (id: string, additive: boolean) => {
     setSelected((curr) => {
-      const next = new Set(additive ? curr : []);
-      if (curr.has(id) && additive) next.delete(id);
+      if (!additive) {
+        return curr.has(id) && curr.size === 1 ? new Set() : new Set([id]);
+      }
+
+      const next = new Set(curr);
+      if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
   };
 
-  const remove = (ids: string[]) => {
-    setKeys((curr) => curr.filter((k) => !ids.includes(k.id)));
-    setSelected(new Set());
-    setRemoving(null);
+  const copyPublicKey = (key: SshKey) => {
+    if (!key.publicKey) return;
+    navigator.clipboard
+      .writeText(key.publicKey)
+      .then(() => {
+        toast.success("Public key copied", {
+          description: `${key.name} public key copied to clipboard.`,
+        });
+      })
+      .catch((err) => {
+        const message = `Copy public key failed: ${String(err)}`;
+        setSshKeyError(message);
+        toast.error("Copy failed", { description: message });
+      });
+  };
+
+  const remove = async (ids: string[]) => {
+    try {
+      await invoke("remove_ssh_keys", { ids });
+      setKeys((curr) => curr.filter((k) => !ids.includes(k.id)));
+      setSelected(new Set());
+      setRemoving(null);
+      setSshKeyError(null);
+    } catch (err) {
+      setSshKeyError(String(err));
+    }
+  };
+
+  const addKey = (key: SshKey) => {
+    setKeys((curr) => [key, ...curr.filter((item) => item.id !== key.id)]);
+    setShowGenerate(false);
+    setSshKeyError(null);
   };
 
   const selectedIds = Array.from(selected);
@@ -2612,8 +2646,20 @@ function SshKeysView() {
         </div>
       </div>
 
+      {sshKeyError && (
+        <div className="mx-4 mt-4 rounded-md border border-[oklch(0.55_0.2_25)]/40 bg-[oklch(0.55_0.2_25)]/10 px-3 py-2 text-xs text-[oklch(0.72_0.18_25)]">
+          {sshKeyError}
+        </div>
+      )}
+
       {keys.length === 0 ? (
-        <SshKeysEmpty onGenerate={() => setShowGenerate(true)} />
+        loading ? (
+          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+            Loading SSH keys…
+          </div>
+        ) : (
+          <SshKeysEmpty />
+        )
       ) : (
         <div className="flex-1 overflow-y-auto px-4 py-4">
           <h2 className="mb-3 text-sm font-semibold text-foreground">SSH Keys</h2>
@@ -2629,6 +2675,7 @@ function SshKeysView() {
                   k={k}
                   selected={selected.has(k.id)}
                   onClick={(e) => toggleSelect(k.id, e.metaKey || e.ctrlKey || e.shiftKey)}
+                  onCopy={() => copyPublicKey(k)}
                   onRemove={() => setRemoving([k.id])}
                 />
               ))}
@@ -2664,7 +2711,7 @@ function SshKeysView() {
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
                         title="Copy public key"
-                        onClick={(e) => { e.stopPropagation(); }}
+                        onClick={(e) => { e.stopPropagation(); copyPublicKey(k); }}
                         className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
                       >
                         <Clipboard className="h-3.5 w-3.5" />
@@ -2685,12 +2732,12 @@ function SshKeysView() {
         </div>
       )}
 
-      {showGenerate && <GenerateSshKeyModal onClose={() => setShowGenerate(false)} />}
+      {showGenerate && <GenerateSshKeyModal onClose={() => setShowGenerate(false)} onCreated={addKey} />}
       {removing && (
         <RemoveSshKeyModal
           count={removing.length}
           onClose={() => setRemoving(null)}
-          onConfirm={() => remove(removing)}
+          onConfirm={() => void remove(removing)}
         />
       )}
     </div>
@@ -2698,11 +2745,12 @@ function SshKeysView() {
 }
 
 function SshKeyCard({
-  k, selected, onClick, onRemove,
+  k, selected, onClick, onCopy, onRemove,
 }: {
   k: SshKey;
   selected: boolean;
   onClick: (e: React.MouseEvent) => void;
+  onCopy: () => void;
   onRemove: () => void;
 }) {
   return (
@@ -2738,7 +2786,7 @@ function SshKeyCard({
         <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
           <button
             title="Copy public key"
-            onClick={(e) => { e.stopPropagation(); }}
+            onClick={(e) => { e.stopPropagation(); onCopy(); }}
             className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
           >
             <Clipboard className="h-3.5 w-3.5" />
@@ -2785,36 +2833,17 @@ function RemoveSshKeyModal({
   );
 }
 
-function SshKeysEmpty({ onGenerate }: { onGenerate?: () => void }) {
-  const [showGenerate, setShowGenerate] = useState(false);
-  const open = () => (onGenerate ? onGenerate() : setShowGenerate(true));
+function SshKeysEmpty() {
   return (
     <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-      <div className="flex h-32 w-32 items-center justify-center rounded-2xl bg-[var(--color-surface-2)]">
-        <KeyRound className="h-14 w-14 text-muted-foreground" strokeWidth={1.5} />
+      <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-[var(--color-surface-2)]">
+        <KeyRound className="h-9 w-9 text-muted-foreground" strokeWidth={1.5} />
       </div>
-      <p className="mt-6 text-sm font-semibold text-foreground">
-        No SSH keys available, create one now!
+      <h3 className="mt-5 text-base font-semibold text-foreground">Create SSH key</h3>
+      <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+        Generate or import SSH keys to connect to your saved hosts securely.
       </p>
-      <div className="mt-5 flex w-full max-w-md flex-col gap-2">
-        <SshKeyButton icon={<KeyRound className="h-4 w-4" />} label="Generate New SSH Key" onClick={open} />
-        <SshKeyButton icon={<Clipboard className="h-4 w-4" />} label="Import Key from Pasteboard" />
-        <SshKeyButton icon={<FileUp className="h-4 w-4" />} label="Import Key from File" />
-      </div>
-      {showGenerate && <GenerateSshKeyModal onClose={() => setShowGenerate(false)} />}
     </div>
-  );
-}
-
-function SshKeyButton({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick?: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      className="flex w-full items-center justify-center gap-2 rounded-md bg-[var(--color-surface-2)] px-4 py-2.5 text-sm font-medium text-foreground transition hover:bg-[var(--color-sidebar-active)]"
-    >
-      {icon}
-      {label}
-    </button>
   );
 }
 
@@ -2822,15 +2851,39 @@ function SshKeyButton({ icon, label, onClick }: { icon: React.ReactNode; label: 
 type KeyType = "ed25519" | "rsa";
 type KeySize = 1024 | 2048 | 4096;
 
-function GenerateSshKeyModal({ onClose }: { onClose: () => void }) {
+function GenerateSshKeyModal({ onClose, onCreated }: { onClose: () => void; onCreated: (key: SshKey) => void }) {
   const [name, setName] = useState("");
   const [keyType, setKeyType] = useState<KeyType>("ed25519");
   const [keySize, setKeySize] = useState<KeySize>(2048);
   const [passphrase, setPassphrase] = useState("");
   const [showPass, setShowPass] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   
 
-  const canCreate = name.trim().length > 0;
+  const canCreate = name.trim().length > 0 && !creating;
+  const createKey = async () => {
+    if (!canCreate) return;
+    setCreating(true);
+    setError(null);
+
+    try {
+      const key = await invoke<SshKey>("generate_ssh_key", {
+        request: {
+          name: name.trim(),
+          type: keyType,
+          size: keyType === "rsa" ? keySize : null,
+          passphrase,
+          remark: name.trim(),
+        },
+      });
+      onCreated(key);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCreating(false);
+    }
+  };
 
   return (
     <div
@@ -2927,6 +2980,11 @@ function GenerateSshKeyModal({ onClose }: { onClose: () => void }) {
               </div>
             </FieldRow>
           </div>
+          {error && (
+            <div className="rounded-md border border-[oklch(0.55_0.2_25)]/40 bg-[oklch(0.55_0.2_25)]/10 px-3 py-2 text-xs text-[oklch(0.72_0.18_25)]">
+              {error}
+            </div>
+          )}
 
         </div>
 
@@ -2940,10 +2998,10 @@ function GenerateSshKeyModal({ onClose }: { onClose: () => void }) {
           </button>
           <button
             disabled={!canCreate}
-            onClick={onClose}
+            onClick={() => void createKey()}
             className="cursor-pointer rounded-md bg-[var(--color-brand-orange)] px-4 py-1.5 text-sm font-semibold text-[var(--color-primary-foreground)] transition disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"
           >
-            Create Key
+            {creating ? "Creating…" : "Create Key"}
           </button>
         </div>
       </div>
