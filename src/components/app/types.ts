@@ -71,3 +71,25 @@ export interface SshKey {
   publicKeyPath?: string;
   privateKeyPath?: string;
 }
+
+export type TunnelDirection = "local" | "remote" | "dynamic";
+
+export interface PortForwardRule {
+  id: string;
+  name: string;
+  hostId: string;
+  direction: TunnelDirection;
+  localHost: string;
+  localPort: number;
+  remoteHost: string;
+  remotePort: number;
+  autoConnect: boolean;
+  createdAt: string;
+}
+
+export interface TunnelStatus {
+  ruleId: string;
+  active: boolean;
+  pid?: number | null;
+  error?: string | null;
+}

@@ -1,10 +1,14 @@
 mod hosts;
+mod port_forwarding;
 mod pty_manager;
 mod ssh_keys;
 
 use hosts::{
     Host, HostGroup, HostsVault, SaveHostGroupRequest, SaveHostRequest, TestHostConnectionRequest,
     TestHostConnectionResult,
+};
+use port_forwarding::{
+    PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus,
 };
 use pty_manager::{PtyManager, TabInfo};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
@@ -18,6 +22,7 @@ static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct AppState {
     pty_manager: Mutex<PtyManager>,
+    tunnel_manager: TunnelManagerState,
 }
 
 #[tauri::command]
@@ -150,6 +155,50 @@ fn test_host_connection(
     hosts::test_host_connection(&app, request)
 }
 
+#[tauri::command]
+fn list_port_forwards(app: tauri::AppHandle) -> Result<Vec<PortForwardRule>, String> {
+    port_forwarding::list_port_forwards(&app)
+}
+
+#[tauri::command]
+fn save_port_forward(
+    app: tauri::AppHandle,
+    request: SavePortForwardRequest,
+) -> Result<PortForwardRule, String> {
+    port_forwarding::save_port_forward(&app, request)
+}
+
+#[tauri::command]
+fn remove_port_forwards(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    port_forwarding::remove_port_forwards(&app, &state.tunnel_manager, ids)
+}
+
+#[tauri::command]
+fn start_tunnel(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    rule_id: String,
+) -> Result<TunnelStatus, String> {
+    port_forwarding::start_tunnel(&app, &state.tunnel_manager, rule_id)
+}
+
+#[tauri::command]
+fn stop_tunnel(state: State<AppState>, rule_id: String) -> Result<TunnelStatus, String> {
+    port_forwarding::stop_tunnel(&state.tunnel_manager, rule_id)
+}
+
+#[tauri::command]
+fn get_tunnel_statuses(
+    state: State<AppState>,
+    rule_ids: Vec<String>,
+) -> Vec<TunnelStatus> {
+    port_forwarding::get_tunnel_statuses(&state.tunnel_manager, rule_ids)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -160,6 +209,7 @@ pub fn run() {
         )
         .manage(AppState {
             pty_manager: Mutex::new(PtyManager::new()),
+            tunnel_manager: port_forwarding::new_tunnel_manager(),
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
@@ -178,6 +228,12 @@ pub fn run() {
             save_host_group,
             remove_host_group,
             test_host_connection,
+            list_port_forwards,
+            save_port_forward,
+            remove_port_forwards,
+            start_tunnel,
+            stop_tunnel,
+            get_tunnel_statuses,
         ])
         .setup(|app| {
             // Build custom application menu
