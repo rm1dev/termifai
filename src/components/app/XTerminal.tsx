@@ -27,6 +27,7 @@ import {
   type ShortcutMap,
 } from "@/lib/shortcuts";
 import type { Snippet } from "@/components/app/types";
+import { Search } from "lucide-react";
 
 interface Props {
   sessionId?: string;
@@ -61,6 +62,89 @@ const initialConnectionStatus: ConnectionStatusPayload = {
   status: "active",
   message: "Opening TCP connection to SSH server...",
 };
+
+function EnumDropdown({
+  options,
+  value,
+  onChange,
+  onConfirm,
+  autoFocus,
+}: {
+  options: string[];
+  value: string;
+  onChange: (v: string) => void;
+  onConfirm: (selectedValue: string) => void;
+  autoFocus?: boolean;
+}) {
+  const [query, setQuery] = useState("");
+  const [activeIdx, setActiveIdx] = useState(0);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const filtered = options.filter((o) =>
+    o.toLowerCase().includes(query.toLowerCase())
+  );
+
+  useEffect(() => {
+    if (autoFocus) searchRef.current?.focus();
+  }, [autoFocus]);
+
+  useEffect(() => {
+    setActiveIdx(0);
+  }, [query]);
+
+  useEffect(() => {
+    const el = listRef.current?.children[activeIdx] as HTMLElement | undefined;
+    el?.scrollIntoView({ block: "nearest" });
+  }, [activeIdx]);
+
+  const confirm = (opt: string) => {
+    onChange(opt);
+    setQuery("");
+    onConfirm(opt);
+  };
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5 rounded-md border border-border bg-[var(--color-surface)] px-2">
+        <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+        <input
+          ref={searchRef}
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown") { e.preventDefault(); setActiveIdx((i) => Math.min(i + 1, filtered.length - 1)); }
+            else if (e.key === "ArrowUp") { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); }
+            else if (e.key === "Enter" && filtered[activeIdx]) { e.preventDefault(); confirm(filtered[activeIdx]); }
+          }}
+          placeholder="Search…"
+          className="h-7 flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+        />
+        {value && <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-xs text-foreground">{value}</span>}
+      </div>
+      <div ref={listRef} className="max-h-36 overflow-y-auto rounded-md border border-border bg-[var(--color-surface)]">
+        {filtered.length === 0 ? (
+          <div className="px-3 py-2 text-xs text-muted-foreground">No options</div>
+        ) : filtered.map((opt, i) => (
+          <button
+            key={opt}
+            type="button"
+            onClick={() => confirm(opt)}
+            className={[
+              "flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm transition",
+              i === activeIdx ? "bg-[var(--color-surface-2)] text-foreground" : "text-foreground hover:bg-[var(--color-surface-2)]/60",
+              opt === value ? "font-medium" : "",
+            ].join(" ")}
+          >
+            {opt === value && <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-orange)]" />}
+            {opt !== value && <span className="h-1.5 w-1.5" />}
+            {opt}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export function XTerminal({ sessionId, initialCommand, initialPassword, readyMarker, connectionLabel, connectionTitle, onClose, onSessionCreated }: Props) {
   const ref = useRef<HTMLDivElement>(null);
@@ -619,60 +703,95 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
         </div>
       )}
 
-      {/* Variable Prompt */}
-      {variablePrompt && (
-        <div className="absolute inset-0 z-20 flex items-start justify-center pt-12" onClick={() => { setVariablePrompt(null); setTimeout(() => termRef.current?.focus(), 50); }}>
-          <div
-            className="w-[400px] flex flex-col overflow-hidden rounded-lg border border-border bg-popover shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="border-b border-border px-4 py-3">
-              <h3 className="text-sm font-semibold text-foreground">Variables — {variablePrompt.snippet.name}</h3>
-              <p className="mt-0.5 text-xs text-muted-foreground">Fill in the variables and press Enter to execute.</p>
-            </div>
-            <div className="space-y-3 px-4 py-3">
-              {variablePrompt.snippet.variables?.map((v, idx) => (
-                <div key={v.name} className="space-y-1">
-                  <label className="text-xs font-medium text-muted-foreground">{v.label || v.name}</label>
-                  {v.type === "enum" ? (
-                    <select
-                      autoFocus={idx === 0}
-                      value={variablePrompt.values[v.name] ?? ""}
-                      onChange={(e) => setVariablePrompt((prev) => prev ? { ...prev, values: { ...prev.values, [v.name]: e.target.value } } : null)}
-                      className="h-8 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring/40"
-                    >
-                      {v.options?.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
-                    </select>
-                  ) : (
-                    <input
-                      autoFocus={idx === 0}
-                      value={variablePrompt.values[v.name] ?? ""}
-                      onChange={(e) => setVariablePrompt((prev) => prev ? { ...prev, values: { ...prev.values, [v.name]: e.target.value } } : null)}
-                      onKeyDown={(e) => { if (e.key === "Enter") submitVariables(); }}
-                      placeholder={v.defaultValue || v.name}
-                      className="h-8 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring/40"
-                    />
-                  )}
+      {/* Variable Prompt — wizard: one variable at a time */}
+      {variablePrompt && (() => {
+        const vars = variablePrompt.snippet.variables ?? [];
+        const idx = variablePrompt.currentIdx;
+        const v = vars[idx];
+        const isLast = idx === vars.length - 1;
+        if (!v) return null;
+
+        const goNext = (val: string) => {
+          const merged = { ...variablePrompt.values, [v.name]: val };
+          if (isLast) {
+            executeSnippet(variablePrompt.snippet, merged);
+          } else {
+            setVariablePrompt((prev) => prev ? { ...prev, values: merged, currentIdx: idx + 1 } : null);
+          }
+        };
+
+        const goPrev = () => {
+          if (idx > 0) setVariablePrompt((prev) => prev ? { ...prev, currentIdx: idx - 1 } : null);
+        };
+
+        return (
+          <div className="absolute inset-0 z-20 flex items-start justify-center pt-12" onClick={() => { setVariablePrompt(null); setTimeout(() => termRef.current?.focus(), 50); }}>
+            <div
+              className="w-[400px] flex flex-col overflow-hidden rounded-lg border border-border bg-popover shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="border-b border-border px-4 py-3">
+                <div className="flex items-center justify-between">
+                  <h3 className="text-sm font-semibold text-foreground">{variablePrompt.snippet.name}</h3>
+                  <span className="text-xs text-muted-foreground">{idx + 1} / {vars.length}</span>
                 </div>
-              ))}
-            </div>
-            <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-2.5">
-              <button
-                onClick={() => { setVariablePrompt(null); setTimeout(() => termRef.current?.focus(), 50); }}
-                className="rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={submitVariables}
-                className="rounded-md bg-[var(--color-brand-orange,oklch(0.75_0.15_55))] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90"
-              >
-                Execute
-              </button>
+                <div className="mt-1.5 flex gap-1">
+                  {vars.map((_, i) => (
+                    <span key={i} className={["h-1 flex-1 rounded-full transition-colors", i <= idx ? "bg-[var(--color-brand-orange)]" : "bg-border"].join(" ")} />
+                  ))}
+                </div>
+              </div>
+              <div className="px-4 py-4">
+                <label className="mb-2 block text-xs font-medium text-foreground">{v.label || v.name}</label>
+                {v.type === "enum" ? (
+                  <EnumDropdown
+                    options={v.options ?? []}
+                    value={variablePrompt.values[v.name] ?? ""}
+                    onChange={(val) => setVariablePrompt((prev) => prev ? { ...prev, values: { ...prev.values, [v.name]: val } } : null)}
+                    onConfirm={(val) => goNext(val)}
+                    autoFocus
+                  />
+                ) : (
+                  <input
+                    autoFocus
+                    value={variablePrompt.values[v.name] ?? ""}
+                    onChange={(e) => setVariablePrompt((prev) => prev ? { ...prev, values: { ...prev.values, [v.name]: e.target.value } } : null)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") goNext(variablePrompt.values[v.name] ?? "");
+                    }}
+                    placeholder={v.defaultValue || v.name}
+                    className="h-8 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring/40"
+                  />
+                )}
+              </div>
+              <div className="flex items-center justify-between border-t border-border px-4 py-2.5">
+                <button
+                  onClick={() => { setVariablePrompt(null); setTimeout(() => termRef.current?.focus(), 50); }}
+                  className="rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+                >
+                  Cancel
+                </button>
+                <div className="flex items-center gap-2">
+                  {idx > 0 && (
+                    <button
+                      onClick={goPrev}
+                      className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-foreground hover:bg-[var(--color-surface-2)]"
+                    >
+                      Back
+                    </button>
+                  )}
+                  <button
+                    onClick={() => goNext(variablePrompt.values[v.name] ?? "")}
+                    className="rounded-md bg-[var(--color-brand-orange,oklch(0.75_0.15_55))] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90"
+                  >
+                    {isLast ? "Execute" : "Next"}
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }

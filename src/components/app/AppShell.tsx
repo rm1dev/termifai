@@ -47,6 +47,7 @@ import {
   Container,
   
   Gauge,
+  GripVertical,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -96,9 +97,11 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { restrictToHorizontalAxis, restrictToParentElement } from "@dnd-kit/modifiers";
+import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import {
   SortableContext,
   horizontalListSortingStrategy,
+  verticalListSortingStrategy,
   useSortable,
   arrayMove,
 } from "@dnd-kit/sortable";
@@ -4042,8 +4045,11 @@ function SnippetsView() {
 
   const toggleSelect = (id: string, additive: boolean) => {
     setSelected((curr) => {
-      const next = new Set(additive ? curr : []);
-      if (curr.has(id) && additive) next.delete(id);
+      if (!additive) {
+        return curr.has(id) && curr.size === 1 ? new Set() : new Set([id]);
+      }
+      const next = new Set(curr);
+      if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
@@ -4220,7 +4226,6 @@ function SnippetsView() {
                   <div
                     key={s.id}
                     onClick={(e) => toggleSelect(s.id, e.metaKey || e.ctrlKey || e.shiftKey)}
-                    onDoubleClick={() => setEditor({ open: true, snippet: s })}
                     className={[
                       "group relative flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-left transition",
                       isSel
@@ -4244,11 +4249,11 @@ function SnippetsView() {
                     </div>
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
-                        title="Run"
-                        onClick={(e) => { e.stopPropagation(); }}
+                        title="Edit"
+                        onClick={(e) => { e.stopPropagation(); setEditor({ open: true, snippet: s }); }}
                         className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
                       >
-                        <Play className="h-3.5 w-3.5" />
+                        <Settings className="h-3.5 w-3.5" />
                       </button>
                       <button
                         title="Remove"
@@ -4272,7 +4277,6 @@ function SnippetsView() {
                   <div
                     key={s.id}
                     onClick={(e) => toggleSelect(s.id, e.metaKey || e.ctrlKey || e.shiftKey)}
-                    onDoubleClick={() => setEditor({ open: true, snippet: s })}
                     className={[
                       "group flex cursor-pointer items-center gap-3 px-3 py-2.5 text-left transition",
                       i > 0 ? "border-t border-border" : "",
@@ -4294,16 +4298,16 @@ function SnippetsView() {
                     )}
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
-                        title="Run"
-                        onClick={(e) => { e.stopPropagation(); }}
-                        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-3,var(--color-surface-2))] hover:text-foreground"
+                        title="Edit"
+                        onClick={(e) => { e.stopPropagation(); setEditor({ open: true, snippet: s }); }}
+                        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
                       >
-                        <Play className="h-3.5 w-3.5" />
+                        <Settings className="h-3.5 w-3.5" />
                       </button>
                       <button
                         title="Remove"
                         onClick={(e) => { e.stopPropagation(); setRemoving([s.id]); }}
-                        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-3,var(--color-surface-2))] hover:text-[oklch(0.72_0.18_25)]"
+                        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-[oklch(0.72_0.18_25)]"
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -4335,6 +4339,132 @@ function SnippetsView() {
   );
 }
 
+function SortableVariableRow({
+  id, v, idx, updateVariable, removeVariable,
+}: {
+  id: string;
+  v: SnippetVariable;
+  idx: number;
+  updateVariable: (idx: number, patch: Partial<SnippetVariable>) => void;
+  removeVariable: (idx: number) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform ? { ...transform, x: 0, scaleX: 1, scaleY: 1 } : null),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : undefined,
+  };
+  return (
+    <div ref={setNodeRef} style={style} className="flex items-center gap-2 rounded-md border border-border bg-[var(--color-surface)] p-2">
+      <button
+        type="button"
+        {...attributes}
+        {...listeners}
+        className="flex h-7 w-5 cursor-grab items-center justify-center text-muted-foreground/50 hover:text-muted-foreground active:cursor-grabbing"
+      >
+        <GripVertical className="h-3.5 w-3.5" />
+      </button>
+      <input
+        value={v.name}
+        onChange={(e) => updateVariable(idx, { name: e.target.value })}
+        placeholder="name"
+        className="h-7 w-24 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+      />
+      <select
+        value={v.type}
+        onChange={(e) => updateVariable(idx, { type: e.target.value as "text" | "enum" })}
+        className="h-7 rounded border border-border bg-[var(--color-surface)] px-2 text-xs text-foreground focus:outline-none"
+      >
+        <option value="text">text</option>
+        <option value="enum">enum</option>
+      </select>
+      {v.type === "text" && (
+        <input
+          value={v.defaultValue ?? ""}
+          onChange={(e) => updateVariable(idx, { defaultValue: e.target.value })}
+          placeholder="default"
+          className="h-7 flex-1 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+        />
+      )}
+      {v.type === "enum" && (
+        <EnumOptionsInput
+          value={v.options ?? []}
+          onChange={(opts) => updateVariable(idx, { options: opts })}
+        />
+      )}
+      <button
+        type="button"
+        onClick={() => removeVariable(idx)}
+        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:text-[oklch(0.72_0.18_25)]"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
+function EnumOptionsInput({ value, onChange }: { value: string[]; onChange: (opts: string[]) => void }) {
+  const [draft, setDraft] = useState(value.join(", "));
+  return (
+    <input
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => onChange(draft.split(",").map((o) => o.trim()).filter(Boolean))}
+      placeholder="opt1, opt2, opt3"
+      className="h-7 flex-1 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+    />
+  );
+}
+
+function CodeEditor({
+  value,
+  onChange,
+  placeholder,
+  minRows = 6,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  minRows?: number;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const gutterRef = useRef<HTMLDivElement>(null);
+  const lines = value.split("\n");
+  const lineCount = Math.max(lines.length, minRows);
+  const lineH = 1.625;
+
+  const syncScroll = () => {
+    if (textareaRef.current && gutterRef.current)
+      gutterRef.current.scrollTop = textareaRef.current.scrollTop;
+  };
+
+  return (
+    <div className="flex overflow-hidden rounded-md border border-border bg-[var(--color-surface)] font-mono text-sm">
+      <div
+        ref={gutterRef}
+        aria-hidden
+        className="select-none overflow-hidden border-r border-border bg-[var(--color-surface-2)] px-2 py-2 text-right text-xs text-muted-foreground/50"
+        style={{ minWidth: `${String(lineCount).length * 0.55 + 1.5}rem`, lineHeight: `${lineH}rem` }}
+      >
+        {Array.from({ length: lineCount }, (_, i) => (
+          <div key={i} style={{ height: `${lineH}rem` }}>{i + 1}</div>
+        ))}
+      </div>
+      <textarea
+        ref={textareaRef}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onScroll={syncScroll}
+        placeholder={placeholder}
+        spellCheck={false}
+        className="flex-1 resize-none bg-transparent px-3 py-2 text-foreground placeholder:text-muted-foreground/50 focus:outline-none"
+        style={{ minHeight: `${lineCount * lineH + 1}rem`, lineHeight: `${lineH}rem` }}
+      />
+    </div>
+  );
+}
+
 function SnippetModal({
   snippet, onClose, onSubmit,
 }: {
@@ -4347,7 +4477,13 @@ function SnippetModal({
   const [body, setBody] = useState(snippet?.body ?? "");
   const [command, setCommand] = useState(snippet?.command ?? "");
   const [script, setScript] = useState(snippet?.script ?? "");
-  const [variables, setVariables] = useState<SnippetVariable[]>(snippet?.variables ?? []);
+  const [variables, setVariables] = useState<SnippetVariable[]>(
+    () => (snippet?.variables ?? []).map((v) => ({ ...v, _id: v._id ?? `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` }))
+  );
+
+  const varSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+  );
 
   const valid = name.trim() && (
     (kind === "text" && body.trim()) ||
@@ -4356,7 +4492,7 @@ function SnippetModal({
   );
 
   const addVariable = () => {
-    setVariables([...variables, { name: "", type: "text", defaultValue: "", options: [] }]);
+    setVariables([...variables, { _id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, name: "", type: "text", defaultValue: "", options: [] }]);
   };
 
   const updateVariable = (idx: number, patch: Partial<SnippetVariable>) => {
@@ -4368,141 +4504,133 @@ function SnippetModal({
   };
 
   return (
-    <ModalShell title={snippet ? "Edit snippet" : "New snippet"} onClose={onClose}>
-      <Field label="Name">
-        <input
-          autoFocus
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. Disk Size"
-          className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-        />
-      </Field>
-      <Field label="Type">
-        <div className="flex gap-2">
-          {(["text", "command", "script"] as const).map((k) => {
-            const meta = SNIPPET_KIND_META[k];
-            return (
-              <button
-                key={k}
-                type="button"
-                onClick={() => setKind(k)}
-                className={[
-                  "flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition",
-                  kind === k
-                    ? "border-[var(--color-brand-orange)]/60 bg-[var(--color-brand-orange)]/10 text-foreground"
-                    : "border-border text-muted-foreground hover:text-foreground hover:bg-[var(--color-surface-2)]",
-                ].join(" ")}
-              >
-                {meta.label}
-              </button>
-            );
-          })}
-        </div>
-      </Field>
-      {kind === "text" && (
-        <Field label="Body">
-          <textarea
-            value={body}
-            onChange={(e) => setBody(e.target.value)}
-            placeholder="Inline text template…"
-            rows={4}
-            className="w-full resize-none rounded-md border border-border bg-[var(--color-surface)] px-3 py-2 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-          />
-        </Field>
-      )}
-      {kind === "command" && (
-        <Field label="Command">
-          <textarea
-            value={command}
-            onChange={(e) => setCommand(e.target.value)}
-            placeholder="df -h /"
-            rows={2}
-            className="w-full resize-none rounded-md border border-border bg-[var(--color-surface)] px-3 py-2 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-          />
-        </Field>
-      )}
-      {kind === "script" && (
-        <Field label="Script">
-          <textarea
-            value={script}
-            onChange={(e) => setScript(e.target.value)}
-            placeholder={"#!/bin/bash\n# Your script here…"}
-            rows={6}
-            className="w-full resize-none rounded-md border border-border bg-[var(--color-surface)] px-3 py-2 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-          />
-        </Field>
-      )}
-      {/* Variables section */}
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <label className="text-xs font-medium text-muted-foreground">Variables</label>
-          <button
-            type="button"
-            onClick={addVariable}
-            className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-          >
-            <Plus className="h-3 w-3" /> Add
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+      <div
+        className="flex w-[880px] max-w-[95vw] max-h-[75vh] flex-col overflow-hidden rounded-xl border border-border bg-popover shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex shrink-0 items-center justify-between border-b border-border px-5 py-3">
+          <h3 className="text-sm font-semibold text-foreground">{snippet ? "Edit snippet" : "New snippet"}</h3>
+          <button onClick={onClose} className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground">
+            <X className="h-4 w-4" />
           </button>
         </div>
-        {variables.map((v, idx) => (
-          <div key={idx} className="flex items-center gap-2 rounded-md border border-border bg-[var(--color-surface)] p-2">
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+          <Field label="Name">
             <input
-              value={v.name}
-              onChange={(e) => updateVariable(idx, { name: e.target.value })}
-              placeholder="name"
-              className="h-7 w-24 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Disk Size"
+              className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
             />
-            <select
-              value={v.type}
-              onChange={(e) => updateVariable(idx, { type: e.target.value as "text" | "enum" })}
-              className="h-7 rounded border border-border bg-[var(--color-surface)] px-2 text-xs text-foreground focus:outline-none"
-            >
-              <option value="text">text</option>
-              <option value="enum">enum</option>
-            </select>
-            {v.type === "text" && (
+          </Field>
+          <Field label="Type">
+            <div className="flex gap-2">
+              {(["text", "command", "script"] as const).map((k) => (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => setKind(k)}
+                  className={[
+                    "flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition",
+                    kind === k
+                      ? "border-[var(--color-brand-orange)]/60 bg-[var(--color-brand-orange)]/10 text-foreground"
+                      : "border-border text-muted-foreground hover:text-foreground hover:bg-[var(--color-surface-2)]",
+                  ].join(" ")}
+                >
+                  {SNIPPET_KIND_META[k].label}
+                </button>
+              ))}
+            </div>
+          </Field>
+          {kind === "text" && (
+            <Field label="Body">
               <input
-                value={v.defaultValue ?? ""}
-                onChange={(e) => updateVariable(idx, { defaultValue: e.target.value })}
-                placeholder="default"
-                className="h-7 flex-1 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                placeholder="e.g. Hello {{name}}…"
+                className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-3 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
               />
+            </Field>
+          )}
+          {kind === "command" && (
+            <Field label="Command">
+              <CodeEditor value={command} onChange={setCommand} placeholder="e.g. ssh {{user}}@{{host}}" minRows={6} />
+            </Field>
+          )}
+          {kind === "script" && (
+            <Field label="Script">
+              <CodeEditor value={script} onChange={setScript} placeholder="#!/bin/bash" minRows={10} />
+            </Field>
+          )}
+          {/* Variables section */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-medium text-muted-foreground">Variables</label>
+                <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground/70">{"{{var_name}}"}</span>
+              </div>
+              <button
+                type="button"
+                onClick={addVariable}
+                className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+              >
+                <Plus className="h-3 w-3" /> Add
+              </button>
+            </div>
+            {variables.length > 0 && (
+              <DndContext
+                sensors={varSensors}
+                collisionDetection={closestCenter}
+                modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+                onDragEnd={(e) => {
+                  const { active, over } = e;
+                  if (!over || active.id === over.id) return;
+                  const from = variables.findIndex((v) => v._id === active.id);
+                  const to = variables.findIndex((v) => v._id === over.id);
+                  if (from !== -1 && to !== -1) setVariables((curr) => arrayMove(curr, from, to));
+                }}
+              >
+                <SortableContext items={variables.map((v) => v._id!)} strategy={verticalListSortingStrategy}>
+                  {variables.map((v, idx) => (
+                    <SortableVariableRow
+                      key={v._id}
+                      id={v._id!}
+                      v={v}
+                      idx={idx}
+                      updateVariable={updateVariable}
+                      removeVariable={removeVariable}
+                    />
+                  ))}
+                </SortableContext>
+              </DndContext>
             )}
-            {v.type === "enum" && (
-              <input
-                value={(v.options ?? []).join(", ")}
-                onChange={(e) => updateVariable(idx, { options: e.target.value.split(",").map((o) => o.trim()).filter(Boolean) })}
-                placeholder="opt1, opt2, opt3"
-                className="h-7 flex-1 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
-              />
-            )}
-            <button
-              type="button"
-              onClick={() => removeVariable(idx)}
-              className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:text-[oklch(0.72_0.18_25)]"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
           </div>
-        ))}
+        </div>
+        <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border px-5 py-3">
+          <button onClick={onClose} className="h-8 rounded-md px-3 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground">
+            Cancel
+          </button>
+          <button
+            onClick={() => valid && onSubmit({
+              id: snippet?.id ?? `s-${Date.now()}`,
+              kind,
+              name: name.trim(),
+              body: kind === "text" ? body.trim() : undefined,
+              command: kind === "command" ? command.trim() : undefined,
+              script: kind === "script" ? script.trim() : undefined,
+              variables: variables.filter((v) => v.name.trim()),
+              createdAt: snippet?.createdAt ?? new Date().toISOString(),
+            })}
+            disabled={!valid}
+            className="h-8 rounded-md bg-[var(--color-brand-orange)] px-3 text-xs font-semibold text-[var(--color-primary-foreground)] disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"
+          >
+            {snippet ? "Save" : "Create snippet"}
+          </button>
+        </div>
       </div>
-      <ModalActions
-        onClose={onClose}
-        onConfirm={() => valid && onSubmit({
-          id: snippet?.id ?? `s-${Date.now()}`,
-          kind,
-          name: name.trim(),
-          body: kind === "text" ? body.trim() : undefined,
-          command: kind === "command" ? command.trim() : undefined,
-          script: kind === "script" ? script.trim() : undefined,
-          variables: variables.filter((v) => v.name.trim()),
-          createdAt: snippet?.createdAt ?? new Date().toISOString(),
-        })}
-        confirmDisabled={!valid}
-        confirmLabel={snippet ? "Save" : "Create snippet"}
-      />
-    </ModalShell>
+    </div>
   );
 }
 
