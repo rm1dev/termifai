@@ -35,6 +35,7 @@ interface Props {
   readyMarker?: string;
   connectionLabel?: string;
   connectionTitle?: string;
+  isActive?: boolean;
   onClose?: () => void;
   onSessionCreated?: (sessionId: string) => void;
 }
@@ -62,7 +63,7 @@ const initialConnectionStatus: ConnectionStatusPayload = {
   message: "Opening TCP connection to SSH server...",
 };
 
-export function XTerminal({ sessionId, initialCommand, initialPassword, readyMarker, connectionLabel, connectionTitle, onClose, onSessionCreated }: Props) {
+export function XTerminal({ sessionId, initialCommand, initialPassword, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [isConnecting, setIsConnecting] = useState(Boolean(readyMarker && !sessionId));
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
@@ -359,28 +360,22 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
     }
   }, [onSessionCreated]);
 
-  // Re-fit when container becomes visible (e.g., tab switch)
+  // Re-fit and focus when this tab becomes active
   useEffect(() => {
-    if (!ref.current) return;
-    const observer = new IntersectionObserver((entries) => {
-      if (entries[0].isIntersecting && fitAddonRef.current) {
-        setTimeout(() => {
-          fitAddonRef.current?.fit();
-          termRef.current?.focus();
-        }, 0);
-      }
+    if (!isActive || isConnecting) return;
+    requestAnimationFrame(() => {
+      fitAddonRef.current?.fit();
+      requestAnimationFrame(() => termRef.current?.focus());
     });
-    observer.observe(ref.current);
-    return () => observer.disconnect();
-  }, []);
+  }, [isActive, isConnecting]);
 
   // Focus terminal when connection overlay is dismissed
   useEffect(() => {
     if (!isConnecting && termRef.current) {
-      setTimeout(() => {
+      requestAnimationFrame(() => {
         fitAddonRef.current?.fit();
-        termRef.current?.focus();
-      }, 50);
+        requestAnimationFrame(() => termRef.current?.focus());
+      });
     }
   }, [isConnecting]);
 

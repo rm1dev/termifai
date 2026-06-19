@@ -176,13 +176,18 @@ export function AppShell() {
   };
 
   const closeTab = (id: string) => {
-    setTabs((curr) => {
-      const tgt = curr.find((t) => t.id === id);
-      if (tgt && !tgt.closable) return curr;
-      const next = curr.filter((t) => t.id !== id);
-      if (id === activeTab && next.length) setActiveTab(next[next.length - 1].id);
-      return next;
-    });
+    const curr = tabsRef.current;
+    const tgt = curr.find((t) => t.id === id);
+    if (tgt && !tgt.closable) return;
+
+    const next = curr.filter((t) => t.id !== id);
+    setTabs(next);
+
+    if (id === activeTabRef.current && next.length) {
+      const closedIndex = curr.findIndex((t) => t.id === id);
+      const newActive = next[closedIndex - 1] ?? next[next.length - 1];
+      setActiveTab(newActive.id);
+    }
   };
 
   const renameTab = (id: string, title: string) => {
@@ -329,6 +334,7 @@ export function AppShell() {
                 readyMarker={t.readyMarker}
                 connectionLabel={t.connectionLabel}
                 connectionTitle={t.connectionTitle}
+                isActive={t.id === activeTab}
                 onClose={() => closeTab(t.id)}
                 onSessionCreated={(sid) => updateTabSession(t.id, sid)}
               />

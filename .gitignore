@@ -9,6 +9,7 @@ src-tauri/target/
 .vscode/
 .idea/
 .kiro/
+.amazonq/
 AGENTS.md
 
 # OS
