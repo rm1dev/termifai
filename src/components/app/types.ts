@@ -54,6 +54,7 @@ export type SnippetKind = "text" | "command" | "script";
 export type SnippetVariableType = "text" | "enum";
 
 export interface SnippetVariable {
+  _id?: string; // unique ID for drag-and-drop tracking
   name: string;
   label?: string;
   type: SnippetVariableType;
