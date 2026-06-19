@@ -2559,15 +2559,12 @@ function SshKeysView() {
       {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <SplitButton
-            primary={<><Plus className="h-3.5 w-3.5" /> New key</>}
-            onPrimary={() => setShowGenerate(true)}
-            menu={[
-              { label: "Generate new key", icon: <KeyRound className="h-3.5 w-3.5" />, onClick: () => setShowGenerate(true) },
-              { label: "Import from file", icon: <FileUp className="h-3.5 w-3.5" />, onClick: () => {} },
-              { label: "Import from pasteboard", icon: <Clipboard className="h-3.5 w-3.5" />, onClick: () => {} },
-            ]}
-          />
+          <button
+            onClick={() => setShowGenerate(true)}
+            className="flex h-7 items-center gap-1 rounded-md bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-white/5"
+          >
+            <Plus className="h-3.5 w-3.5" /> New key
+          </button>
           {selectedIds.length > 0 && (
             <button
               onClick={() => setRemoving(selectedIds)}
