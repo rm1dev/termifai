@@ -62,6 +62,8 @@ impl PtyManager {
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
         let mut cmd = CommandBuilder::new(&shell);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
         if let Some(initial_command) = initial_command.filter(|command| !command.trim().is_empty())
         {
             cmd.arg("-lc");
