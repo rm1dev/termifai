@@ -5,7 +5,8 @@ export type ShortcutActionId =
   | "close-tab"
   | "next-tab"
   | "previous-tab"
-  | "open-settings";
+  | "open-settings"
+  | "open-snippets";
 
 export interface ShortcutBinding {
   key: string;
@@ -58,6 +59,12 @@ export const shortcutDefinitions: ShortcutDefinition[] = [
     label: "Open settings",
     description: "Open or focus the Settings window",
     defaultBinding: binding(",", { metaKey: true, code: "Comma" }),
+  },
+  {
+    id: "open-snippets",
+    label: "Snippets",
+    description: "Open snippets list in the terminal",
+    defaultBinding: binding("s", { metaKey: true, shiftKey: true, code: "KeyS" }),
   },
 ];
 

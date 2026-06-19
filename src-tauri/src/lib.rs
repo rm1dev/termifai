@@ -1,6 +1,7 @@
 mod hosts;
 mod port_forwarding;
 mod pty_manager;
+mod snippets;
 mod ssh_keys;
 
 use hosts::{
@@ -11,6 +12,7 @@ use port_forwarding::{
     PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus,
 };
 use pty_manager::{PtyManager, TabInfo};
+use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -199,6 +201,70 @@ fn get_tunnel_statuses(
     port_forwarding::get_tunnel_statuses(&state.tunnel_manager, rule_ids)
 }
 
+#[tauri::command]
+fn list_snippets(app: tauri::AppHandle) -> Result<Vec<Snippet>, String> {
+    snippets::list_snippets(&app)
+}
+
+#[tauri::command]
+fn save_snippet(app: tauri::AppHandle, request: SaveSnippetRequest) -> Result<Snippet, String> {
+    snippets::save_snippet(&app, request)
+}
+
+#[tauri::command]
+fn remove_snippets(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
+    snippets::remove_snippets(&app, ids)
+}
+
+#[tauri::command]
+fn run_snippet_script(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    title: String,
+    script: String,
+) -> Result<(), String> {
+    // Emit title message directly to xterm via event (bypasses PTY — user sees the title)
+    let title_msg = format!(
+        "\x1b[38;2;255;207;107m▶ {} script started...\x1b[0m\r\n",
+        title
+    );
+    let event_name = format!("term:{}:output", session_id);
+    let _ = app.emit(&event_name, title_msg);
+
+    // Strategy for hiding the command from terminal display AND supporting remote SSH:
+    // We cannot write to the remote filesystem from Rust directly.
+    // Instead we use heredoc via PTY to write the script to /tmp on the target machine,
+    // then execute it. The heredoc content is NOT echoed by the shell (only the cat command is).
+    // A wrapper script erases the visible command line with ANSI escapes.
+    //
+    // The full sequence sent to PTY:
+    //   printf '\033[1A\033[2K\r' && cat > /tmp/termifai_s_ID.sh << 'TERMIFAI_SNIPPET_EOF'
+    //   [script content - not echoed by shell]
+    //   TERMIFAI_SNIPPET_EOF
+    //   chmod +x /tmp/termifai_s_ID.sh && bash /tmp/termifai_s_ID.sh; rm -f /tmp/termifai_s_ID.sh
+
+    let script_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let script_id = &script_id[..8];
+    let tmp_path = format!("/tmp/termifai_s_{}.sh", script_id);
+    let eof_marker = "TERMIFAI_SNIPPET_EOF";
+
+    // Build the full payload to send to PTY
+    // Line 1: erase the echoed command + write script via heredoc
+    // Line 2..N: script content (shell does NOT echo heredoc body)
+    // Last line: EOF marker
+    // Then: chmod + execute + cleanup
+    let payload = format!(
+        " printf '\\033[1A\\033[2K\\r' && cat > {path} << '{eof}'\r{script}\r{eof}\rchmod +x {path} && bash {path}; rm -f {path}\r",
+        path = tmp_path,
+        eof = eof_marker,
+        script = script.replace('\r', ""),
+    );
+
+    let manager = state.pty_manager.lock().unwrap();
+    manager.write_to_session(&session_id, &payload)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -234,6 +300,10 @@ pub fn run() {
             start_tunnel,
             stop_tunnel,
             get_tunnel_statuses,
+            list_snippets,
+            save_snippet,
+            remove_snippets,
+            run_snippet_script,
         ])
         .setup(|app| {
             // Build custom application menu

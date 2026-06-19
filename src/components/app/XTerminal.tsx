@@ -1,4 +1,4 @@
-import { useEffect, useRef, useLayoutEffect, useState } from "react";
+import { useEffect, useRef, useLayoutEffect, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -19,6 +19,14 @@ import {
   loadAppTheme,
   type AppTheme,
 } from "@/lib/app-theme";
+import {
+  isShortcutMatch,
+  loadShortcuts,
+  shortcutsChangedEvent,
+  shortcutsStorageKey,
+  type ShortcutMap,
+} from "@/lib/shortcuts";
+import type { Snippet } from "@/components/app/types";
 
 interface Props {
   sessionId?: string;
@@ -60,6 +68,12 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
   const [connectionLogs, setConnectionLogs] = useState<string[]>([]);
   const [showConnectionLogs, setShowConnectionLogs] = useState(false);
+  const [snippetPalette, setSnippetPalette] = useState(false);
+  const [snippets, setSnippets] = useState<Snippet[]>([]);
+  const [snippetQuery, setSnippetQuery] = useState("");
+  const [snippetIndex, setSnippetIndex] = useState(0);
+  const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
+  const shortcutsRefLocal = useRef<ShortcutMap>(loadShortcuts());
   const termRef = useRef<Terminal | null>(null);
   const sessionRef = useRef<string | null>(sessionId ?? null);
   const unlistenOutputRef = useRef<UnlistenFn | null>(null);
@@ -98,6 +112,25 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
     term.open(ref.current);
     termRef.current = term;
     requestAnimationFrame(() => term.focus());
+
+    // Intercept Cmd+Shift+S for snippet palette
+    term.attachCustomKeyEventHandler((event) => {
+      const shortcuts = shortcutsRefLocal.current;
+      if (shortcuts["open-snippets"] && isShortcutMatch(event, shortcuts["open-snippets"])) {
+        if (event.type === "keydown") {
+          event.preventDefault();
+          // Load snippets from backend
+          invoke<Snippet[]>("list_snippets").then((data) => {
+            setSnippets(data);
+            setSnippetQuery("");
+            setSnippetIndex(0);
+            setSnippetPalette(true);
+          }).catch(() => {});
+        }
+        return false; // prevent xterm from processing this key
+      }
+      return true;
+    });
 
     const safeFit = () => {
       try {
@@ -141,6 +174,12 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
     window.addEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
     window.addEventListener(appThemeChangedEvent, onAppThemeChanged);
     window.addEventListener("storage", onStorageChanged);
+    const onShortcutStorageChanged = (event: StorageEvent) => {
+      if (event.key === shortcutsStorageKey) {
+        shortcutsRefLocal.current = loadShortcuts();
+      }
+    };
+    window.addEventListener("storage", onShortcutStorageChanged);
     void ensureTerminalFontLoaded(appearance).then(() => {
       term.options.fontFamily = getTerminalFontStack(appearance.fontFamily);
       term.options.fontSize = appearance.fontSize;
@@ -274,6 +313,7 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
       window.removeEventListener(appThemeChangedEvent, onAppThemeChanged);
       window.removeEventListener("storage", onStorageChanged);
+      window.removeEventListener("storage", onShortcutStorageChanged);
       unlistenAppTheme?.();
       unlistenAppearance?.();
       ro.disconnect();
@@ -343,6 +383,101 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
       }, 50);
     }
   }, [isConnecting]);
+
+  // ── Snippet Palette Logic ──────────────────────────────────────────────────
+
+  const filteredSnippets = snippets.filter((s) => {
+    // Filter by search query
+    if (!snippetQuery.trim()) return true;
+    const q = snippetQuery.toLowerCase();
+    const content = s.body || s.command || s.script || "";
+    return s.name.toLowerCase().includes(q) || content.toLowerCase().includes(q);
+  });
+
+  const executeSnippet = useCallback((snippet: Snippet, varValues?: Record<string, string>) => {
+    const sid = sessionRef.current;
+    if (!sid) return;
+
+    const resolveVars = (text: string) => {
+      if (!snippet.variables?.length) return text;
+      let resolved = text;
+      for (const v of snippet.variables) {
+        const val = varValues?.[v.name] ?? v.defaultValue ?? "";
+        resolved = resolved.replaceAll(`{{${v.name}}}`, val);
+        resolved = resolved.replaceAll(`\${${v.name}}`, val);
+        resolved = resolved.replaceAll(`{${v.name}}`, val);
+      }
+      return resolved;
+    };
+
+    if (snippet.kind === "text") {
+      const body = resolveVars(snippet.body ?? "");
+      invoke("write_to_session", { sessionId: sid, data: body }).catch(() => {});
+    } else if (snippet.kind === "command") {
+      const cmd = resolveVars(snippet.command ?? "");
+      invoke("write_to_session", { sessionId: sid, data: cmd + "\r" }).catch(() => {});
+    } else if (snippet.kind === "script") {
+      const script = resolveVars(snippet.script ?? "");
+      // Send script to backend — it writes a temp .sh file, executes it, and cleans up
+      // Only title message is shown in terminal, not the script content
+      invoke("run_snippet_script", {
+        sessionId: sid,
+        title: snippet.name,
+        script,
+      }).catch((err) => console.error("run_snippet_script failed:", err));
+    }
+
+    setSnippetPalette(false);
+    setVariablePrompt(null);
+    // Refocus terminal
+    setTimeout(() => termRef.current?.focus(), 50);
+  }, []);
+
+  const selectSnippet = useCallback((snippet: Snippet) => {
+    if (snippet.variables && snippet.variables.length > 0) {
+      // Show variable prompt
+      const defaults: Record<string, string> = {};
+      for (const v of snippet.variables) {
+        defaults[v.name] = v.defaultValue ?? (v.type === "enum" ? (v.options?.[0] ?? "") : "");
+      }
+      setVariablePrompt({ snippet, values: defaults, currentIdx: 0 });
+      setSnippetPalette(false);
+    } else {
+      executeSnippet(snippet);
+    }
+  }, [executeSnippet]);
+
+  const submitVariables = useCallback(() => {
+    if (!variablePrompt) return;
+    executeSnippet(variablePrompt.snippet, variablePrompt.values);
+  }, [variablePrompt, executeSnippet]);
+
+  // Palette keyboard navigation
+  useEffect(() => {
+    if (!snippetPalette) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSnippetPalette(false);
+        setTimeout(() => termRef.current?.focus(), 50);
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSnippetIndex((i) => Math.min(i + 1, filteredSnippets.length - 1));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSnippetIndex((i) => Math.max(i - 1, 0));
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        const selected = filteredSnippets[snippetIndex];
+        if (selected) selectSnippet(selected);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [snippetPalette, filteredSnippets, snippetIndex, selectSnippet]);
+
+  // Reset index when query changes
+  useEffect(() => { setSnippetIndex(0); }, [snippetQuery]);
 
   return (
     <div className="relative h-full w-full bg-background">
@@ -430,6 +565,114 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
         className="xterm-wrapper h-full w-full pl-1 pt-1"
         style={{ visibility: isConnecting ? "hidden" : "visible" }}
       />
+
+      {/* Snippet Palette */}
+      {snippetPalette && (
+        <div className="absolute inset-0 z-20 flex items-start justify-center pt-12" onClick={() => { setSnippetPalette(false); setTimeout(() => termRef.current?.focus(), 50); }}>
+          <div
+            className="w-[420px] max-h-[360px] flex flex-col overflow-hidden rounded-lg border border-border bg-popover shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+              <svg className="h-4 w-4 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" /></svg>
+              <input
+                autoFocus
+                value={snippetQuery}
+                onChange={(e) => setSnippetQuery(e.target.value)}
+                placeholder="Search snippets…"
+                className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+              />
+              <kbd className="rounded border border-border bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">ESC</kbd>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {filteredSnippets.length === 0 ? (
+                <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+                  No snippets found.
+                </div>
+              ) : (
+                filteredSnippets.map((s, i) => {
+                  const kindColors: Record<string, string> = { text: "oklch(0.55_0.15_160)", command: "oklch(0.45_0.15_230)", script: "oklch(0.55_0.15_300)" };
+                  const kindLabels: Record<string, string> = { text: "Text", command: "Cmd", script: "Script" };
+                  return (
+                    <div
+                      key={s.id}
+                      onClick={() => selectSnippet(s)}
+                      className={[
+                        "flex cursor-pointer items-center gap-3 px-3 py-2 transition",
+                        i === snippetIndex ? "bg-[var(--color-surface-2)]" : "hover:bg-[var(--color-surface-2)]/60",
+                      ].join(" ")}
+                    >
+                      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
+                        {kindLabels[s.kind]?.[0] || "C"}
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
+                        <div className="truncate text-xs text-muted-foreground font-mono">{s.body || s.command || s.script || ""}</div>
+                      </div>
+                      <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">{kindLabels[s.kind] || "Command"}</span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Variable Prompt */}
+      {variablePrompt && (
+        <div className="absolute inset-0 z-20 flex items-start justify-center pt-12" onClick={() => { setVariablePrompt(null); setTimeout(() => termRef.current?.focus(), 50); }}>
+          <div
+            className="w-[400px] flex flex-col overflow-hidden rounded-lg border border-border bg-popover shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="border-b border-border px-4 py-3">
+              <h3 className="text-sm font-semibold text-foreground">Variables — {variablePrompt.snippet.name}</h3>
+              <p className="mt-0.5 text-xs text-muted-foreground">Fill in the variables and press Enter to execute.</p>
+            </div>
+            <div className="space-y-3 px-4 py-3">
+              {variablePrompt.snippet.variables?.map((v, idx) => (
+                <div key={v.name} className="space-y-1">
+                  <label className="text-xs font-medium text-muted-foreground">{v.label || v.name}</label>
+                  {v.type === "enum" ? (
+                    <select
+                      autoFocus={idx === 0}
+                      value={variablePrompt.values[v.name] ?? ""}
+                      onChange={(e) => setVariablePrompt((prev) => prev ? { ...prev, values: { ...prev.values, [v.name]: e.target.value } } : null)}
+                      className="h-8 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring/40"
+                    >
+                      {v.options?.map((opt) => <option key={opt} value={opt}>{opt}</option>)}
+                    </select>
+                  ) : (
+                    <input
+                      autoFocus={idx === 0}
+                      value={variablePrompt.values[v.name] ?? ""}
+                      onChange={(e) => setVariablePrompt((prev) => prev ? { ...prev, values: { ...prev.values, [v.name]: e.target.value } } : null)}
+                      onKeyDown={(e) => { if (e.key === "Enter") submitVariables(); }}
+                      placeholder={v.defaultValue || v.name}
+                      className="h-8 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring/40"
+                    />
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="flex items-center justify-end gap-2 border-t border-border px-4 py-2.5">
+              <button
+                onClick={() => { setVariablePrompt(null); setTimeout(() => termRef.current?.focus(), 50); }}
+                className="rounded-md px-3 py-1.5 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={submitVariables}
+                className="rounded-md bg-[var(--color-brand-orange,oklch(0.75_0.15_55))] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90"
+              >
+                Execute
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

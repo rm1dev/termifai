@@ -9,6 +9,7 @@ import {
   KeyRound,
   Clipboard,
   FileUp,
+  FileText,
   Eye,
   EyeOff,
   ClipboardList,
@@ -77,7 +78,7 @@ import {
   PolarAngleAxis,
 } from "recharts";
 import { OsBadge } from "./icons";
-import type { AppTab, Host, HostGroup, SidebarKey, Snippet, SshKey, TabKind } from "./types";
+import type { AppTab, Host, HostGroup, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind } from "./types";
 import { XTerminal } from "./XTerminal";
 import {
   isShortcutMatch,
@@ -4003,13 +4004,17 @@ function SftpView() {
 
 /* ---------------- Snippets view ---------------- */
 
-const initialSnippets: Snippet[] = [
-  { id: "s-disk", name: "Disk Size", command: "df -h /", createdAt: "2025-06-01T10:00:00Z" },
-  { id: "s-ls", name: "list directory", command: "ls -l", createdAt: "2025-06-10T14:00:00Z" },
-];
+const SNIPPET_KIND_META: Record<SnippetKind, { label: string; color: string; icon: typeof Braces }> = {
+  text: { label: "Text Template", color: "oklch(0.55_0.15_160)", icon: FileText },
+  command: { label: "Command", color: "oklch(0.45_0.15_230)", icon: TerminalSquare },
+  script: { label: "Script", color: "oklch(0.55_0.15_300)", icon: Braces },
+};
+
+const initialSnippets: Snippet[] = [];
 
 function SnippetsView() {
   const [snippets, setSnippets] = useState<Snippet[]>(initialSnippets);
+  const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editor, setEditor] = useState<{ open: boolean; snippet?: Snippet | null }>({ open: false });
   const [removing, setRemoving] = useState<string[] | null>(null);
@@ -4021,6 +4026,14 @@ function SnippetsView() {
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
 
+  // Load from backend
+  useEffect(() => {
+    invoke<Snippet[]>("list_snippets").then((data) => {
+      setSnippets(data);
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, []);
+
   const toggleSelect = (id: string, additive: boolean) => {
     setSelected((curr) => {
       const next = new Set(additive ? curr : []);
@@ -4030,35 +4043,51 @@ function SnippetsView() {
     });
   };
 
-  const upsert = (s: Snippet) => {
-    setSnippets((curr) => {
-      const idx = curr.findIndex((x) => x.id === s.id);
-      if (idx === -1) return [...curr, s];
-      const next = [...curr];
-      next[idx] = s;
-      return next;
-    });
+  const upsert = async (s: Snippet) => {
+    try {
+      const saved = await invoke<Snippet>("save_snippet", {
+        request: { id: s.id, kind: s.kind, name: s.name, body: s.body, command: s.command, script: s.script, variables: s.variables || [] },
+      });
+      setSnippets((curr) => {
+        const idx = curr.findIndex((x) => x.id === saved.id);
+        if (idx === -1) return [saved, ...curr];
+        const next = [...curr];
+        next[idx] = saved;
+        return next;
+      });
+    } catch (err) {
+      console.error("Failed to save snippet:", err);
+    }
   };
 
-  const remove = (ids: string[]) => {
-    setSnippets((curr) => curr.filter((s) => !ids.includes(s.id)));
-    setSelected(new Set());
-    setRemoving(null);
+  const remove = async (ids: string[]) => {
+    try {
+      await invoke("remove_snippets", { ids });
+      setSnippets((curr) => curr.filter((s) => !ids.includes(s.id)));
+      setSelected(new Set());
+      setRemoving(null);
+    } catch (err) {
+      console.error("Failed to remove snippets:", err);
+    }
   };
 
   const selectedIds = Array.from(selected);
+
+  const getSnippetContent = (s: Snippet) => s.body || s.command || s.script || "";
 
   const visibleSnippets = snippets
     .filter((s) => {
       if (!query.trim()) return true;
       const q = query.toLowerCase();
-      return s.name.toLowerCase().includes(q) || s.command.toLowerCase().includes(q);
+      return s.name.toLowerCase().includes(q) || getSnippetContent(s).toLowerCase().includes(q);
     })
     .sort((a, b) => {
       const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
       const db = b.createdAt ? new Date(b.createdAt).getTime() : 0;
       return sortDir === "desc" ? db - da : da - db;
     });
+
+  if (loading) return <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">Loading…</div>;
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
@@ -4182,6 +4211,8 @@ function SnippetsView() {
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
               {visibleSnippets.map((s) => {
                 const isSel = selected.has(s.id);
+                const meta = SNIPPET_KIND_META[s.kind || "command"];
+                const KindIcon = meta.icon;
                 return (
                   <div
                     key={s.id}
@@ -4194,12 +4225,19 @@ function SnippetsView() {
                         : "border-border bg-[var(--color-surface)] hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]",
                     ].join(" ")}
                   >
-                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-[oklch(0.45_0.15_230)] text-white">
-                      <Braces className="h-5 w-5" />
+                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-white" style={{ backgroundColor: meta.color }}>
+                      <KindIcon className="h-5 w-5" />
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
-                      <div className="truncate font-mono text-xs text-muted-foreground">{s.command}</div>
+                      <div className="truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
+                      {s.variables && s.variables.length > 0 && (
+                        <div className="mt-1 flex items-center gap-1">
+                          <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                            {s.variables.length} var{s.variables.length > 1 ? "s" : ""}
+                          </span>
+                        </div>
+                      )}
                     </div>
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
@@ -4225,6 +4263,8 @@ function SnippetsView() {
             <div className="overflow-hidden rounded-lg border border-border bg-[var(--color-surface)]">
               {visibleSnippets.map((s, i) => {
                 const isSel = selected.has(s.id);
+                const meta = SNIPPET_KIND_META[s.kind || "command"];
+                const KindIcon = meta.icon;
                 return (
                   <div
                     key={s.id}
@@ -4238,11 +4278,12 @@ function SnippetsView() {
                         : "hover:bg-[var(--color-surface-2)]",
                     ].join(" ")}
                   >
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-[oklch(0.45_0.15_230)] text-white">
-                      <Braces className="h-4 w-4" />
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-white" style={{ backgroundColor: meta.color }}>
+                      <KindIcon className="h-4 w-4" />
                     </span>
                     <div className="w-48 shrink-0 truncate text-sm font-medium text-foreground">{s.name}</div>
-                    <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{s.command}</div>
+                    <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+                    <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
                     {s.createdAt && (
                       <div className="hidden shrink-0 text-xs text-muted-foreground md:block">
                         {new Date(s.createdAt).toLocaleDateString()}
@@ -4276,7 +4317,7 @@ function SnippetsView() {
         <SnippetModal
           snippet={editor.snippet ?? null}
           onClose={() => setEditor({ open: false })}
-          onSubmit={(s) => { upsert(s); setEditor({ open: false }); }}
+          onSubmit={(s) => { void upsert(s); setEditor({ open: false }); }}
         />
       )}
 
@@ -4284,7 +4325,7 @@ function SnippetsView() {
         <RemoveSnippetModal
           count={removing.length}
           onClose={() => setRemoving(null)}
-          onConfirm={() => remove(removing)}
+          onConfirm={() => void remove(removing)}
         />
       )}
     </div>
@@ -4299,8 +4340,29 @@ function SnippetModal({
   onSubmit: (s: Snippet) => void;
 }) {
   const [name, setName] = useState(snippet?.name ?? "");
+  const [kind, setKind] = useState<SnippetKind>(snippet?.kind ?? "command");
+  const [body, setBody] = useState(snippet?.body ?? "");
   const [command, setCommand] = useState(snippet?.command ?? "");
-  const valid = name.trim() && command.trim();
+  const [script, setScript] = useState(snippet?.script ?? "");
+  const [variables, setVariables] = useState<SnippetVariable[]>(snippet?.variables ?? []);
+
+  const valid = name.trim() && (
+    (kind === "text" && body.trim()) ||
+    (kind === "command" && command.trim()) ||
+    (kind === "script" && script.trim())
+  );
+
+  const addVariable = () => {
+    setVariables([...variables, { name: "", type: "text", defaultValue: "", options: [] }]);
+  };
+
+  const updateVariable = (idx: number, patch: Partial<SnippetVariable>) => {
+    setVariables((curr) => curr.map((v, i) => i === idx ? { ...v, ...patch } : v));
+  };
+
+  const removeVariable = (idx: number) => {
+    setVariables((curr) => curr.filter((_, i) => i !== idx));
+  };
 
   return (
     <ModalShell title={snippet ? "Edit snippet" : "New snippet"} onClose={onClose}>
@@ -4313,21 +4375,125 @@ function SnippetModal({
           className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
         />
       </Field>
-      <Field label="Command">
-        <textarea
-          value={command}
-          onChange={(e) => setCommand(e.target.value)}
-          placeholder="df -h /"
-          rows={4}
-          className="w-full resize-none rounded-md border border-border bg-[var(--color-surface)] px-3 py-2 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-        />
+      <Field label="Type">
+        <div className="flex gap-2">
+          {(["text", "command", "script"] as const).map((k) => {
+            const meta = SNIPPET_KIND_META[k];
+            return (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setKind(k)}
+                className={[
+                  "flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition",
+                  kind === k
+                    ? "border-[var(--color-brand-orange)]/60 bg-[var(--color-brand-orange)]/10 text-foreground"
+                    : "border-border text-muted-foreground hover:text-foreground hover:bg-[var(--color-surface-2)]",
+                ].join(" ")}
+              >
+                {meta.label}
+              </button>
+            );
+          })}
+        </div>
       </Field>
+      {kind === "text" && (
+        <Field label="Body">
+          <textarea
+            value={body}
+            onChange={(e) => setBody(e.target.value)}
+            placeholder="Inline text template…"
+            rows={4}
+            className="w-full resize-none rounded-md border border-border bg-[var(--color-surface)] px-3 py-2 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+          />
+        </Field>
+      )}
+      {kind === "command" && (
+        <Field label="Command">
+          <textarea
+            value={command}
+            onChange={(e) => setCommand(e.target.value)}
+            placeholder="df -h /"
+            rows={2}
+            className="w-full resize-none rounded-md border border-border bg-[var(--color-surface)] px-3 py-2 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+          />
+        </Field>
+      )}
+      {kind === "script" && (
+        <Field label="Script">
+          <textarea
+            value={script}
+            onChange={(e) => setScript(e.target.value)}
+            placeholder={"#!/bin/bash\n# Your script here…"}
+            rows={6}
+            className="w-full resize-none rounded-md border border-border bg-[var(--color-surface)] px-3 py-2 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+          />
+        </Field>
+      )}
+      {/* Variables section */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between">
+          <label className="text-xs font-medium text-muted-foreground">Variables</label>
+          <button
+            type="button"
+            onClick={addVariable}
+            className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+          >
+            <Plus className="h-3 w-3" /> Add
+          </button>
+        </div>
+        {variables.map((v, idx) => (
+          <div key={idx} className="flex items-center gap-2 rounded-md border border-border bg-[var(--color-surface)] p-2">
+            <input
+              value={v.name}
+              onChange={(e) => updateVariable(idx, { name: e.target.value })}
+              placeholder="name"
+              className="h-7 w-24 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+            />
+            <select
+              value={v.type}
+              onChange={(e) => updateVariable(idx, { type: e.target.value as "text" | "enum" })}
+              className="h-7 rounded border border-border bg-[var(--color-surface)] px-2 text-xs text-foreground focus:outline-none"
+            >
+              <option value="text">text</option>
+              <option value="enum">enum</option>
+            </select>
+            {v.type === "text" && (
+              <input
+                value={v.defaultValue ?? ""}
+                onChange={(e) => updateVariable(idx, { defaultValue: e.target.value })}
+                placeholder="default"
+                className="h-7 flex-1 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+              />
+            )}
+            {v.type === "enum" && (
+              <input
+                value={(v.options ?? []).join(", ")}
+                onChange={(e) => updateVariable(idx, { options: e.target.value.split(",").map((o) => o.trim()).filter(Boolean) })}
+                placeholder="opt1, opt2, opt3"
+                className="h-7 flex-1 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+              />
+            )}
+            <button
+              type="button"
+              onClick={() => removeVariable(idx)}
+              className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:text-[oklch(0.72_0.18_25)]"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        ))}
+      </div>
       <ModalActions
         onClose={onClose}
         onConfirm={() => valid && onSubmit({
           id: snippet?.id ?? `s-${Date.now()}`,
+          kind,
           name: name.trim(),
-          command: command.trim(),
+          body: kind === "text" ? body.trim() : undefined,
+          command: kind === "command" ? command.trim() : undefined,
+          script: kind === "script" ? script.trim() : undefined,
+          variables: variables.filter((v) => v.name.trim()),
           createdAt: snippet?.createdAt ?? new Date().toISOString(),
         })}
         confirmDisabled={!valid}

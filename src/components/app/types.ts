@@ -49,10 +49,29 @@ export interface AppTab {
   hostId?: string; // present for SSH host tabs — used to distinguish from local terminal
 }
 
+export type SnippetKind = "text" | "command" | "script";
+
+export type SnippetVariableType = "text" | "enum";
+
+export interface SnippetVariable {
+  name: string;
+  label?: string;
+  type: SnippetVariableType;
+  defaultValue?: string;
+  options?: string[]; // for enum type
+}
+
 export interface Snippet {
   id: string;
+  kind: SnippetKind;
   name: string;
-  command: string;
+  /** For "text" kind — the inline template body */
+  body?: string;
+  /** For "command" kind — a single executable command */
+  command?: string;
+  /** For "script" kind — a full bash script */
+  script?: string;
+  variables?: SnippetVariable[];
   createdAt?: string; // ISO date string
 }
 
