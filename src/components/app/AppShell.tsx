@@ -4021,13 +4021,19 @@ function SnippetsView() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editor, setEditor] = useState<{ open: boolean; snippet?: Snippet | null }>({ open: false });
   const [removing, setRemoving] = useState<string[] | null>(null);
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [viewMode, setViewMode] = useState<"grid" | "list">(
+    () => (localStorage.getItem("snippets-view-mode") as "grid" | "list") ?? "grid"
+  );
   const [viewOpen, setViewOpen] = useState(false);
-  const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
+  const [sortDir, setSortDir] = useState<"desc" | "asc">(
+    () => (localStorage.getItem("snippets-sort-dir") as "desc" | "asc") ?? "desc"
+  );
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
+  useEffect(() => { localStorage.setItem("snippets-view-mode", viewMode); }, [viewMode]);
+  useEffect(() => { localStorage.setItem("snippets-sort-dir", sortDir); }, [sortDir]);
 
   // Load from backend
   useEffect(() => {
@@ -4097,15 +4103,12 @@ function SnippetsView() {
       {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <SplitButton
-            primary={<><Plus className="h-3.5 w-3.5" /> New snippet</>}
-            onPrimary={() => setEditor({ open: true, snippet: null })}
-            menu={[
-              { label: "New snippet", icon: <Plus className="h-3.5 w-3.5" />, onClick: () => setEditor({ open: true, snippet: null }) },
-              { label: "Import from file", icon: <FileUp className="h-3.5 w-3.5" />, onClick: () => {} },
-            ]}
-          />
-          <ToolbarButton icon={<Clock className="h-4 w-4" />} label="Shell History" />
+          <button
+            onClick={() => setEditor({ open: true, snippet: null })}
+            className="flex h-7 items-center gap-1 rounded-md bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-white/5"
+          >
+            <Plus className="h-3.5 w-3.5" /> New snippet
+          </button>
           {selectedIds.length > 0 && (
             <button
               onClick={() => setRemoving(selectedIds)}
