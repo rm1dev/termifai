@@ -230,6 +230,20 @@
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
     overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+  }
+
+  /* Allow text selection in inputs, textareas, and terminal */
+  input, textarea, [contenteditable="true"], .xterm-wrapper {
+    user-select: text;
+    -webkit-user-select: text;
+  }
+
+  /* Prevent dragging images and links */
+  img, a {
+    -webkit-user-drag: none;
   }
 }
 
