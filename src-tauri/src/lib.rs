@@ -78,15 +78,28 @@ fn new_window(app: tauri::AppHandle) -> Result<(), String> {
     let count = WINDOW_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
     let label = format!("window-{}", count);
 
-    WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
-        .title("Termifai")
-        .inner_size(800.0, 600.0)
-        .min_inner_size(800.0, 600.0)
-        .title_bar_style(tauri::TitleBarStyle::Overlay)
-        .hidden_title(true)
-        .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition::new(
-            12.0, 16.0,
-        )))
+    let mut builder =
+        WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
+            .title("Termifai")
+            .inner_size(800.0, 600.0)
+            .min_inner_size(800.0, 600.0);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+                12.0, 16.0,
+            )));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.decorations(false);
+    }
+
+    builder
         .build()
         .map_err(|e| format!("Failed to create window: {}", e))?;
 
