@@ -110,12 +110,12 @@ import { toast } from "sonner";
 
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
-  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  // { key: "dashboard", label: "Dashboard", icon: LayoutDashboard }, // temporarily hidden
   { key: "hosts", label: "Hosts", icon: Server },
   { key: "port-forwarding", label: "Port Forwarding", icon: Network },
   { key: "snippets", label: "Snippets", icon: Braces },
   { key: "ssh-keys", label: "SSH Keys", icon: KeyRound },
-  { key: "logs", label: "Logs", icon: ClipboardList },
+  // { key: "logs", label: "Logs", icon: ClipboardList },
 ];
 
 export function AppShell() {
@@ -1917,7 +1917,7 @@ function HostsView({
               { label: "New group", icon: <FolderPlus className="h-3.5 w-3.5" />, onClick: () => setGroupModal({ open: true, parentId: null }) },
             ]}
           />
-          <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={onNewSftp} />
+          {/* <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={onNewSftp} /> */}{/* temporarily hidden */}
           <ToolbarButton icon={<TerminalSquare className="h-4 w-4" />} label="Terminal" onClick={onNewTerminal} />
         </div>
         <div className="flex items-center gap-1">
