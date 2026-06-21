@@ -30,9 +30,9 @@ export const terminalAppearanceChangedEvent = "termifai:terminal-appearance-chan
 export const terminalAppearanceStorageKey = "termifai:terminal-appearance";
 
 export const defaultTerminalAppearance: TerminalAppearance = {
-  fontFamily: "Source Code Pro",
-  fontSize: 13,
-  lineHeight: 1.3,
+  fontFamily: "Vazir Code",
+  fontSize: 12,
+  lineHeight: 1.1,
 };
 
 const fallbackFontFamily = "ui-monospace, monospace";

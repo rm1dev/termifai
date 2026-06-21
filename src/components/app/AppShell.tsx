@@ -1,5 +1,8 @@
 import { useState, useRef, useEffect, forwardRef } from "react";
+import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { platform } from "@/lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import {
   Server,
@@ -9,13 +12,13 @@ import {
   KeyRound,
   Clipboard,
   FileUp,
+  FileText,
   Eye,
   EyeOff,
   ClipboardList,
   Plus,
   ChevronDown,
   TerminalSquare,
-  Bell,
   Search,
   Tag,
   LayoutGrid,
@@ -46,8 +49,19 @@ import {
   Container,
   
   Gauge,
+  GripVertical,
+  Minus,
+  Square,
+  Menu,
+  Maximize2,
 } from "lucide-react";
-import { sampleHosts } from "./data";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -62,6 +76,13 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Area,
   AreaChart,
@@ -78,7 +99,7 @@ import {
   PolarAngleAxis,
 } from "recharts";
 import { OsBadge } from "./icons";
-import type { AppTab, Host, HostGroup, SidebarKey, Snippet, SshKey, TabKind } from "./types";
+import type { AppTab, Host, HostGroup, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind } from "./types";
 import { XTerminal } from "./XTerminal";
 import {
   isShortcutMatch,
@@ -96,22 +117,25 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import { restrictToHorizontalAxis, restrictToParentElement } from "@dnd-kit/modifiers";
+import { restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import {
   SortableContext,
   horizontalListSortingStrategy,
+  verticalListSortingStrategy,
   useSortable,
   arrayMove,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { toast } from "sonner";
 
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
-  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  // { key: "dashboard", label: "Dashboard", icon: LayoutDashboard }, // temporarily hidden
   { key: "hosts", label: "Hosts", icon: Server },
   { key: "port-forwarding", label: "Port Forwarding", icon: Network },
   { key: "snippets", label: "Snippets", icon: Braces },
   { key: "ssh-keys", label: "SSH Keys", icon: KeyRound },
-  { key: "logs", label: "Logs", icon: ClipboardList },
+  // { key: "logs", label: "Logs", icon: ClipboardList },
 ];
 
 export function AppShell() {
@@ -131,15 +155,62 @@ export function AppShell() {
     setTabs((t) => [...t, { id, kind, title, closable: true }]);
     setActiveTab(id);
   };
+  const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const openSshTerminal = async (host: Host) => {
+    const id = `t-ssh-${host.id}-${Date.now()}`;
+    let keyArg = "";
+    if (host.sshKeyId) {
+      try {
+        const keys = await invoke<SshKey[]>("list_ssh_keys");
+        const key = keys.find((item) => item.id === host.sshKeyId);
+        if (key?.privateKeyPath) keyArg = ` -i ${shellQuote(key.privateKeyPath)}`;
+      } catch {
+        /* SSH can still use agent/default keys. */
+      }
+    }
+    const portArg = host.port && host.port !== 22 ? ` -p ${host.port}` : "";
+    const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
+    const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
+    const remoteBootstrap = `printf '${readyMarker}\\n'; ${cdPart}exec ` + "${SHELL:-/bin/sh}" + " -i";
+    const command = `ssh -v -tt -o StrictHostKeyChecking=no${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+
+    // Count existing tabs for this host to generate a numbered title
+    const baseTitle = host.name || host.hostname;
+    setTabs((currentTabs) => {
+      const existingCount = currentTabs.filter((t) => t.hostId === host.id).length;
+      const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
+      return [
+        ...currentTabs,
+        {
+          id,
+          kind: "terminal",
+          title,
+          closable: true,
+          initialCommand: command,
+          initialPassword: host.password,
+          readyMarker,
+          connectionLabel: `${host.user}@${host.hostname}:${host.port}`,
+          connectionTitle: host.name || host.hostname,
+          hostId: host.id,
+        },
+      ];
+    });
+    setActiveTab(id);
+  };
 
   const closeTab = (id: string) => {
-    setTabs((curr) => {
-      const tgt = curr.find((t) => t.id === id);
-      if (tgt && !tgt.closable) return curr;
-      const next = curr.filter((t) => t.id !== id);
-      if (id === activeTab && next.length) setActiveTab(next[next.length - 1].id);
-      return next;
-    });
+    const curr = tabsRef.current;
+    const tgt = curr.find((t) => t.id === id);
+    if (tgt && !tgt.closable) return;
+
+    const next = curr.filter((t) => t.id !== id);
+    setTabs(next);
+
+    if (id === activeTabRef.current && next.length) {
+      const closedIndex = curr.findIndex((t) => t.id === id);
+      const newActive = next[closedIndex - 1] ?? next[next.length - 1];
+      setActiveTab(newActive.id);
+    }
   };
 
   const renameTab = (id: string, title: string) => {
@@ -268,6 +339,7 @@ export function AppShell() {
         onNew={newTab}
         onRename={renameTab}
         onReorder={reorderTab}
+        platform={platform}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -281,6 +353,13 @@ export function AppShell() {
             >
               <XTerminal
                 sessionId={t.sessionId}
+                initialCommand={t.initialCommand}
+                initialPassword={t.initialPassword}
+                readyMarker={t.readyMarker}
+                connectionLabel={t.connectionLabel}
+                connectionTitle={t.connectionTitle}
+                isActive={t.id === activeTab}
+                onClose={() => closeTab(t.id)}
                 onSessionCreated={(sid) => updateTabSession(t.id, sid)}
               />
             </div>
@@ -300,7 +379,7 @@ export function AppShell() {
                 <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
                 <main className="flex min-w-0 flex-1 flex-col">
                   {activeSidebar === "dashboard" && <DashboardView />}
-                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={() => newTab("sftp")} />}
+                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={() => newTab("sftp")} onConnectHost={(host) => void openSshTerminal(host)} />}
                   {activeSidebar === "port-forwarding" && <PortForwardingView />}
                   {activeSidebar === "snippets" && <SnippetsView />}
                   {activeSidebar === "ssh-keys" && <SshKeysView />}
@@ -329,6 +408,7 @@ function TitleBar({
   onNew,
   onRename,
   onReorder,
+  platform,
 }: {
   tabs: AppTab[];
   activeTab: string;
@@ -337,6 +417,7 @@ function TitleBar({
   onNew: (kind: TabKind) => void;
   onRename: (id: string, title: string) => void;
   onReorder: (fromId: string, toId: string) => void;
+  platform: string;
 }) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -352,9 +433,10 @@ function TitleBar({
   const closableTabs = tabs.filter((t) => t.closable);
 
   return (
-    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] pr-3 select-none" data-tauri-drag-region>
+    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none" data-tauri-drag-region>
       {/* Space for native macOS traffic lights */}
-      <div className="w-[80px] h-full shrink-0 flex items-center" />
+      {platform === "macos" && <div className="w-[80px] h-full shrink-0 flex items-center" />}
+      {platform !== "macos" && <div className="w-3 h-full shrink-0" />}
 
       <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" data-tauri-drag-region>
         {/* Pinned tabs (Hosts) — outside DnD, immovable */}
@@ -401,8 +483,82 @@ function TitleBar({
         </div>
       </div>
 
-      <button className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground self-center" aria-label="Notifications">
-        <Bell className="h-4 w-4" />
+      {/* Linux/Windows: hamburger app menu + window controls */}
+      {platform !== "macos" && (
+        <>
+          <AppHamburgerMenu onNew={onNew} />
+          <WindowControls />
+        </>
+      )}
+    </div>
+  );
+}
+
+function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
+  const win = getCurrentWindow();
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    win.isFullscreen().then(setIsFullscreen).catch(() => {});
+    win.onResized(() => {
+      win.isFullscreen().then(setIsFullscreen).catch(() => {});
+    }).then((fn) => { unlisten = fn; }).catch(() => {});
+    return () => { unlisten?.(); };
+  }, []);
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground self-center mr-1"
+          aria-label="App menu"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuItem onSelect={() => onNew("terminal")}>
+          New Terminal
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+T</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void invoke("open_settings_window")}>
+          Settings
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => void win.setFullscreen(!isFullscreen)}>
+          {isFullscreen ? "Exit Full Screen" : "Full Screen"}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function WindowControls() {
+  const win = getCurrentWindow();
+  return (
+    <div className="flex items-center h-full shrink-0">
+      <button
+        onClick={() => void win.minimize()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground transition-colors"
+        aria-label="Minimize"
+      >
+        <Minus className="h-3.5 w-3.5" />
+      </button>
+      <button
+        onClick={() => void win.toggleMaximize()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground transition-colors"
+        aria-label="Maximize"
+      >
+        <Square className="h-3 w-3" />
+      </button>
+      <button
+        onClick={() => void win.close()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-red-500 hover:text-white transition-colors"
+        aria-label="Close"
+      >
+        <X className="h-3.5 w-3.5" />
       </button>
     </div>
   );
@@ -444,10 +600,12 @@ const BaseTabChip = forwardRef<HTMLDivElement, BaseTabChipProps>(function BaseTa
   };
 
   const icon =
-    tab.kind === "terminal" ? (
+    tab.kind === "terminal" && tab.hostId ? (
+      <Server className="h-3.5 w-3.5 text-[var(--color-brand-orange)]" />
+    ) : tab.kind === "terminal" ? (
       <TerminalSquare className="h-3.5 w-3.5 text-[var(--color-brand-green)]" />
     ) : tab.kind === "sftp" ? (
-      <Folder className="h-3.5 w-3.5 text-muted-foreground" />
+      <Folder className="h-3.5 w-3.5 text-[var(--color-brand-cyan)]" />
     ) : (
       <LayoutGrid className="h-3.5 w-3.5 text-muted-foreground" />
     );
@@ -1692,35 +1850,128 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
 
 /* ---------------- Hosts view ---------------- */
 
-function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; onNewSftp?: () => void }) {
+function HostsView({
+  onNewTerminal,
+  onNewSftp,
+  onConnectHost,
+}: {
+  onNewTerminal?: () => void;
+  onNewSftp?: () => void;
+  onConnectHost: (host: Host) => void;
+}) {
   const [query, setQuery] = useState("");
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
-  const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
+  const [viewMode, setViewMode] = useState<"grid" | "list">(() => {
+    const saved = localStorage.getItem("hosts-view-mode");
+    return saved === "list" ? "list" : "grid";
+  });
+  const [sortDir, setSortDir] = useState<"desc" | "asc">(() => {
+    const saved = localStorage.getItem("hosts-sort-dir");
+    return saved === "asc" ? "asc" : "desc";
+  });
   const [viewOpen, setViewOpen] = useState(false);
+  const [tagFilter, setTagFilter] = useState<string | null>(null);
+  const [tagMenuOpen, setTagMenuOpen] = useState(false);
 
-  const [hosts, setHosts] = useState<Host[]>(sampleHosts);
+  const [hosts, setHosts] = useState<Host[]>([]);
   const [groups, setGroups] = useState<HostGroup[]>([]);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [loading, setLoading] = useState(true);
+  const [hostsError, setHostsError] = useState<string | null>(null);
 
   const [hostModal, setHostModal] = useState<{ open: boolean; groupId: string | null }>({ open: false, groupId: null });
-  const [groupModal, setGroupModal] = useState<{ open: boolean; parentId: string | null }>({ open: false, parentId: null });
+  const [editingHost, setEditingHost] = useState<Host | null>(null);
+  const [groupModal, setGroupModal] = useState<{ open: boolean; parentId: string | null; group?: HostGroup | null }>({ open: false, parentId: null, group: null });
+  const [removingHostId, setRemovingHostId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    invoke<{ hosts: Host[]; groups: HostGroup[] }>("list_hosts")
+      .then((vault) => {
+        if (!cancelled) {
+          setHosts(vault.hosts);
+          setGroups(vault.groups);
+          setHostsError(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setHostsError(String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem("hosts-view-mode", viewMode);
+  }, [viewMode]);
+
+  useEffect(() => {
+    localStorage.setItem("hosts-sort-dir", sortDir);
+  }, [sortDir]);
 
   const toggleCollapse = (id: string) =>
     setCollapsed((c) => ({ ...c, [id]: !c[id] }));
 
-  const addGroup = (name: string, parentId: string | null) => {
-    const id = `g-${Date.now()}`;
-    setGroups((g) => [...g, { id, name, parentId }]);
+  const upsertGroup = async (name: string, parentId: string | null, id?: string) => {
+    try {
+      const group = await invoke<HostGroup>("save_host_group", {
+        request: { id: id ?? null, name, parentId },
+      });
+      setGroups((curr) => [group, ...curr.filter((item) => item.id !== group.id)]);
+      setHostsError(null);
+      setGroupModal({ open: false, parentId: null, group: null });
+    } catch (err) {
+      setHostsError(String(err));
+    }
   };
-  const addHost = (h: Omit<Host, "id">) => {
-    const id = `h-${Date.now()}`;
-    setHosts((hs) => [{ ...h, id, lastUsed: new Date().toISOString() }, ...hs]);
+  const upsertHost = async (h: Omit<Host, "id">, id?: string) => {
+    try {
+      const host = await invoke<Host>("save_host", { request: { ...h, id: id ?? null } });
+      setHosts((curr) => [host, ...curr.filter((item) => item.id !== host.id)]);
+      setHostsError(null);
+      setHostModal({ open: false, groupId: null });
+      setEditingHost(null);
+    } catch (err) {
+      setHostsError(String(err));
+    }
+  };
+  const removeHost = async (id: string) => {
+    try {
+      await invoke("remove_hosts", { ids: [id] });
+      setHosts((curr) => curr.filter((host) => host.id !== id));
+      setHostsError(null);
+      toast.success("Host deleted");
+    } catch (err) {
+      setHostsError(String(err));
+      toast.error("Delete host failed", { description: String(err) });
+    }
+  };
+  const removeGroup = async (id: string) => {
+    try {
+      await invoke("remove_host_group", { id });
+      const descendants = descendantGroupIds(groups, id);
+      setGroups((curr) => curr.filter((group) => group.id !== id && !descendants.includes(group.id)));
+      setHosts((curr) =>
+        curr.filter((host) => !host.groupId || (host.groupId !== id && !descendants.includes(host.groupId)))
+      );
+      setHostsError(null);
+      toast.success("Group deleted");
+    } catch (err) {
+      setHostsError(String(err));
+      toast.error("Delete group failed", { description: String(err) });
+    }
   };
 
   const filteredHosts = hosts
     .filter((h) =>
       `${h.name} ${h.user}@${h.hostname}`.toLowerCase().includes(query.toLowerCase()),
     )
+    .filter((h) => !tagFilter || (h.tags ?? []).includes(tagFilter))
     .sort((a, b) => {
       const da = a.lastUsed ? new Date(a.lastUsed).getTime() : 0;
       const db = b.lastUsed ? new Date(b.lastUsed).getTime() : 0;
@@ -1729,6 +1980,7 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
 
   const rootHosts = filteredHosts.filter((h) => !h.groupId);
   const rootGroups = groups.filter((g) => !g.parentId);
+  const connectTarget = filteredHosts[0] ?? null;
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
@@ -1744,7 +1996,8 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
           />
         </div>
         <button
-          disabled={!query}
+          disabled={!query.trim() || !connectTarget}
+          onClick={() => query.trim() && connectTarget && onConnectHost(connectTarget)}
           className="h-9 rounded-md border border-border bg-[var(--color-surface)] px-4 text-sm font-medium text-muted-foreground disabled:cursor-not-allowed disabled:opacity-60 hover:enabled:bg-[var(--color-surface-2)] hover:enabled:text-foreground"
         >
           Connect
@@ -1762,7 +2015,7 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
               { label: "New group", icon: <FolderPlus className="h-3.5 w-3.5" />, onClick: () => setGroupModal({ open: true, parentId: null }) },
             ]}
           />
-          <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={onNewSftp} />
+          {/* <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={onNewSftp} /> */}{/* temporarily hidden */}
           <ToolbarButton icon={<TerminalSquare className="h-4 w-4" />} label="Terminal" onClick={onNewTerminal} />
         </div>
         <div className="flex items-center gap-1">
@@ -1798,7 +2051,43 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
             )}
           </div>
 
-          <IconButton icon={<Tag className="h-4 w-4" />} title="Tags" />
+          <div className="relative">
+            <button
+              onClick={() => setTagMenuOpen((v) => !v)}
+              className={[
+                "flex h-7 w-7 items-center justify-center rounded-md hover:bg-[var(--color-surface-2)] hover:text-foreground",
+                tagFilter ? "text-foreground" : "text-muted-foreground",
+              ].join(" ")}
+              title="Filter by tag"
+            >
+              <Tag className="h-4 w-4" />
+            </button>
+            {tagMenuOpen && (
+              <div
+                className="absolute right-0 top-full z-30 mt-1 w-44 overflow-hidden rounded-lg border border-border bg-popover shadow-2xl"
+                onMouseLeave={() => setTagMenuOpen(false)}
+              >
+                <button
+                  onClick={() => { setTagFilter(null); setTagMenuOpen(false); }}
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[var(--color-surface-2)] ${!tagFilter ? "text-foreground font-medium" : "text-muted-foreground"}`}
+                >
+                  All tags
+                </button>
+                {Array.from(new Set(hosts.flatMap((h) => h.tags ?? []))).sort().map((tag) => (
+                  <button
+                    key={tag}
+                    onClick={() => { setTagFilter(tag); setTagMenuOpen(false); }}
+                    className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[var(--color-surface-2)] ${tagFilter === tag ? "text-foreground font-medium" : "text-muted-foreground"}`}
+                  >
+                    {tag}
+                  </button>
+                ))}
+                {hosts.every((h) => !(h.tags ?? []).length) && (
+                  <div className="px-3 py-2 text-xs text-muted-foreground">No tags defined</div>
+                )}
+              </div>
+            )}
+          </div>
           <button
             onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}
             className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
@@ -1811,47 +2100,92 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 py-4">
+        {hostsError && (
+          <div className="mb-3 rounded-md border border-[oklch(0.55_0.2_25)]/40 bg-[oklch(0.55_0.2_25)]/10 px-3 py-2 text-xs text-[oklch(0.72_0.18_25)]">
+            {hostsError}
+          </div>
+        )}
         <h2 className="mb-3 text-sm font-semibold text-foreground">Hosts</h2>
 
-        {/* Root-level groups (recursive) */}
-        {rootGroups.map((g) => (
-          <GroupNode
-            key={g.id}
-            group={g}
-            depth={0}
-            groups={groups}
-            hosts={filteredHosts}
-            viewMode={viewMode}
-            collapsed={collapsed}
-            onToggle={toggleCollapse}
-            onAddSubgroup={(parentId) => setGroupModal({ open: true, parentId })}
-            onAddHost={(groupId) => setHostModal({ open: true, groupId })}
-          />
-        ))}
+        {loading ? (
+          <div className="flex min-h-40 items-center justify-center text-sm text-muted-foreground">
+            Loading hosts…
+          </div>
+        ) : hosts.length === 0 && groups.length === 0 && !query ? (
+          <div className="flex min-h-80 flex-col items-center justify-center px-6 text-center">
+            <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-[var(--color-surface-2)]">
+              <Server className="h-9 w-9 text-muted-foreground" strokeWidth={1.5} />
+            </div>
+            <h3 className="mt-5 text-base font-semibold text-foreground">Create host</h3>
+            <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+              Add SSH hosts and organize them into groups for quick terminal and SFTP access.
+            </p>
+          </div>
+        ) : (
+          <>
+            {/* Root-level groups (recursive) */}
+            {rootGroups.map((g) => (
+              <GroupNode
+                key={g.id}
+                group={g}
+                depth={0}
+                groups={groups}
+                hosts={filteredHosts}
+                viewMode={viewMode}
+                collapsed={collapsed}
+                onToggle={toggleCollapse}
+                onAddSubgroup={(parentId) => setGroupModal({ open: true, parentId, group: null })}
+                onAddHost={(groupId) => setHostModal({ open: true, groupId })}
+                onEditGroup={(group) => setGroupModal({ open: true, parentId: group.parentId, group })}
+                onDeleteGroup={removeGroup}
+                onEditHost={setEditingHost}
+                onDeleteHost={setRemovingHostId}
+                onConnectHost={onConnectHost}
+              />
+            ))}
 
-        {/* Root-level hosts */}
-        <HostsList hosts={rootHosts} viewMode={viewMode} query={query} />
+            {/* Root-level hosts */}
+            <HostsList
+              hosts={rootHosts}
+              viewMode={viewMode}
+              query={query}
+              onConnectHost={onConnectHost}
+              onEditHost={setEditingHost}
+              onDeleteHost={setRemovingHostId}
+            />
+          </>
+        )}
       </div>
 
-      {hostModal.open && (
+      {(hostModal.open || editingHost) && (
         <HostModal
           groups={groups}
-          defaultGroupId={hostModal.groupId}
-          onClose={() => setHostModal({ open: false, groupId: null })}
-          onSubmit={(h) => {
-            addHost(h);
+          existingTags={Array.from(new Set(hosts.flatMap((host) => host.tags ?? []))).sort()}
+          defaultGroupId={editingHost?.groupId ?? hostModal.groupId}
+          host={editingHost}
+          onClose={() => {
             setHostModal({ open: false, groupId: null });
+            setEditingHost(null);
           }}
+          onSubmit={(h) => void upsertHost(h, editingHost?.id)}
         />
       )}
       {groupModal.open && (
         <GroupModal
           groups={groups}
           defaultParentId={groupModal.parentId}
-          onClose={() => setGroupModal({ open: false, parentId: null })}
-          onSubmit={(name, parentId) => {
-            addGroup(name, parentId);
-            setGroupModal({ open: false, parentId: null });
+          group={groupModal.group}
+          onClose={() => setGroupModal({ open: false, parentId: null, group: null })}
+          onSubmit={(name, parentId) => void upsertGroup(name, parentId, groupModal.group?.id)}
+        />
+      )}
+      {removingHostId && (
+        <RemoveHostModal
+          hostName={hosts.find((h) => h.id === removingHostId)?.name || hosts.find((h) => h.id === removingHostId)?.hostname || "this host"}
+          onClose={() => setRemovingHostId(null)}
+          onConfirm={() => {
+            void removeHost(removingHostId);
+            setRemovingHostId(null);
           }}
         />
       )}
@@ -1861,7 +2195,7 @@ function HostsView({ onNewTerminal, onNewSftp }: { onNewTerminal?: () => void; o
 
 /* ---- Group rendering (recursive) ---- */
 function GroupNode({
-  group, depth, groups, hosts, viewMode, collapsed, onToggle, onAddSubgroup, onAddHost,
+  group, depth, groups, hosts, viewMode, collapsed, onToggle, onAddSubgroup, onAddHost, onEditGroup, onDeleteGroup, onEditHost, onDeleteHost, onConnectHost,
 }: {
   group: HostGroup;
   depth: number;
@@ -1872,6 +2206,11 @@ function GroupNode({
   onToggle: (id: string) => void;
   onAddSubgroup: (parentId: string) => void;
   onAddHost: (groupId: string) => void;
+  onEditGroup: (group: HostGroup) => void;
+  onDeleteGroup: (id: string) => void;
+  onEditHost: (host: Host) => void;
+  onDeleteHost: (id: string) => void;
+  onConnectHost: (host: Host) => void;
 }) {
   const isOpen = !collapsed[group.id];
   const children = groups.filter((g) => g.parentId === group.id);
@@ -1906,6 +2245,20 @@ function GroupNode({
           >
             <FolderPlus className="h-3.5 w-3.5" />
           </button>
+          <button
+            title="Edit group"
+            onClick={() => onEditGroup(group)}
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+          >
+            <Settings className="h-3.5 w-3.5" />
+          </button>
+          <button
+            title="Delete group"
+            onClick={() => onDeleteGroup(group.id)}
+            className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-[oklch(0.72_0.18_25)]"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
 
@@ -1923,10 +2276,22 @@ function GroupNode({
               onToggle={onToggle}
               onAddSubgroup={onAddSubgroup}
               onAddHost={onAddHost}
+              onEditGroup={onEditGroup}
+              onDeleteGroup={onDeleteGroup}
+              onEditHost={onEditHost}
+              onDeleteHost={onDeleteHost}
+              onConnectHost={onConnectHost}
             />
           ))}
           {groupHosts.length > 0 && (
-            <HostsList hosts={groupHosts} viewMode={viewMode} query="" />
+            <HostsList
+              hosts={groupHosts}
+              viewMode={viewMode}
+              query=""
+              onConnectHost={onConnectHost}
+              onEditHost={onEditHost}
+              onDeleteHost={onDeleteHost}
+            />
           )}
         </div>
       )}
@@ -1934,7 +2299,21 @@ function GroupNode({
   );
 }
 
-function HostsList({ hosts, viewMode, query }: { hosts: Host[]; viewMode: "grid" | "list"; query: string }) {
+function HostsList({
+  hosts,
+  viewMode,
+  query,
+  onConnectHost,
+  onEditHost,
+  onDeleteHost,
+}: {
+  hosts: Host[];
+  viewMode: "grid" | "list";
+  query: string;
+  onConnectHost: (host: Host) => void;
+  onEditHost: (host: Host) => void;
+  onDeleteHost: (id: string) => void;
+}) {
   if (hosts.length === 0 && query) {
     return (
       <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
@@ -1948,17 +2327,37 @@ function HostsList({ hosts, viewMode, query }: { hosts: Host[]; viewMode: "grid"
     return (
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
         {hosts.map((h) => (
-          <button
+          <div
             key={h.id}
-            className="group flex items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
+            role="button"
+            tabIndex={0}
+            onClick={() => onConnectHost(h)}
+            onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onConnectHost(h); } }}
+            className="group flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
           >
             <OsBadge os={h.os} />
             <div className="min-w-0 flex-1">
               <div className="truncate text-sm font-medium text-foreground">{h.name}</div>
               <div className="truncate text-xs text-muted-foreground">ssh, {h.user}</div>
             </div>
-            <PanelRightOpen className="h-4 w-4 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100" />
-          </button>
+            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+              <button
+                title="Edit"
+                onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
+                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-foreground"
+              >
+                <Settings className="h-3.5 w-3.5" />
+              </button>
+              <button
+                title="Delete"
+                onClick={(e) => { e.stopPropagation(); onDeleteHost(h.id); }}
+                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-[oklch(0.72_0.18_25)]"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+              <PanelRightOpen className="h-4 w-4 text-muted-foreground" />
+            </div>
+          </div>
         ))}
       </div>
     );
@@ -1966,9 +2365,13 @@ function HostsList({ hosts, viewMode, query }: { hosts: Host[]; viewMode: "grid"
   return (
     <div className="flex flex-col gap-2">
       {hosts.map((h) => (
-        <button
+        <div
           key={h.id}
-          className="group flex items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
+          role="button"
+          tabIndex={0}
+          onClick={() => onConnectHost(h)}
+          onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onConnectHost(h); } }}
+          className="group flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
         >
           <OsBadge os={h.os} />
           <div className="min-w-0 flex-1">
@@ -1976,10 +2379,24 @@ function HostsList({ hosts, viewMode, query }: { hosts: Host[]; viewMode: "grid"
             <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}</div>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            <span className="rounded border border-border px-1.5 py-0.5">{h.os}</span>
+            <button
+              title="Edit"
+              onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
+              className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-foreground group-hover:opacity-100"
+            >
+              <Settings className="h-3.5 w-3.5" />
+            </button>
+            <button
+              title="Delete"
+              onClick={(e) => { e.stopPropagation(); onDeleteHost(h.id); }}
+              className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-[oklch(0.72_0.18_25)] group-hover:opacity-100"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
             <PanelRightOpen className="h-4 w-4 opacity-0 transition-opacity group-hover:opacity-100" />
+            <span className="rounded border border-border px-1.5 py-0.5">{h.os}</span>
           </div>
-        </button>
+        </div>
       ))}
     </div>
   );
@@ -1997,20 +2414,39 @@ function groupPath(groups: HostGroup[], id: string | null): string {
   return parts.join(" › ");
 }
 
+function descendantGroupIds(groups: HostGroup[], id: string): string[] {
+  const descendants: string[] = [];
+  const stack = [id];
+
+  while (stack.length > 0) {
+    const parentId = stack.pop()!;
+    groups
+      .filter((group) => group.parentId === parentId)
+      .forEach((group) => {
+        descendants.push(group.id);
+        stack.push(group.id);
+      });
+  }
+
+  return descendants;
+}
+
 /* ---- Modal: New Group ---- */
 function GroupModal({
-  groups, defaultParentId, onClose, onSubmit,
+  groups, defaultParentId, group, onClose, onSubmit,
 }: {
   groups: HostGroup[];
   defaultParentId: string | null;
+  group?: HostGroup | null;
   onClose: () => void;
   onSubmit: (name: string, parentId: string | null) => void;
 }) {
-  const [name, setName] = useState("");
-  const [parentId, setParentId] = useState<string | null>(defaultParentId);
+  const [name, setName] = useState(group?.name ?? "");
+  const [parentId, setParentId] = useState<string | null>(group?.parentId ?? defaultParentId);
+  const invalidParentIds = group ? [group.id, ...descendantGroupIds(groups, group.id)] : [];
 
   return (
-    <ModalShell title="New group" onClose={onClose}>
+    <ModalShell title={group ? "Edit group" : "New group"} onClose={onClose}>
       <Field label="Name">
         <input
           autoFocus
@@ -2021,16 +2457,17 @@ function GroupModal({
         />
       </Field>
       <Field label="Parent group">
-        <select
-          value={parentId ?? ""}
-          onChange={(e) => setParentId(e.target.value || null)}
-          className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-        >
-          <option value="">— (root)</option>
-          {groups.map((g) => (
-            <option key={g.id} value={g.id}>{groupPath(groups, g.id)}</option>
-          ))}
-        </select>
+        <Select value={parentId ?? "__none__"} onValueChange={(val) => setParentId(val === "__none__" ? null : val)}>
+          <SelectTrigger className="h-9 w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none__">— (root)</SelectItem>
+            {groups.filter((g) => !invalidParentIds.includes(g.id)).map((g) => (
+              <SelectItem key={g.id} value={g.id}>{groupPath(groups, g.id)}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </Field>
       <ModalActions
         onClose={onClose}
@@ -2039,36 +2476,14 @@ function GroupModal({
           if (n) onSubmit(n, parentId);
         }}
         confirmDisabled={!name.trim()}
-        confirmLabel="Create group"
+        confirmLabel={group ? "Save group" : "Create group"}
       />
     </ModalShell>
   );
 }
 
-/* ---- Modal: New Host ---- */
-function HostModal({
-  groups, defaultGroupId, onClose, onSubmit,
-}: {
-  groups: HostGroup[];
-  defaultGroupId: string | null;
-  onClose: () => void;
-  onSubmit: (h: Omit<Host, "id">) => void;
-}) {
-  const [name, setName] = useState("");
-  const [hostname, setHostname] = useState("");
-  const [port, setPort] = useState(22);
-  const [user, setUser] = useState("");
-  const [password, setPassword] = useState("");
-  const [showPass, setShowPass] = useState(false);
-  const [sshKeyId, setSshKeyId] = useState<string | null>(null);
-  const [groupId, setGroupId] = useState<string | null>(defaultGroupId);
-  const [tags, setTags] = useState<string[]>([]);
-  const [showStatus, setShowStatus] = useState(true);
-  const [sftpPath, setSftpPath] = useState("/");
-
-  const valid = name.trim() && hostname.trim() && user.trim();
-
-  const SectionTitle = ({ icon, title }: { icon: React.ReactNode; title: string }) => (
+function HostModalSectionTitle({ icon, title }: { icon: React.ReactNode; title: string }) {
+  return (
     <div className="flex items-center gap-2 px-4 py-3">
       <span className="flex h-5 w-5 items-center justify-center text-muted-foreground">
         {icon}
@@ -2076,8 +2491,18 @@ function HostModal({
       <span className="text-sm font-semibold text-foreground">{title}</span>
     </div>
   );
+}
 
-  const Row = ({ label, children, rightText }: { label: string; children: React.ReactNode; rightText?: string }) => (
+function HostModalRow({
+  label,
+  children,
+  rightText,
+}: {
+  label: string;
+  children: React.ReactNode;
+  rightText?: string;
+}) {
+  return (
     <div className="flex items-center justify-between border-t border-border px-4 py-2.5">
       <span className="text-sm text-foreground">{label}</span>
       <div className="flex items-center gap-2">
@@ -2086,8 +2511,10 @@ function HostModal({
       </div>
     </div>
   );
+}
 
-  const Input = (props: React.InputHTMLAttributes<HTMLInputElement>) => (
+function HostModalInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
+  return (
     <input
       {...props}
       dir="ltr"
@@ -2097,18 +2524,10 @@ function HostModal({
       ].filter(Boolean).join(" ")}
     />
   );
+}
 
-  const SelectButton = ({ label, icon, onClick }: { label: string; icon: React.ReactNode; onClick?: () => void }) => (
-    <button
-      onClick={onClick}
-      className="flex h-7 items-center gap-1.5 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-[var(--color-surface)]"
-    >
-      <span>{label}</span>
-      {icon}
-    </button>
-  );
-
-  const Toggle = ({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) => (
+function HostModalToggle({ checked, onChange }: { checked: boolean; onChange: (v: boolean) => void }) {
+  return (
     <button
       onClick={() => onChange(!checked)}
       className={[
@@ -2124,6 +2543,88 @@ function HostModal({
       />
     </button>
   );
+}
+
+/* ---- Modal: New Host ---- */
+function HostModal({
+  groups, existingTags, defaultGroupId, host, onClose, onSubmit,
+}: {
+  groups: HostGroup[];
+  existingTags: string[];
+  defaultGroupId: string | null;
+  host?: Host | null;
+  onClose: () => void;
+  onSubmit: (h: Omit<Host, "id">) => void;
+}) {
+  const [name, setName] = useState(host?.name ?? "");
+  const [hostname, setHostname] = useState(host?.hostname ?? "");
+  const [port, setPort] = useState(host?.port ?? 22);
+  const [user, setUser] = useState(host?.user ?? "");
+  const [password, setPassword] = useState(host?.password ?? "");
+  const [showPass, setShowPass] = useState(false);
+  const [sshKeyId, setSshKeyId] = useState<string | null>(host?.sshKeyId ?? null);
+  const [os, setOs] = useState<import("./types").OsKind>(host?.os ?? "ubuntu");
+  const [groupId, setGroupId] = useState<string | null>(host?.groupId ?? defaultGroupId);
+  const [tags, setTags] = useState<string[]>(host?.tags ?? []);
+  const [tagInput, setTagInput] = useState("");
+  const [showStatus, setShowStatus] = useState(host?.showStatusInDashboard ?? true);
+  const [workingDir, setWorkingDir] = useState(host?.workingDirectory ?? "");
+  const [sftpPath, setSftpPath] = useState(host?.defaultSftpPath ?? "/");
+  const [sshKeys, setSshKeys] = useState<SshKey[]>([]);
+  const [testing, setTesting] = useState(false);
+
+  const valid = name.trim() && hostname.trim() && user.trim();
+
+  useEffect(() => {
+    let cancelled = false;
+    invoke<SshKey[]>("list_ssh_keys")
+      .then((items) => {
+        if (!cancelled) setSshKeys(items);
+      })
+      .catch(() => {
+        if (!cancelled) setSshKeys([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const addTag = (tag: string) => {
+    const normalized = tag.trim();
+    if (!normalized) return;
+    setTags((curr) => (curr.includes(normalized) ? curr : [...curr, normalized]));
+    setTagInput("");
+  };
+  const removeTag = (tag: string) => {
+    setTags((curr) => curr.filter((item) => item !== tag));
+  };
+  const testConnection = async () => {
+    if (!hostname.trim() || !user.trim()) return;
+    // flushSync forces React to paint the "Testing..." / disabled state before
+    // the async invoke starts — without this, React may batch the state update
+    // with the invoke call and the button never visually changes on macOS/Linux.
+    flushSync(() => setTesting(true));
+
+    try {
+      const result = await invoke<{ ok: boolean; message: string }>("test_host_connection", {
+        request: {
+          hostname: hostname.trim(),
+          user: user.trim(),
+          port,
+          password,
+          sshKeyId,
+          timeoutSecs: 5,
+        },
+      });
+      if (result.ok) toast.success("Connection test passed", { description: result.message });
+      else toast.error("Connection test failed", { description: result.message });
+    } catch (err) {
+      const message = String(err);
+      toast.error("Connection test failed", { description: message });
+    } finally {
+      setTesting(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
@@ -2133,7 +2634,7 @@ function HostModal({
       >
         {/* Header */}
         <div className="flex items-center justify-between border-b border-border bg-[var(--color-sidebar)] px-5 py-3">
-          <h3 className="text-sm font-semibold text-foreground">Create New Machine</h3>
+          <h3 className="text-sm font-semibold text-foreground">{host ? "Edit Machine" : "Create New Machine"}</h3>
           <button
             onClick={onClose}
             className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition hover:bg-[var(--color-surface-2)] hover:text-foreground"
@@ -2145,37 +2646,53 @@ function HostModal({
         {/* Body */}
         <div className="flex-1 overflow-y-auto">
           {/* Machine Information */}
-          <SectionTitle icon={<Info className="h-4 w-4" />} title="Machine Information" />
+          <HostModalSectionTitle icon={<Info className="h-4 w-4" />} title="Machine Information" />
           <div className="border-t border-border">
-            <Row label="Name">
-              <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" />
-            </Row>
-            <Row label="Host">
-              <Input value={hostname} onChange={(e) => setHostname(e.target.value)} placeholder="IP or Hostname" />
-            </Row>
-            <Row label="Port" rightText="22">
+            <HostModalRow label="Name">
+              <HostModalInput autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Name" />
+            </HostModalRow>
+            <HostModalRow label="Host">
+              <HostModalInput value={hostname} onChange={(e) => setHostname(e.target.value)} placeholder="IP or Hostname" />
+            </HostModalRow>
+            <HostModalRow label="Port" rightText="22">
               <input
                 type="number"
                 value={port}
                 onChange={(e) => setPort(Number(e.target.value) || 22)}
                 dir="ltr"
-                className="h-8 w-16 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+                className="h-8 w-24 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
               />
-            </Row>
+            </HostModalRow>
+            <HostModalRow label="OS">
+              <Select value={os} onValueChange={(val) => setOs(val as import("./types").OsKind)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ubuntu">Ubuntu</SelectItem>
+                  <SelectItem value="debian">Debian</SelectItem>
+                  <SelectItem value="centos">CentOS</SelectItem>
+                  <SelectItem value="alpine">Alpine</SelectItem>
+                  <SelectItem value="macos">macOS</SelectItem>
+                  <SelectItem value="windows">Windows</SelectItem>
+                  <SelectItem value="other">Other</SelectItem>
+                </SelectContent>
+              </Select>
+            </HostModalRow>
           </div>
           <div className="px-4 pb-2 pt-1.5">
             <p className="text-right text-[11px] text-muted-foreground">If Name is empty, Host will be used as Name.</p>
           </div>
 
           {/* Authentication */}
-          <SectionTitle icon={<Lock className="h-4 w-4" />} title="Authentication" />
+          <HostModalSectionTitle icon={<Lock className="h-4 w-4" />} title="Authentication" />
           <div className="border-t border-border">
-            <Row label="Username">
-              <Input value={user} onChange={(e) => setUser(e.target.value)} placeholder="Username" />
-            </Row>
-            <Row label="Password">
+            <HostModalRow label="Username">
+              <HostModalInput value={user} onChange={(e) => setUser(e.target.value)} placeholder="Username" />
+            </HostModalRow>
+            <HostModalRow label="Password">
               <div className="relative">
-                <Input
+                <HostModalInput
                   className="pr-7"
                   type={showPass ? "text" : "password"}
                   value={password}
@@ -2189,49 +2706,86 @@ function HostModal({
                   {showPass ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
                 </button>
               </div>
-            </Row>
-            <Row label="SSH Key">
-              <SelectButton
-                label={sshKeyId ? "Selected" : "Select Key"}
-                icon={<KeyRound className="h-3.5 w-3.5" />}
-              />
-            </Row>
-          </div>
-          <div className="mx-4 my-2 rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-2">
-            <button className="rounded-md bg-[var(--color-surface)] px-3 py-1 text-xs font-medium text-muted-foreground hover:text-foreground">
-              Test Connection
-            </button>
-          </div>
-          <div className="px-4 pb-2 pt-1">
-            <p className="text-right text-[11px] text-muted-foreground">It is recommended to test connection before saving.</p>
+            </HostModalRow>
+            <HostModalRow label="SSH Key">
+              <Select value={sshKeyId ?? "__none__"} onValueChange={(val) => setSshKeyId(val === "__none__" ? null : val)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">No key</SelectItem>
+                  {sshKeys.map((key) => (
+                    <SelectItem key={key.id} value={key.id}>{key.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </HostModalRow>
           </div>
 
           {/* Categorization */}
-          <SectionTitle icon={<Tag className="h-4 w-4" />} title="Categorization" />
+          <HostModalSectionTitle icon={<Tag className="h-4 w-4" />} title="Categorization" />
           <div className="border-t border-border">
-            <Row label="Group">
-              <SelectButton
-                label={groupId ? groupPath(groups, groupId) : "Select Group"}
-                icon={<LayoutGrid className="h-3.5 w-3.5" />}
-              />
-            </Row>
-            <Row label="Tags">
-              <SelectButton
-                label={tags.length > 0 ? `${tags.length} tags` : "Edit Tags"}
-                icon={<Tag className="h-3.5 w-3.5" />}
-              />
-            </Row>
+            <HostModalRow label="Group">
+              <Select value={groupId ?? "__none__"} onValueChange={(val) => setGroupId(val === "__none__" ? null : val)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">Root</SelectItem>
+                  {groups.map((group) => (
+                    <SelectItem key={group.id} value={group.id}>{groupPath(groups, group.id)}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </HostModalRow>
+            <HostModalRow label="Tags">
+              <div className="flex w-64 flex-col items-end gap-2">
+                <div className="flex w-full flex-wrap justify-end gap-1">
+                  {tags.map((tag) => (
+                    <button
+                      key={tag}
+                      onClick={() => removeTag(tag)}
+                      className="rounded border border-border bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground"
+                    >
+                      {tag} ×
+                    </button>
+                  ))}
+                </div>
+                <input
+                  list="host-tag-options"
+                  value={tagInput}
+                  onChange={(e) => setTagInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === ",") {
+                      e.preventDefault();
+                      addTag(tagInput.replace(",", ""));
+                    }
+                  }}
+                  onBlur={() => addTag(tagInput)}
+                  placeholder="Add tag"
+                  className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+                />
+                <datalist id="host-tag-options">
+                  {existingTags.map((tag) => (
+                    <option key={tag} value={tag} />
+                  ))}
+                </datalist>
+              </div>
+            </HostModalRow>
           </div>
 
           {/* Preferences */}
-          <SectionTitle icon={<Settings className="h-4 w-4" />} title="Preferences" />
+          <HostModalSectionTitle icon={<Settings className="h-4 w-4" />} title="Preferences" />
           <div className="border-t border-border">
-            <Row label="Show Status in Dashboard">
-              <Toggle checked={showStatus} onChange={setShowStatus} />
-            </Row>
-            <Row label="Default SFTP Path">
-              <Input value={sftpPath} onChange={(e) => setSftpPath(e.target.value)} placeholder="/" />
-            </Row>
+            <HostModalRow label="Show Status in Dashboard">
+              <HostModalToggle checked={showStatus} onChange={setShowStatus} />
+            </HostModalRow>
+            <HostModalRow label="Working Directory">
+              <HostModalInput value={workingDir} onChange={(e) => setWorkingDir(e.target.value)} placeholder="e.g. /home/user/project" />
+            </HostModalRow>
+            <HostModalRow label="Default SFTP Path">
+              <HostModalInput value={sftpPath} onChange={(e) => setSftpPath(e.target.value)} placeholder="/" />
+            </HostModalRow>
           </div>
         </div>
 
@@ -2244,6 +2798,13 @@ function HostModal({
             Cancel
           </button>
           <button
+            disabled={!hostname.trim() || !user.trim() || testing}
+            onClick={() => void testConnection()}
+            className="w-[9.5rem] rounded-md border border-border bg-[var(--color-surface)] px-4 py-1.5 text-center text-sm font-medium text-foreground disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:bg-[var(--color-surface-2)]"
+          >
+            {testing ? "Testing..." : "Test Connection"}
+          </button>
+          <button
             onClick={() =>
               valid &&
               onSubmit({
@@ -2251,19 +2812,21 @@ function HostModal({
                 hostname: hostname.trim(),
                 port,
                 user: user.trim(),
-                os: "ubuntu",
+                os,
                 groupId,
                 tags,
                 password,
                 sshKeyId,
+                authMethod: sshKeyId ? "key" : password ? "password" : undefined,
                 showStatusInDashboard: showStatus,
+                workingDirectory: workingDir.trim() || undefined,
                 defaultSftpPath: sftpPath,
               })
             }
             disabled={!valid}
             className="rounded-md bg-[var(--color-brand-orange)] px-4 py-1.5 text-sm font-semibold text-[var(--color-primary-foreground)] disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"
           >
-            Create host
+            {host ? "Save host" : "Create host"}
           </button>
         </div>
       </div>
@@ -2404,21 +2967,427 @@ function SplitButton({
 /* ---------------- Port forwarding (empty) ---------------- */
 
 function PortForwardingView() {
+  const [rules, setRules] = useState<import("./types").PortForwardRule[]>([]);
+  const [hosts, setHosts] = useState<Host[]>([]);
+  const [statuses, setStatuses] = useState<Record<string, import("./types").TunnelStatus>>({});
+  const [loading, setLoading] = useState(true);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editingRule, setEditingRule] = useState<import("./types").PortForwardRule | null>(null);
+  const [removingId, setRemovingId] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
+
+  const loadData = async () => {
+    try {
+      const [ruleList, hostVault] = await Promise.all([
+        invoke<import("./types").PortForwardRule[]>("list_port_forwards"),
+        invoke<{ hosts: Host[]; groups: HostGroup[] }>("list_hosts"),
+      ]);
+      setRules(ruleList);
+      setHosts(hostVault.hosts);
+
+      if (ruleList.length > 0) {
+        const s = await invoke<import("./types").TunnelStatus[]>("get_tunnel_statuses", {
+          ruleIds: ruleList.map((r) => r.id),
+        });
+        const map: Record<string, import("./types").TunnelStatus> = {};
+        s.forEach((st) => { map[st.ruleId] = st; });
+        setStatuses(map);
+      }
+    } catch (err) {
+      toast.error("Failed to load port forwards", { description: String(err) });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => { void loadData(); }, []);
+
+  // Refresh statuses periodically
+  useEffect(() => {
+    if (rules.length === 0) return;
+    const interval = setInterval(async () => {
+      try {
+        const s = await invoke<import("./types").TunnelStatus[]>("get_tunnel_statuses", {
+          ruleIds: rules.map((r) => r.id),
+        });
+        const map: Record<string, import("./types").TunnelStatus> = {};
+        s.forEach((st) => { map[st.ruleId] = st; });
+        setStatuses(map);
+      } catch { /* ignore */ }
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [rules]);
+
+  const handleSave = async (data: Omit<import("./types").PortForwardRule, "id" | "createdAt">, id?: string) => {
+    try {
+      const saved = await invoke<import("./types").PortForwardRule>("save_port_forward", {
+        request: { ...data, id: id ?? null },
+      });
+      setRules((curr) => [saved, ...curr.filter((r) => r.id !== saved.id)]);
+      setModalOpen(false);
+      setEditingRule(null);
+      toast.success(id ? "Rule updated" : "Rule created");
+    } catch (err) {
+      toast.error("Failed to save rule", { description: String(err) });
+    }
+  };
+
+  const handleRemove = async (id: string) => {
+    try {
+      await invoke("remove_port_forwards", { ids: [id] });
+      setRules((curr) => curr.filter((r) => r.id !== id));
+      setStatuses((curr) => { const next = { ...curr }; delete next[id]; return next; });
+      setRemovingId(null);
+      toast.success("Rule removed");
+    } catch (err) {
+      toast.error("Failed to remove rule", { description: String(err) });
+    }
+  };
+
+  const handleToggle = async (ruleId: string) => {
+    const current = statuses[ruleId];
+    try {
+      if (current?.active) {
+        const s = await invoke<import("./types").TunnelStatus>("stop_tunnel", { ruleId });
+        setStatuses((curr) => ({ ...curr, [ruleId]: s }));
+        toast.success("Tunnel stopped");
+      } else {
+        const s = await invoke<import("./types").TunnelStatus>("start_tunnel", { ruleId });
+        setStatuses((curr) => ({ ...curr, [ruleId]: s }));
+        if (s.active) toast.success("Tunnel started");
+        else toast.error("Tunnel failed to start", { description: s.error ?? "Unknown error" });
+      }
+    } catch (err) {
+      toast.error("Tunnel operation failed", { description: String(err) });
+    }
+  };
+
+  const filtered = rules.filter((r) =>
+    `${r.name} ${r.localHost}:${r.localPort} ${r.remoteHost}:${r.remotePort}`.toLowerCase().includes(query.toLowerCase())
+  );
+
+  const getHostName = (hostId: string) => {
+    const h = hosts.find((x) => x.id === hostId);
+    return h ? (h.name || h.hostname) : "Unknown host";
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
+      {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-border px-4 py-3">
-        <SplitButton primary={<><Plus className="h-3.5 w-3.5" /> New forwarding</>} />
+        <button
+          onClick={() => { setEditingRule(null); setModalOpen(true); }}
+          className="flex h-7 items-center gap-1 rounded-md bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-white/5"
+        >
+          <Plus className="h-3.5 w-3.5" /> New forwarding
+        </button>
         <div className="flex items-center gap-1">
-          <IconButton icon={<Search className="h-4 w-4" />} title="Search" />
-          <IconButton icon={<LayoutGrid className="h-4 w-4" />} title="Grid" active />
-          <IconButton icon={<CalendarClock className="h-4 w-4" />} title="Recent" />
+          {searchOpen ? (
+            <input
+              ref={searchRef}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onBlur={() => { if (!query) setSearchOpen(false); }}
+              onKeyDown={(e) => { if (e.key === "Escape") { setQuery(""); setSearchOpen(false); } }}
+              placeholder="Search..."
+              className="h-7 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring/40"
+            />
+          ) : (
+            <button
+              onClick={() => setSearchOpen(true)}
+              className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+              title="Search"
+            >
+              <Search className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </div>
-      <EmptyState
-        icon={Network}
-        title="Set up port forwarding"
-        subtitle="Save port forwarding to access databases, web apps, and other services."
-      />
+
+      {/* Content */}
+      <div className="flex flex-1 flex-col overflow-y-auto px-4 py-4">
+        {loading ? (
+          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">Loading...</div>
+        ) : filtered.length === 0 && !query ? (
+          <EmptyState
+            icon={Network}
+            title="Set up port forwarding"
+            subtitle="Save port forwarding rules to access databases, web apps, and other services through SSH tunnels."
+          />
+        ) : filtered.length === 0 && query ? (
+          <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
+            No rules match "{query}"
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {filtered.map((rule) => {
+              const status = statuses[rule.id];
+              const active = status?.active ?? false;
+              const hasError = !!status?.error;
+              return (
+                <div
+                  key={rule.id}
+                  className="group flex items-center gap-4 rounded-lg border border-border bg-[var(--color-surface)] p-4 transition hover:border-[var(--color-brand-orange)]/40"
+                >
+                  {/* Status indicator + toggle */}
+                  <button
+                    onClick={() => void handleToggle(rule.id)}
+                    className={[
+                      "flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition",
+                      active
+                        ? "bg-[oklch(0.65_0.18_145)]/20 text-[oklch(0.65_0.18_145)] hover:bg-[oklch(0.65_0.2_25)]/20 hover:text-[oklch(0.65_0.2_25)]"
+                        : "bg-[var(--color-surface-2)] text-muted-foreground hover:bg-[oklch(0.65_0.18_145)]/20 hover:text-[oklch(0.65_0.18_145)]",
+                    ].join(" ")}
+                    title={active ? "Stop tunnel" : "Start tunnel"}
+                  >
+                    {active ? <X className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                  </button>
+
+                  {/* Info */}
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium text-foreground">{rule.name}</span>
+                      <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
+                        rule.direction === "local" ? "bg-[oklch(0.65_0.15_230)]/15 text-[oklch(0.65_0.15_230)]"
+                        : rule.direction === "remote" ? "bg-[oklch(0.65_0.18_145)]/15 text-[oklch(0.65_0.18_145)]"
+                        : "bg-[var(--color-brand-yellow)]/15 text-[var(--color-brand-yellow)]"
+                      }`}>
+                        {rule.direction}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+                      <span className="font-mono">{rule.localHost}:{rule.localPort}</span>
+                      <span>→</span>
+                      {rule.direction === "dynamic" ? (
+                        <span className="font-mono">SOCKS proxy</span>
+                      ) : (
+                        <span className="font-mono">{rule.remoteHost}:{rule.remotePort}</span>
+                      )}
+                      <span className="text-muted-foreground/60">via</span>
+                      <span>{getHostName(rule.hostId)}</span>
+                    </div>
+                    {/* Status line */}
+                    <div className="mt-1.5 flex items-center gap-2 text-[11px]">
+                      {active ? (
+                        <span className="flex items-center gap-1.5 font-medium text-[oklch(0.65_0.18_145)]">
+                          <span className="h-1.5 w-1.5 rounded-full bg-[oklch(0.65_0.18_145)] animate-pulse" />
+                          Connected{status?.pid ? ` (PID ${status.pid})` : ""}
+                        </span>
+                      ) : hasError ? (
+                        <span className="flex items-center gap-1.5 font-medium text-[oklch(0.65_0.2_25)]">
+                          <span className="h-1.5 w-1.5 rounded-full bg-[oklch(0.65_0.2_25)]" />
+                          Failed: {status.error}
+                        </span>
+                      ) : (
+                        <span className="flex items-center gap-1.5 text-muted-foreground">
+                          <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40" />
+                          Disconnected
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Actions */}
+                  <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+                    <button
+                      title="Edit"
+                      onClick={() => { setEditingRule(rule); setModalOpen(true); }}
+                      className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+                    >
+                      <Settings className="h-3.5 w-3.5" />
+                    </button>
+                    <button
+                      title="Delete"
+                      onClick={() => setRemovingId(rule.id)}
+                      className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-[oklch(0.72_0.18_25)]"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* Modal: Create / Edit */}
+      {modalOpen && (
+        <PortForwardModal
+          rule={editingRule}
+          hosts={hosts}
+          onClose={() => { setModalOpen(false); setEditingRule(null); }}
+          onSubmit={(data) => void handleSave(data, editingRule?.id)}
+        />
+      )}
+
+      {/* Modal: Remove confirmation */}
+      {removingId && (
+        <RemovePortForwardModal
+          name={rules.find((r) => r.id === removingId)?.name ?? "this rule"}
+          onClose={() => setRemovingId(null)}
+          onConfirm={() => void handleRemove(removingId)}
+        />
+      )}
+    </div>
+  );
+}
+
+function PortForwardModal({
+  rule,
+  hosts,
+  onClose,
+  onSubmit,
+}: {
+  rule?: import("./types").PortForwardRule | null;
+  hosts: Host[];
+  onClose: () => void;
+  onSubmit: (data: Omit<import("./types").PortForwardRule, "id" | "createdAt">) => void;
+}) {
+  const [name, setName] = useState(rule?.name ?? "");
+  const [hostId, setHostId] = useState(rule?.hostId ?? (hosts[0]?.id ?? ""));
+  const [direction, setDirection] = useState<import("./types").TunnelDirection>(rule?.direction ?? "local");
+  const [localHost, setLocalHost] = useState(rule?.localHost ?? "127.0.0.1");
+  const [localPort, setLocalPort] = useState(rule?.localPort ?? 0);
+  const [remoteHost, setRemoteHost] = useState(rule?.remoteHost ?? "127.0.0.1");
+  const [remotePort, setRemotePort] = useState(rule?.remotePort ?? 0);
+  const [autoConnect, setAutoConnect] = useState(rule?.autoConnect ?? false);
+
+  const valid = name.trim() && hostId && localPort > 0 && (direction === "dynamic" || remotePort > 0);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div
+        className="flex max-h-[75vh] w-[520px] max-w-[92vw] flex-col overflow-hidden rounded-xl border border-border bg-[var(--color-surface)] shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-border bg-[var(--color-sidebar)] px-5 py-3">
+          <h3 className="text-sm font-semibold text-foreground">{rule ? "Edit Port Forward" : "New Port Forward"}</h3>
+          <button onClick={onClose} className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground transition hover:bg-[var(--color-surface-2)] hover:text-foreground">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto">
+          <div className="border-t border-border">
+            <HostModalRow label="Name">
+              <HostModalInput autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. My Database" />
+            </HostModalRow>
+            <HostModalRow label="Host">
+              <Select value={hostId} onValueChange={setHostId}>
+                <SelectTrigger className="h-8 w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {hosts.map((h) => (
+                    <SelectItem key={h.id} value={h.id}>{h.name || h.hostname}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </HostModalRow>
+            <HostModalRow label="Direction">
+              <Select value={direction} onValueChange={(val) => setDirection(val as import("./types").TunnelDirection)}>
+                <SelectTrigger className="h-8 w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="local">Local (-L)</SelectItem>
+                  <SelectItem value="remote">Remote (-R)</SelectItem>
+                  <SelectItem value="dynamic">Dynamic SOCKS (-D)</SelectItem>
+                </SelectContent>
+              </Select>
+            </HostModalRow>
+            <HostModalRow label="Local Host">
+              <HostModalInput value={localHost} onChange={(e) => setLocalHost(e.target.value)} placeholder="127.0.0.1" />
+            </HostModalRow>
+            <HostModalRow label="Local Port">
+              <input
+                type="number"
+                value={localPort || ""}
+                onChange={(e) => setLocalPort(Number(e.target.value) || 0)}
+                placeholder="e.g. 3306"
+                dir="ltr"
+                className="h-8 w-24 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+              />
+            </HostModalRow>
+            {direction !== "dynamic" && (
+              <>
+                <HostModalRow label="Remote Host">
+                  <HostModalInput value={remoteHost} onChange={(e) => setRemoteHost(e.target.value)} placeholder="127.0.0.1" />
+                </HostModalRow>
+                <HostModalRow label="Remote Port">
+                  <input
+                    type="number"
+                    value={remotePort || ""}
+                    onChange={(e) => setRemotePort(Number(e.target.value) || 0)}
+                    placeholder="e.g. 3306"
+                    dir="ltr"
+                    className="h-8 w-24 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+                  />
+                </HostModalRow>
+              </>
+            )}
+            <HostModalRow label="Auto-connect">
+              <HostModalToggle checked={autoConnect} onChange={setAutoConnect} />
+            </HostModalRow>
+          </div>
+          <div className="px-4 pb-2 pt-1.5">
+            <p className="text-[11px] text-muted-foreground">
+              {direction === "local" && "Local: binds a local port and forwards traffic through SSH to the remote destination."}
+              {direction === "remote" && "Remote: binds a port on the remote server and forwards traffic back to your local machine."}
+              {direction === "dynamic" && "Dynamic: creates a local SOCKS proxy that routes traffic through the SSH connection."}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-border bg-[var(--color-sidebar)] px-5 py-3">
+          <button onClick={onClose} className="rounded-md px-4 py-1.5 text-sm font-medium text-muted-foreground transition hover:bg-[var(--color-surface-2)] hover:text-foreground">
+            Cancel
+          </button>
+          <button
+            onClick={() => valid && onSubmit({ name: name.trim(), hostId, direction, localHost: localHost.trim() || "127.0.0.1", localPort, remoteHost: remoteHost.trim() || "127.0.0.1", remotePort, autoConnect })}
+            disabled={!valid}
+            className="rounded-md bg-[var(--color-brand-orange)] px-4 py-1.5 text-sm font-semibold text-[var(--color-primary-foreground)] disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"
+          >
+            {rule ? "Save" : "Create"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RemovePortForwardModal({
+  name, onClose, onConfirm,
+}: {
+  name: string;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-[480px] max-w-[92vw] overflow-hidden rounded-lg border border-border bg-[var(--color-surface)] shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-border bg-[var(--color-sidebar)] px-5 py-3">
+          <h3 className="text-sm font-semibold text-foreground">Remove port forward</h3>
+          <button onClick={onClose} className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-muted-foreground transition hover:bg-[var(--color-surface-2)] hover:text-foreground">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        <div className="px-5 py-6">
+          <p className="text-sm text-foreground">
+            Are you sure you want to remove <span className="font-semibold">{name}</span>? Active tunnels will be stopped.
+          </p>
+          <div className="mt-6 flex items-center justify-end">
+            <button onClick={onConfirm} className="cursor-pointer rounded-md bg-[oklch(0.68_0.17_25)] px-5 py-1.5 text-sm font-semibold text-white transition hover:opacity-90">
+              Remove
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -2452,54 +3421,95 @@ function EmptyState({
 
 /* ---------------- SSH Keys view ---------------- */
 
-const initialSshKeys: SshKey[] = [
-  {
-    id: "k-prod",
-    name: "production",
-    type: "ed25519",
-    fingerprint: "SHA256:7c4ZbX9qP1mE2nYdR0vKsT3uVoLpQwHgJfA8cMxYbI",
-    remark: "Production servers",
-    hasPassphrase: true,
-    createdAt: "2025-03-12T09:24:00Z",
-  },
-  {
-    id: "k-staging",
-    name: "staging-rsa",
-    type: "rsa",
-    size: 4096,
-    fingerprint: "SHA256:2aPmNcVxK9LtR0bYhZqWdSjF3uXoTgEnHvJfA7cMxYb",
-    remark: "Staging cluster",
-    hasPassphrase: false,
-    createdAt: "2025-05-04T18:02:00Z",
-  },
-];
-
 function SshKeysView() {
-  const [keys, setKeys] = useState<SshKey[]>(initialSshKeys);
+  const [keys, setKeys] = useState<SshKey[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showGenerate, setShowGenerate] = useState(false);
   const [removing, setRemoving] = useState<string[] | null>(null);
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [viewMode, setViewMode] = useState<"grid" | "list">(() => {
+    const saved = localStorage.getItem("sshkeys-view-mode");
+    return saved === "list" ? "list" : "grid";
+  });
   const [viewOpen, setViewOpen] = useState(false);
-  const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
+  const [sortDir, setSortDir] = useState<"desc" | "asc">(() => {
+    const saved = localStorage.getItem("sshkeys-sort-dir");
+    return saved === "asc" ? "asc" : "desc";
+  });
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [sshKeyError, setSshKeyError] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
+  useEffect(() => { localStorage.setItem("sshkeys-view-mode", viewMode); }, [viewMode]);
+  useEffect(() => { localStorage.setItem("sshkeys-sort-dir", sortDir); }, [sortDir]);
+  useEffect(() => {
+    let cancelled = false;
+
+    invoke<SshKey[]>("list_ssh_keys")
+      .then((items) => {
+        if (!cancelled) {
+          setKeys(items);
+          setSshKeyError(null);
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) setSshKeyError(String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const toggleSelect = (id: string, additive: boolean) => {
     setSelected((curr) => {
-      const next = new Set(additive ? curr : []);
-      if (curr.has(id) && additive) next.delete(id);
+      if (!additive) {
+        return curr.has(id) && curr.size === 1 ? new Set() : new Set([id]);
+      }
+
+      const next = new Set(curr);
+      if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
   };
 
-  const remove = (ids: string[]) => {
-    setKeys((curr) => curr.filter((k) => !ids.includes(k.id)));
-    setSelected(new Set());
-    setRemoving(null);
+  const copyPublicKey = (key: SshKey) => {
+    if (!key.publicKey) return;
+    navigator.clipboard
+      .writeText(key.publicKey)
+      .then(() => {
+        toast.success("Public key copied", {
+          description: `${key.name} public key copied to clipboard.`,
+        });
+      })
+      .catch((err) => {
+        const message = `Copy public key failed: ${String(err)}`;
+        setSshKeyError(message);
+        toast.error("Copy failed", { description: message });
+      });
+  };
+
+  const remove = async (ids: string[]) => {
+    try {
+      await invoke("remove_ssh_keys", { ids });
+      setKeys((curr) => curr.filter((k) => !ids.includes(k.id)));
+      setSelected(new Set());
+      setRemoving(null);
+      setSshKeyError(null);
+    } catch (err) {
+      setSshKeyError(String(err));
+    }
+  };
+
+  const addKey = (key: SshKey) => {
+    setKeys((curr) => [key, ...curr.filter((item) => item.id !== key.id)]);
+    setShowGenerate(false);
+    setSshKeyError(null);
   };
 
   const selectedIds = Array.from(selected);
@@ -2525,15 +3535,12 @@ function SshKeysView() {
       {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <SplitButton
-            primary={<><Plus className="h-3.5 w-3.5" /> New key</>}
-            onPrimary={() => setShowGenerate(true)}
-            menu={[
-              { label: "Generate new key", icon: <KeyRound className="h-3.5 w-3.5" />, onClick: () => setShowGenerate(true) },
-              { label: "Import from file", icon: <FileUp className="h-3.5 w-3.5" />, onClick: () => {} },
-              { label: "Import from pasteboard", icon: <Clipboard className="h-3.5 w-3.5" />, onClick: () => {} },
-            ]}
-          />
+          <button
+            onClick={() => setShowGenerate(true)}
+            className="flex h-7 items-center gap-1 rounded-md bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-white/5"
+          >
+            <Plus className="h-3.5 w-3.5" /> New key
+          </button>
           {selectedIds.length > 0 && (
             <button
               onClick={() => setRemoving(selectedIds)}
@@ -2612,8 +3619,20 @@ function SshKeysView() {
         </div>
       </div>
 
+      {sshKeyError && (
+        <div className="mx-4 mt-4 rounded-md border border-[oklch(0.55_0.2_25)]/40 bg-[oklch(0.55_0.2_25)]/10 px-3 py-2 text-xs text-[oklch(0.72_0.18_25)]">
+          {sshKeyError}
+        </div>
+      )}
+
       {keys.length === 0 ? (
-        <SshKeysEmpty onGenerate={() => setShowGenerate(true)} />
+        loading ? (
+          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+            Loading SSH keys…
+          </div>
+        ) : (
+          <SshKeysEmpty />
+        )
       ) : (
         <div className="flex-1 overflow-y-auto px-4 py-4">
           <h2 className="mb-3 text-sm font-semibold text-foreground">SSH Keys</h2>
@@ -2629,6 +3648,7 @@ function SshKeysView() {
                   k={k}
                   selected={selected.has(k.id)}
                   onClick={(e) => toggleSelect(k.id, e.metaKey || e.ctrlKey || e.shiftKey)}
+                  onCopy={() => copyPublicKey(k)}
                   onRemove={() => setRemoving([k.id])}
                 />
               ))}
@@ -2664,7 +3684,7 @@ function SshKeysView() {
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
                         title="Copy public key"
-                        onClick={(e) => { e.stopPropagation(); }}
+                        onClick={(e) => { e.stopPropagation(); copyPublicKey(k); }}
                         className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
                       >
                         <Clipboard className="h-3.5 w-3.5" />
@@ -2685,12 +3705,12 @@ function SshKeysView() {
         </div>
       )}
 
-      {showGenerate && <GenerateSshKeyModal onClose={() => setShowGenerate(false)} />}
+      {showGenerate && <GenerateSshKeyModal onClose={() => setShowGenerate(false)} onCreated={addKey} />}
       {removing && (
         <RemoveSshKeyModal
           count={removing.length}
           onClose={() => setRemoving(null)}
-          onConfirm={() => remove(removing)}
+          onConfirm={() => void remove(removing)}
         />
       )}
     </div>
@@ -2698,11 +3718,12 @@ function SshKeysView() {
 }
 
 function SshKeyCard({
-  k, selected, onClick, onRemove,
+  k, selected, onClick, onCopy, onRemove,
 }: {
   k: SshKey;
   selected: boolean;
   onClick: (e: React.MouseEvent) => void;
+  onCopy: () => void;
   onRemove: () => void;
 }) {
   return (
@@ -2738,7 +3759,7 @@ function SshKeyCard({
         <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
           <button
             title="Copy public key"
-            onClick={(e) => { e.stopPropagation(); }}
+            onClick={(e) => { e.stopPropagation(); onCopy(); }}
             className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
           >
             <Clipboard className="h-3.5 w-3.5" />
@@ -2785,36 +3806,17 @@ function RemoveSshKeyModal({
   );
 }
 
-function SshKeysEmpty({ onGenerate }: { onGenerate?: () => void }) {
-  const [showGenerate, setShowGenerate] = useState(false);
-  const open = () => (onGenerate ? onGenerate() : setShowGenerate(true));
+function SshKeysEmpty() {
   return (
     <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-      <div className="flex h-32 w-32 items-center justify-center rounded-2xl bg-[var(--color-surface-2)]">
-        <KeyRound className="h-14 w-14 text-muted-foreground" strokeWidth={1.5} />
+      <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-[var(--color-surface-2)]">
+        <KeyRound className="h-9 w-9 text-muted-foreground" strokeWidth={1.5} />
       </div>
-      <p className="mt-6 text-sm font-semibold text-foreground">
-        No SSH keys available, create one now!
+      <h3 className="mt-5 text-base font-semibold text-foreground">Create SSH key</h3>
+      <p className="mt-1 max-w-sm text-sm text-muted-foreground">
+        Generate or import SSH keys to connect to your saved hosts securely.
       </p>
-      <div className="mt-5 flex w-full max-w-md flex-col gap-2">
-        <SshKeyButton icon={<KeyRound className="h-4 w-4" />} label="Generate New SSH Key" onClick={open} />
-        <SshKeyButton icon={<Clipboard className="h-4 w-4" />} label="Import Key from Pasteboard" />
-        <SshKeyButton icon={<FileUp className="h-4 w-4" />} label="Import Key from File" />
-      </div>
-      {showGenerate && <GenerateSshKeyModal onClose={() => setShowGenerate(false)} />}
     </div>
-  );
-}
-
-function SshKeyButton({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick?: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      className="flex w-full items-center justify-center gap-2 rounded-md bg-[var(--color-surface-2)] px-4 py-2.5 text-sm font-medium text-foreground transition hover:bg-[var(--color-sidebar-active)]"
-    >
-      {icon}
-      {label}
-    </button>
   );
 }
 
@@ -2822,15 +3824,39 @@ function SshKeyButton({ icon, label, onClick }: { icon: React.ReactNode; label: 
 type KeyType = "ed25519" | "rsa";
 type KeySize = 1024 | 2048 | 4096;
 
-function GenerateSshKeyModal({ onClose }: { onClose: () => void }) {
+function GenerateSshKeyModal({ onClose, onCreated }: { onClose: () => void; onCreated: (key: SshKey) => void }) {
   const [name, setName] = useState("");
   const [keyType, setKeyType] = useState<KeyType>("ed25519");
   const [keySize, setKeySize] = useState<KeySize>(2048);
   const [passphrase, setPassphrase] = useState("");
   const [showPass, setShowPass] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   
 
-  const canCreate = name.trim().length > 0;
+  const canCreate = name.trim().length > 0 && !creating;
+  const createKey = async () => {
+    if (!canCreate) return;
+    setCreating(true);
+    setError(null);
+
+    try {
+      const key = await invoke<SshKey>("generate_ssh_key", {
+        request: {
+          name: name.trim(),
+          type: keyType,
+          size: keyType === "rsa" ? keySize : null,
+          passphrase,
+          remark: name.trim(),
+        },
+      });
+      onCreated(key);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCreating(false);
+    }
+  };
 
   return (
     <div
@@ -2927,6 +3953,11 @@ function GenerateSshKeyModal({ onClose }: { onClose: () => void }) {
               </div>
             </FieldRow>
           </div>
+          {error && (
+            <div className="rounded-md border border-[oklch(0.55_0.2_25)]/40 bg-[oklch(0.55_0.2_25)]/10 px-3 py-2 text-xs text-[oklch(0.72_0.18_25)]">
+              {error}
+            </div>
+          )}
 
         </div>
 
@@ -2940,10 +3971,10 @@ function GenerateSshKeyModal({ onClose }: { onClose: () => void }) {
           </button>
           <button
             disabled={!canCreate}
-            onClick={onClose}
+            onClick={() => void createKey()}
             className="cursor-pointer rounded-md bg-[var(--color-brand-orange)] px-4 py-1.5 text-sm font-semibold text-[var(--color-primary-foreground)] transition disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"
           >
-            Create Key
+            {creating ? "Creating…" : "Create Key"}
           </button>
         </div>
       </div>
@@ -3082,56 +4113,91 @@ function SftpView() {
 
 /* ---------------- Snippets view ---------------- */
 
-const initialSnippets: Snippet[] = [
-  { id: "s-disk", name: "Disk Size", command: "df -h /", createdAt: "2025-06-01T10:00:00Z" },
-  { id: "s-ls", name: "list directory", command: "ls -l", createdAt: "2025-06-10T14:00:00Z" },
-];
+const SNIPPET_KIND_META: Record<SnippetKind, { label: string; color: string; icon: typeof Braces }> = {
+  text: { label: "Text Template", color: "oklch(0.55_0.15_160)", icon: FileText },
+  command: { label: "Command", color: "oklch(0.45_0.15_230)", icon: TerminalSquare },
+  script: { label: "Script", color: "oklch(0.55_0.15_300)", icon: Braces },
+};
+
+const initialSnippets: Snippet[] = [];
 
 function SnippetsView() {
   const [snippets, setSnippets] = useState<Snippet[]>(initialSnippets);
+  const [loading, setLoading] = useState(true);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [editor, setEditor] = useState<{ open: boolean; snippet?: Snippet | null }>({ open: false });
   const [removing, setRemoving] = useState<string[] | null>(null);
-  const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
+  const [viewMode, setViewMode] = useState<"grid" | "list">(
+    () => (localStorage.getItem("snippets-view-mode") as "grid" | "list") ?? "grid"
+  );
   const [viewOpen, setViewOpen] = useState(false);
-  const [sortDir, setSortDir] = useState<"desc" | "asc">("desc");
+  const [sortDir, setSortDir] = useState<"desc" | "asc">(
+    () => (localStorage.getItem("snippets-sort-dir") as "desc" | "asc") ?? "desc"
+  );
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
+  useEffect(() => { localStorage.setItem("snippets-view-mode", viewMode); }, [viewMode]);
+  useEffect(() => { localStorage.setItem("snippets-sort-dir", sortDir); }, [sortDir]);
+
+  // Load from backend
+  useEffect(() => {
+    invoke<Snippet[]>("list_snippets").then((data) => {
+      setSnippets(data);
+      setLoading(false);
+    }).catch(() => setLoading(false));
+  }, []);
 
   const toggleSelect = (id: string, additive: boolean) => {
     setSelected((curr) => {
-      const next = new Set(additive ? curr : []);
-      if (curr.has(id) && additive) next.delete(id);
+      if (!additive) {
+        return curr.has(id) && curr.size === 1 ? new Set() : new Set([id]);
+      }
+      const next = new Set(curr);
+      if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
   };
 
-  const upsert = (s: Snippet) => {
-    setSnippets((curr) => {
-      const idx = curr.findIndex((x) => x.id === s.id);
-      if (idx === -1) return [...curr, s];
-      const next = [...curr];
-      next[idx] = s;
-      return next;
-    });
+  const upsert = async (s: Snippet) => {
+    try {
+      const saved = await invoke<Snippet>("save_snippet", {
+        request: { id: s.id, kind: s.kind, name: s.name, body: s.body, command: s.command, script: s.script, variables: s.variables || [] },
+      });
+      setSnippets((curr) => {
+        const idx = curr.findIndex((x) => x.id === saved.id);
+        if (idx === -1) return [saved, ...curr];
+        const next = [...curr];
+        next[idx] = saved;
+        return next;
+      });
+    } catch (err) {
+      console.error("Failed to save snippet:", err);
+    }
   };
 
-  const remove = (ids: string[]) => {
-    setSnippets((curr) => curr.filter((s) => !ids.includes(s.id)));
-    setSelected(new Set());
-    setRemoving(null);
+  const remove = async (ids: string[]) => {
+    try {
+      await invoke("remove_snippets", { ids });
+      setSnippets((curr) => curr.filter((s) => !ids.includes(s.id)));
+      setSelected(new Set());
+      setRemoving(null);
+    } catch (err) {
+      console.error("Failed to remove snippets:", err);
+    }
   };
 
   const selectedIds = Array.from(selected);
+
+  const getSnippetContent = (s: Snippet) => s.body || s.command || s.script || "";
 
   const visibleSnippets = snippets
     .filter((s) => {
       if (!query.trim()) return true;
       const q = query.toLowerCase();
-      return s.name.toLowerCase().includes(q) || s.command.toLowerCase().includes(q);
+      return s.name.toLowerCase().includes(q) || getSnippetContent(s).toLowerCase().includes(q);
     })
     .sort((a, b) => {
       const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
@@ -3139,20 +4205,19 @@ function SnippetsView() {
       return sortDir === "desc" ? db - da : da - db;
     });
 
+  if (loading) return <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">Loading…</div>;
+
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
       {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <SplitButton
-            primary={<><Plus className="h-3.5 w-3.5" /> New snippet</>}
-            onPrimary={() => setEditor({ open: true, snippet: null })}
-            menu={[
-              { label: "New snippet", icon: <Plus className="h-3.5 w-3.5" />, onClick: () => setEditor({ open: true, snippet: null }) },
-              { label: "Import from file", icon: <FileUp className="h-3.5 w-3.5" />, onClick: () => {} },
-            ]}
-          />
-          <ToolbarButton icon={<Clock className="h-4 w-4" />} label="Shell History" />
+          <button
+            onClick={() => setEditor({ open: true, snippet: null })}
+            className="flex h-7 items-center gap-1 rounded-md bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-white/5"
+          >
+            <Plus className="h-3.5 w-3.5" /> New snippet
+          </button>
           {selectedIds.length > 0 && (
             <button
               onClick={() => setRemoving(selectedIds)}
@@ -3261,11 +4326,12 @@ function SnippetsView() {
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
               {visibleSnippets.map((s) => {
                 const isSel = selected.has(s.id);
+                const meta = SNIPPET_KIND_META[s.kind || "command"];
+                const KindIcon = meta.icon;
                 return (
                   <div
                     key={s.id}
                     onClick={(e) => toggleSelect(s.id, e.metaKey || e.ctrlKey || e.shiftKey)}
-                    onDoubleClick={() => setEditor({ open: true, snippet: s })}
                     className={[
                       "group relative flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-left transition",
                       isSel
@@ -3273,20 +4339,27 @@ function SnippetsView() {
                         : "border-border bg-[var(--color-surface)] hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]",
                     ].join(" ")}
                   >
-                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-[oklch(0.45_0.15_230)] text-white">
-                      <Braces className="h-5 w-5" />
+                    <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-white" style={{ backgroundColor: meta.color }}>
+                      <KindIcon className="h-5 w-5" />
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
-                      <div className="truncate font-mono text-xs text-muted-foreground">{s.command}</div>
+                      <div className="truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
+                      {s.variables && s.variables.length > 0 && (
+                        <div className="mt-1 flex items-center gap-1">
+                          <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                            {s.variables.length} var{s.variables.length > 1 ? "s" : ""}
+                          </span>
+                        </div>
+                      )}
                     </div>
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
-                        title="Run"
-                        onClick={(e) => { e.stopPropagation(); }}
+                        title="Edit"
+                        onClick={(e) => { e.stopPropagation(); setEditor({ open: true, snippet: s }); }}
                         className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
                       >
-                        <Play className="h-3.5 w-3.5" />
+                        <Settings className="h-3.5 w-3.5" />
                       </button>
                       <button
                         title="Remove"
@@ -3304,11 +4377,12 @@ function SnippetsView() {
             <div className="overflow-hidden rounded-lg border border-border bg-[var(--color-surface)]">
               {visibleSnippets.map((s, i) => {
                 const isSel = selected.has(s.id);
+                const meta = SNIPPET_KIND_META[s.kind || "command"];
+                const KindIcon = meta.icon;
                 return (
                   <div
                     key={s.id}
                     onClick={(e) => toggleSelect(s.id, e.metaKey || e.ctrlKey || e.shiftKey)}
-                    onDoubleClick={() => setEditor({ open: true, snippet: s })}
                     className={[
                       "group flex cursor-pointer items-center gap-3 px-3 py-2.5 text-left transition",
                       i > 0 ? "border-t border-border" : "",
@@ -3317,11 +4391,12 @@ function SnippetsView() {
                         : "hover:bg-[var(--color-surface-2)]",
                     ].join(" ")}
                   >
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-[oklch(0.45_0.15_230)] text-white">
-                      <Braces className="h-4 w-4" />
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-white" style={{ backgroundColor: meta.color }}>
+                      <KindIcon className="h-4 w-4" />
                     </span>
                     <div className="w-48 shrink-0 truncate text-sm font-medium text-foreground">{s.name}</div>
-                    <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{s.command}</div>
+                    <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+                    <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
                     {s.createdAt && (
                       <div className="hidden shrink-0 text-xs text-muted-foreground md:block">
                         {new Date(s.createdAt).toLocaleDateString()}
@@ -3329,16 +4404,16 @@ function SnippetsView() {
                     )}
                     <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                       <button
-                        title="Run"
-                        onClick={(e) => { e.stopPropagation(); }}
-                        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-3,var(--color-surface-2))] hover:text-foreground"
+                        title="Edit"
+                        onClick={(e) => { e.stopPropagation(); setEditor({ open: true, snippet: s }); }}
+                        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
                       >
-                        <Play className="h-3.5 w-3.5" />
+                        <Settings className="h-3.5 w-3.5" />
                       </button>
                       <button
                         title="Remove"
                         onClick={(e) => { e.stopPropagation(); setRemoving([s.id]); }}
-                        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-3,var(--color-surface-2))] hover:text-[oklch(0.72_0.18_25)]"
+                        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-[oklch(0.72_0.18_25)]"
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
@@ -3355,7 +4430,7 @@ function SnippetsView() {
         <SnippetModal
           snippet={editor.snippet ?? null}
           onClose={() => setEditor({ open: false })}
-          onSubmit={(s) => { upsert(s); setEditor({ open: false }); }}
+          onSubmit={(s) => { void upsert(s); setEditor({ open: false }); }}
         />
       )}
 
@@ -3363,9 +4438,136 @@ function SnippetsView() {
         <RemoveSnippetModal
           count={removing.length}
           onClose={() => setRemoving(null)}
-          onConfirm={() => remove(removing)}
+          onConfirm={() => void remove(removing)}
         />
       )}
+    </div>
+  );
+}
+
+function SortableVariableRow({
+  id, v, idx, updateVariable, removeVariable,
+}: {
+  id: string;
+  v: SnippetVariable;
+  idx: number;
+  updateVariable: (idx: number, patch: Partial<SnippetVariable>) => void;
+  removeVariable: (idx: number) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform ? { ...transform, x: 0, scaleX: 1, scaleY: 1 } : null),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : undefined,
+  };
+  return (
+    <div ref={setNodeRef} style={style} className="flex items-center gap-2 rounded-md border border-border bg-[var(--color-surface)] p-2">
+      <button
+        type="button"
+        {...attributes}
+        {...listeners}
+        className="flex h-7 w-5 cursor-grab items-center justify-center text-muted-foreground/50 hover:text-muted-foreground active:cursor-grabbing"
+      >
+        <GripVertical className="h-3.5 w-3.5" />
+      </button>
+      <input
+        value={v.name}
+        onChange={(e) => updateVariable(idx, { name: e.target.value })}
+        placeholder="name"
+        className="h-7 w-24 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+      />
+      <Select value={v.type} onValueChange={(val) => updateVariable(idx, { type: val as "text" | "enum" })}>
+        <SelectTrigger className="h-7 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="text">text</SelectItem>
+          <SelectItem value="enum">enum</SelectItem>
+        </SelectContent>
+      </Select>
+      {v.type === "text" && (
+        <input
+          value={v.defaultValue ?? ""}
+          onChange={(e) => updateVariable(idx, { defaultValue: e.target.value })}
+          placeholder="default"
+          className="h-7 flex-1 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+        />
+      )}
+      {v.type === "enum" && (
+        <EnumOptionsInput
+          value={v.options ?? []}
+          onChange={(opts) => updateVariable(idx, { options: opts })}
+        />
+      )}
+      <button
+        type="button"
+        onClick={() => removeVariable(idx)}
+        className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:text-[oklch(0.72_0.18_25)]"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
+function EnumOptionsInput({ value, onChange }: { value: string[]; onChange: (opts: string[]) => void }) {
+  const [draft, setDraft] = useState(value.join(", "));
+  return (
+    <input
+      value={draft}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={() => onChange(draft.split(",").map((o) => o.trim()).filter(Boolean))}
+      placeholder="opt1, opt2, opt3"
+      className="h-7 flex-1 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
+    />
+  );
+}
+
+function CodeEditor({
+  value,
+  onChange,
+  placeholder,
+  minRows = 6,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  minRows?: number;
+}) {
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const gutterRef = useRef<HTMLDivElement>(null);
+  const lines = value.split("\n");
+  const lineCount = Math.max(lines.length, minRows);
+  const lineH = 1.625;
+
+  const syncScroll = () => {
+    if (textareaRef.current && gutterRef.current)
+      gutterRef.current.scrollTop = textareaRef.current.scrollTop;
+  };
+
+  return (
+    <div className="flex overflow-hidden rounded-md border border-border bg-[var(--color-surface)] font-mono text-sm">
+      <div
+        ref={gutterRef}
+        aria-hidden
+        className="select-none overflow-hidden border-r border-border bg-[var(--color-surface-2)] px-2 py-2 text-right text-xs text-muted-foreground/50"
+        style={{ minWidth: `${String(lineCount).length * 0.55 + 1.5}rem`, lineHeight: `${lineH}rem` }}
+      >
+        {Array.from({ length: lineCount }, (_, i) => (
+          <div key={i} style={{ height: `${lineH}rem` }}>{i + 1}</div>
+        ))}
+      </div>
+      <textarea
+        ref={textareaRef}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        onScroll={syncScroll}
+        placeholder={placeholder}
+        spellCheck={false}
+        className="flex-1 resize-none bg-transparent px-3 py-2 text-foreground placeholder:text-muted-foreground/50 focus:outline-none"
+        style={{ minHeight: `${lineCount * lineH + 1}rem`, lineHeight: `${lineH}rem` }}
+      />
     </div>
   );
 }
@@ -3378,41 +4580,164 @@ function SnippetModal({
   onSubmit: (s: Snippet) => void;
 }) {
   const [name, setName] = useState(snippet?.name ?? "");
+  const [kind, setKind] = useState<SnippetKind>(snippet?.kind ?? "command");
+  const [body, setBody] = useState(snippet?.body ?? "");
   const [command, setCommand] = useState(snippet?.command ?? "");
-  const valid = name.trim() && command.trim();
+  const [script, setScript] = useState(snippet?.script ?? "");
+  const [variables, setVariables] = useState<SnippetVariable[]>(
+    () => (snippet?.variables ?? []).map((v) => ({ ...v, _id: v._id ?? `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}` }))
+  );
+
+  const varSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+  );
+
+  const valid = name.trim() && (
+    (kind === "text" && body.trim()) ||
+    (kind === "command" && command.trim()) ||
+    (kind === "script" && script.trim())
+  );
+
+  const addVariable = () => {
+    setVariables([...variables, { _id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, name: "", type: "text", defaultValue: "", options: [] }]);
+  };
+
+  const updateVariable = (idx: number, patch: Partial<SnippetVariable>) => {
+    setVariables((curr) => curr.map((v, i) => i === idx ? { ...v, ...patch } : v));
+  };
+
+  const removeVariable = (idx: number) => {
+    setVariables((curr) => curr.filter((_, i) => i !== idx));
+  };
 
   return (
-    <ModalShell title={snippet ? "Edit snippet" : "New snippet"} onClose={onClose}>
-      <Field label="Name">
-        <input
-          autoFocus
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. Disk Size"
-          className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-        />
-      </Field>
-      <Field label="Command">
-        <textarea
-          value={command}
-          onChange={(e) => setCommand(e.target.value)}
-          placeholder="df -h /"
-          rows={4}
-          className="w-full resize-none rounded-md border border-border bg-[var(--color-surface)] px-3 py-2 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-        />
-      </Field>
-      <ModalActions
-        onClose={onClose}
-        onConfirm={() => valid && onSubmit({
-          id: snippet?.id ?? `s-${Date.now()}`,
-          name: name.trim(),
-          command: command.trim(),
-          createdAt: snippet?.createdAt ?? new Date().toISOString(),
-        })}
-        confirmDisabled={!valid}
-        confirmLabel={snippet ? "Save" : "Create snippet"}
-      />
-    </ModalShell>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={onClose}>
+      <div
+        className="flex w-[880px] max-w-[95vw] max-h-[75vh] flex-col overflow-hidden rounded-xl border border-border bg-popover shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex shrink-0 items-center justify-between border-b border-border px-5 py-3">
+          <h3 className="text-sm font-semibold text-foreground">{snippet ? "Edit snippet" : "New snippet"}</h3>
+          <button onClick={onClose} className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
+          <Field label="Name">
+            <input
+              autoFocus
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Disk Size"
+              className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-3 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+            />
+          </Field>
+          <Field label="Type">
+            <div className="flex gap-2">
+              {(["text", "command", "script"] as const).map((k) => (
+                <button
+                  key={k}
+                  type="button"
+                  onClick={() => setKind(k)}
+                  className={[
+                    "flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition",
+                    kind === k
+                      ? "border-[var(--color-brand-orange)]/60 bg-[var(--color-brand-orange)]/10 text-foreground"
+                      : "border-border text-muted-foreground hover:text-foreground hover:bg-[var(--color-surface-2)]",
+                  ].join(" ")}
+                >
+                  {SNIPPET_KIND_META[k].label}
+                </button>
+              ))}
+            </div>
+          </Field>
+          {kind === "text" && (
+            <Field label="Body">
+              <input
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                placeholder="e.g. Hello {{name}}…"
+                className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-3 font-mono text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
+              />
+            </Field>
+          )}
+          {kind === "command" && (
+            <Field label="Command">
+              <CodeEditor value={command} onChange={setCommand} placeholder="e.g. ssh {{user}}@{{host}}" minRows={6} />
+            </Field>
+          )}
+          {kind === "script" && (
+            <Field label="Script">
+              <CodeEditor value={script} onChange={setScript} placeholder="#!/bin/bash" minRows={10} />
+            </Field>
+          )}
+          {/* Variables section */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <label className="text-xs font-medium text-muted-foreground">Variables</label>
+                <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground/70">{"{{var_name}}"}</span>
+              </div>
+              <button
+                type="button"
+                onClick={addVariable}
+                className="flex items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+              >
+                <Plus className="h-3 w-3" /> Add
+              </button>
+            </div>
+            {variables.length > 0 && (
+              <DndContext
+                sensors={varSensors}
+                collisionDetection={closestCenter}
+                modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+                onDragEnd={(e) => {
+                  const { active, over } = e;
+                  if (!over || active.id === over.id) return;
+                  const from = variables.findIndex((v) => v._id === active.id);
+                  const to = variables.findIndex((v) => v._id === over.id);
+                  if (from !== -1 && to !== -1) setVariables((curr) => arrayMove(curr, from, to));
+                }}
+              >
+                <SortableContext items={variables.map((v) => v._id!)} strategy={verticalListSortingStrategy}>
+                  {variables.map((v, idx) => (
+                    <SortableVariableRow
+                      key={v._id}
+                      id={v._id!}
+                      v={v}
+                      idx={idx}
+                      updateVariable={updateVariable}
+                      removeVariable={removeVariable}
+                    />
+                  ))}
+                </SortableContext>
+              </DndContext>
+            )}
+          </div>
+        </div>
+        <div className="flex shrink-0 items-center justify-end gap-2 border-t border-border px-5 py-3">
+          <button onClick={onClose} className="h-8 rounded-md px-3 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground">
+            Cancel
+          </button>
+          <button
+            onClick={() => valid && onSubmit({
+              id: snippet?.id ?? `s-${Date.now()}`,
+              kind,
+              name: name.trim(),
+              body: kind === "text" ? body.trim() : undefined,
+              command: kind === "command" ? command.trim() : undefined,
+              script: kind === "script" ? script.trim() : undefined,
+              variables: variables.filter((v) => v.name.trim()),
+              createdAt: snippet?.createdAt ?? new Date().toISOString(),
+            })}
+            disabled={!valid}
+            className="h-8 rounded-md bg-[var(--color-brand-orange)] px-3 text-xs font-semibold text-[var(--color-primary-foreground)] disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"
+          >
+            {snippet ? "Save" : "Create snippet"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -3444,6 +4769,49 @@ function RemoveSnippetModal({
         <div className="px-5 py-6">
           <p className="text-sm text-foreground">
             Are you sure you want to remove {count} snippet{count > 1 ? "s" : ""}?
+          </p>
+          <div className="mt-6 flex items-center justify-end">
+            <button
+              onClick={onConfirm}
+              className="cursor-pointer rounded-md bg-[oklch(0.68_0.17_25)] px-5 py-1.5 text-sm font-semibold text-white transition hover:opacity-90"
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RemoveHostModal({
+  hostName, onClose, onConfirm,
+}: {
+  hostName: string;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="w-[480px] max-w-[92vw] overflow-hidden rounded-lg border border-border bg-[var(--color-surface)] shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-border bg-[var(--color-sidebar)] px-5 py-3">
+          <h3 className="text-sm font-semibold text-foreground">Remove host</h3>
+          <button
+            onClick={onClose}
+            className="flex h-6 w-6 cursor-pointer items-center justify-center rounded text-muted-foreground transition hover:bg-[var(--color-surface-2)] hover:text-foreground"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        <div className="px-5 py-6">
+          <p className="text-sm text-foreground">
+            Are you sure you want to remove <span className="font-semibold">{hostName}</span>?
           </p>
           <div className="mt-6 flex items-center justify-end">
             <button
