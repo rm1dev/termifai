@@ -76,6 +76,13 @@ import {
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Area,
   AreaChart,
   CartesianGrid,
@@ -2449,16 +2456,17 @@ function GroupModal({
         />
       </Field>
       <Field label="Parent group">
-        <select
-          value={parentId ?? ""}
-          onChange={(e) => setParentId(e.target.value || null)}
-          className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-        >
-          <option value="">— (root)</option>
-          {groups.filter((g) => !invalidParentIds.includes(g.id)).map((g) => (
-            <option key={g.id} value={g.id}>{groupPath(groups, g.id)}</option>
-          ))}
-        </select>
+        <Select value={parentId ?? "__none__"} onValueChange={(val) => setParentId(val === "__none__" ? null : val)}>
+          <SelectTrigger className="h-9 w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none__">— (root)</SelectItem>
+            {groups.filter((g) => !invalidParentIds.includes(g.id)).map((g) => (
+              <SelectItem key={g.id} value={g.id}>{groupPath(groups, g.id)}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </Field>
       <ModalActions
         onClose={onClose}
@@ -2648,23 +2656,24 @@ function HostModal({
                 value={port}
                 onChange={(e) => setPort(Number(e.target.value) || 22)}
                 dir="ltr"
-                className="h-8 w-16 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+                className="h-8 w-24 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
               />
             </HostModalRow>
             <HostModalRow label="OS">
-              <select
-                value={os}
-                onChange={(e) => setOs(e.target.value as import("./types").OsKind)}
-                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                <option value="ubuntu">Ubuntu</option>
-                <option value="debian">Debian</option>
-                <option value="centos">CentOS</option>
-                <option value="alpine">Alpine</option>
-                <option value="macos">macOS</option>
-                <option value="windows">Windows</option>
-                <option value="other">Other</option>
-              </select>
+              <Select value={os} onValueChange={(val) => setOs(val as import("./types").OsKind)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ubuntu">Ubuntu</SelectItem>
+                  <SelectItem value="debian">Debian</SelectItem>
+                  <SelectItem value="centos">CentOS</SelectItem>
+                  <SelectItem value="alpine">Alpine</SelectItem>
+                  <SelectItem value="macos">macOS</SelectItem>
+                  <SelectItem value="windows">Windows</SelectItem>
+                  <SelectItem value="other">Other</SelectItem>
+                </SelectContent>
+              </Select>
             </HostModalRow>
           </div>
           <div className="px-4 pb-2 pt-1.5">
@@ -2695,18 +2704,17 @@ function HostModal({
               </div>
             </HostModalRow>
             <HostModalRow label="SSH Key">
-              <select
-                value={sshKeyId ?? ""}
-                onChange={(e) => setSshKeyId(e.target.value || null)}
-                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                <option value="">No key</option>
-                {sshKeys.map((key) => (
-                  <option key={key.id} value={key.id}>
-                    {key.name}
-                  </option>
-                ))}
-              </select>
+              <Select value={sshKeyId ?? "__none__"} onValueChange={(val) => setSshKeyId(val === "__none__" ? null : val)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">No key</SelectItem>
+                  {sshKeys.map((key) => (
+                    <SelectItem key={key.id} value={key.id}>{key.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </HostModalRow>
           </div>
 
@@ -2714,18 +2722,17 @@ function HostModal({
           <HostModalSectionTitle icon={<Tag className="h-4 w-4" />} title="Categorization" />
           <div className="border-t border-border">
             <HostModalRow label="Group">
-              <select
-                value={groupId ?? ""}
-                onChange={(e) => setGroupId(e.target.value || null)}
-                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                <option value="">Root</option>
-                {groups.map((group) => (
-                  <option key={group.id} value={group.id}>
-                    {groupPath(groups, group.id)}
-                  </option>
-                ))}
-              </select>
+              <Select value={groupId ?? "__none__"} onValueChange={(val) => setGroupId(val === "__none__" ? null : val)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">Root</SelectItem>
+                  {groups.map((group) => (
+                    <SelectItem key={group.id} value={group.id}>{groupPath(groups, group.id)}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </HostModalRow>
             <HostModalRow label="Tags">
               <div className="flex w-64 flex-col items-end gap-2">
@@ -3267,26 +3274,28 @@ function PortForwardModal({
               <HostModalInput autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. My Database" />
             </HostModalRow>
             <HostModalRow label="Host">
-              <select
-                value={hostId}
-                onChange={(e) => setHostId(e.target.value)}
-                className="h-8 w-48 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                {hosts.map((h) => (
-                  <option key={h.id} value={h.id}>{h.name || h.hostname}</option>
-                ))}
-              </select>
+              <Select value={hostId} onValueChange={setHostId}>
+                <SelectTrigger className="h-8 w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {hosts.map((h) => (
+                    <SelectItem key={h.id} value={h.id}>{h.name || h.hostname}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </HostModalRow>
             <HostModalRow label="Direction">
-              <select
-                value={direction}
-                onChange={(e) => setDirection(e.target.value as import("./types").TunnelDirection)}
-                className="h-8 w-48 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                <option value="local">Local (-L)</option>
-                <option value="remote">Remote (-R)</option>
-                <option value="dynamic">Dynamic SOCKS (-D)</option>
-              </select>
+              <Select value={direction} onValueChange={(val) => setDirection(val as import("./types").TunnelDirection)}>
+                <SelectTrigger className="h-8 w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="local">Local (-L)</SelectItem>
+                  <SelectItem value="remote">Remote (-R)</SelectItem>
+                  <SelectItem value="dynamic">Dynamic SOCKS (-D)</SelectItem>
+                </SelectContent>
+              </Select>
             </HostModalRow>
             <HostModalRow label="Local Host">
               <HostModalInput value={localHost} onChange={(e) => setLocalHost(e.target.value)} placeholder="127.0.0.1" />
@@ -4464,14 +4473,15 @@ function SortableVariableRow({
         placeholder="name"
         className="h-7 w-24 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
       />
-      <select
-        value={v.type}
-        onChange={(e) => updateVariable(idx, { type: e.target.value as "text" | "enum" })}
-        className="h-7 rounded border border-border bg-[var(--color-surface)] px-2 text-xs text-foreground focus:outline-none"
-      >
-        <option value="text">text</option>
-        <option value="enum">enum</option>
-      </select>
+      <Select value={v.type} onValueChange={(val) => updateVariable(idx, { type: val as "text" | "enum" })}>
+        <SelectTrigger className="h-7 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="text">text</SelectItem>
+          <SelectItem value="enum">enum</SelectItem>
+        </SelectContent>
+      </Select>
       {v.type === "text" && (
         <input
           value={v.defaultValue ?? ""}
