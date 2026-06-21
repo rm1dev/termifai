@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, forwardRef } from "react";
+import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
@@ -2599,7 +2600,10 @@ function HostModal({
   };
   const testConnection = async () => {
     if (!hostname.trim() || !user.trim()) return;
-    setTesting(true);
+    // flushSync forces React to paint the "Testing..." / disabled state before
+    // the async invoke starts — without this, React may batch the state update
+    // with the invoke call and the button never visually changes on macOS/Linux.
+    flushSync(() => setTesting(true));
 
     try {
       const result = await invoke<{ ok: boolean; message: string }>("test_host_connection", {
@@ -2796,7 +2800,7 @@ function HostModal({
           <button
             disabled={!hostname.trim() || !user.trim() || testing}
             onClick={() => void testConnection()}
-            className="rounded-md border border-border bg-[var(--color-surface)] px-4 py-1.5 text-sm font-medium text-foreground transition disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:bg-[var(--color-surface-2)]"
+            className="w-[9.5rem] rounded-md border border-border bg-[var(--color-surface)] px-4 py-1.5 text-center text-sm font-medium text-foreground disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:bg-[var(--color-surface-2)]"
           >
             {testing ? "Testing..." : "Test Connection"}
           </button>
