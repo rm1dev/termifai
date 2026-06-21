@@ -298,6 +298,10 @@ impl ConnectionTracker {
             || lower.contains("network is unreachable")
         {
             self.fail("connecting", "SSH connection timed out.");
+        } else if lower.contains("are you sure you want to continue connecting") {
+            // Host key not yet in known_hosts — accept-new flag should handle this automatically,
+            // but if it doesn't (older SSH), surface it as a handshake failure
+            self.fail("handshaking", "Host key not verified. Check SSH client version.");
         } else if lower.contains("host key verification failed")
             || lower.contains("no matching host key type")
             || lower.contains("no matching key exchange method")

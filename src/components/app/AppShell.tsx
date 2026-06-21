@@ -165,7 +165,7 @@ export function AppShell() {
     const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
     const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
     const remoteBootstrap = `printf '${readyMarker}\\n'; ${cdPart}exec ` + "${SHELL:-/bin/sh}" + " -i";
-    const command = `ssh -v -tt${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
