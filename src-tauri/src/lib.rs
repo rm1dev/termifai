@@ -177,11 +177,13 @@ fn remove_host_group(app: tauri::AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn test_host_connection(
+async fn test_host_connection(
     app: tauri::AppHandle,
     request: TestHostConnectionRequest,
 ) -> Result<TestHostConnectionResult, String> {
-    hosts::test_host_connection(&app, request)
+    tauri::async_runtime::spawn_blocking(move || hosts::test_host_connection(&app, request))
+        .await
+        .map_err(|e| format!("Task error: {}", e))?
 }
 
 #[tauri::command]
