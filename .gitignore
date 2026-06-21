@@ -10,6 +10,7 @@ src-tauri/target/
 .idea/
 .kiro/
 .amazonq/
+.claude/
 AGENTS.md
 
 # OS

@@ -1,5 +1,8 @@
 import { useState, useRef, useEffect, forwardRef } from "react";
+import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { platform } from "@/lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import {
   Server,
@@ -16,7 +19,6 @@ import {
   Plus,
   ChevronDown,
   TerminalSquare,
-  Bell,
   Search,
   Tag,
   LayoutGrid,
@@ -48,7 +50,18 @@ import {
   
   Gauge,
   GripVertical,
+  Minus,
+  Square,
+  Menu,
+  Maximize2,
 } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -63,6 +76,13 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Area,
   AreaChart,
@@ -110,12 +130,12 @@ import { toast } from "sonner";
 
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
-  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
+  // { key: "dashboard", label: "Dashboard", icon: LayoutDashboard }, // temporarily hidden
   { key: "hosts", label: "Hosts", icon: Server },
   { key: "port-forwarding", label: "Port Forwarding", icon: Network },
   { key: "snippets", label: "Snippets", icon: Braces },
   { key: "ssh-keys", label: "SSH Keys", icon: KeyRound },
-  { key: "logs", label: "Logs", icon: ClipboardList },
+  // { key: "logs", label: "Logs", icon: ClipboardList },
 ];
 
 export function AppShell() {
@@ -152,7 +172,7 @@ export function AppShell() {
     const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
     const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
     const remoteBootstrap = `printf '${readyMarker}\\n'; ${cdPart}exec ` + "${SHELL:-/bin/sh}" + " -i";
-    const command = `ssh -v -tt${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+    const command = `ssh -v -tt -o StrictHostKeyChecking=no${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
@@ -319,6 +339,7 @@ export function AppShell() {
         onNew={newTab}
         onRename={renameTab}
         onReorder={reorderTab}
+        platform={platform}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -387,6 +408,7 @@ function TitleBar({
   onNew,
   onRename,
   onReorder,
+  platform,
 }: {
   tabs: AppTab[];
   activeTab: string;
@@ -395,6 +417,7 @@ function TitleBar({
   onNew: (kind: TabKind) => void;
   onRename: (id: string, title: string) => void;
   onReorder: (fromId: string, toId: string) => void;
+  platform: string;
 }) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -410,9 +433,10 @@ function TitleBar({
   const closableTabs = tabs.filter((t) => t.closable);
 
   return (
-    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] pr-3 select-none" data-tauri-drag-region>
+    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none" data-tauri-drag-region>
       {/* Space for native macOS traffic lights */}
-      <div className="w-[80px] h-full shrink-0 flex items-center" />
+      {platform === "macos" && <div className="w-[80px] h-full shrink-0 flex items-center" />}
+      {platform !== "macos" && <div className="w-3 h-full shrink-0" />}
 
       <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" data-tauri-drag-region>
         {/* Pinned tabs (Hosts) — outside DnD, immovable */}
@@ -459,8 +483,82 @@ function TitleBar({
         </div>
       </div>
 
-      <button className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground self-center" aria-label="Notifications">
-        <Bell className="h-4 w-4" />
+      {/* Linux/Windows: hamburger app menu + window controls */}
+      {platform !== "macos" && (
+        <>
+          <AppHamburgerMenu onNew={onNew} />
+          <WindowControls />
+        </>
+      )}
+    </div>
+  );
+}
+
+function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
+  const win = getCurrentWindow();
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    win.isFullscreen().then(setIsFullscreen).catch(() => {});
+    win.onResized(() => {
+      win.isFullscreen().then(setIsFullscreen).catch(() => {});
+    }).then((fn) => { unlisten = fn; }).catch(() => {});
+    return () => { unlisten?.(); };
+  }, []);
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground self-center mr-1"
+          aria-label="App menu"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuItem onSelect={() => onNew("terminal")}>
+          New Terminal
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+T</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void invoke("open_settings_window")}>
+          Settings
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => void win.setFullscreen(!isFullscreen)}>
+          {isFullscreen ? "Exit Full Screen" : "Full Screen"}
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function WindowControls() {
+  const win = getCurrentWindow();
+  return (
+    <div className="flex items-center h-full shrink-0">
+      <button
+        onClick={() => void win.minimize()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground transition-colors"
+        aria-label="Minimize"
+      >
+        <Minus className="h-3.5 w-3.5" />
+      </button>
+      <button
+        onClick={() => void win.toggleMaximize()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground transition-colors"
+        aria-label="Maximize"
+      >
+        <Square className="h-3 w-3" />
+      </button>
+      <button
+        onClick={() => void win.close()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-red-500 hover:text-white transition-colors"
+        aria-label="Close"
+      >
+        <X className="h-3.5 w-3.5" />
       </button>
     </div>
   );
@@ -1917,7 +2015,7 @@ function HostsView({
               { label: "New group", icon: <FolderPlus className="h-3.5 w-3.5" />, onClick: () => setGroupModal({ open: true, parentId: null }) },
             ]}
           />
-          <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={onNewSftp} />
+          {/* <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={onNewSftp} /> */}{/* temporarily hidden */}
           <ToolbarButton icon={<TerminalSquare className="h-4 w-4" />} label="Terminal" onClick={onNewTerminal} />
         </div>
         <div className="flex items-center gap-1">
@@ -2359,16 +2457,17 @@ function GroupModal({
         />
       </Field>
       <Field label="Parent group">
-        <select
-          value={parentId ?? ""}
-          onChange={(e) => setParentId(e.target.value || null)}
-          className="h-9 w-full rounded-md border border-border bg-[var(--color-surface)] px-2 text-sm text-foreground focus:outline-none focus:ring-2 focus:ring-ring/40"
-        >
-          <option value="">— (root)</option>
-          {groups.filter((g) => !invalidParentIds.includes(g.id)).map((g) => (
-            <option key={g.id} value={g.id}>{groupPath(groups, g.id)}</option>
-          ))}
-        </select>
+        <Select value={parentId ?? "__none__"} onValueChange={(val) => setParentId(val === "__none__" ? null : val)}>
+          <SelectTrigger className="h-9 w-full">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="__none__">— (root)</SelectItem>
+            {groups.filter((g) => !invalidParentIds.includes(g.id)).map((g) => (
+              <SelectItem key={g.id} value={g.id}>{groupPath(groups, g.id)}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </Field>
       <ModalActions
         onClose={onClose}
@@ -2501,7 +2600,10 @@ function HostModal({
   };
   const testConnection = async () => {
     if (!hostname.trim() || !user.trim()) return;
-    setTesting(true);
+    // flushSync forces React to paint the "Testing..." / disabled state before
+    // the async invoke starts — without this, React may batch the state update
+    // with the invoke call and the button never visually changes on macOS/Linux.
+    flushSync(() => setTesting(true));
 
     try {
       const result = await invoke<{ ok: boolean; message: string }>("test_host_connection", {
@@ -2558,23 +2660,24 @@ function HostModal({
                 value={port}
                 onChange={(e) => setPort(Number(e.target.value) || 22)}
                 dir="ltr"
-                className="h-8 w-16 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
+                className="h-8 w-24 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 text-left text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
               />
             </HostModalRow>
             <HostModalRow label="OS">
-              <select
-                value={os}
-                onChange={(e) => setOs(e.target.value as import("./types").OsKind)}
-                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                <option value="ubuntu">Ubuntu</option>
-                <option value="debian">Debian</option>
-                <option value="centos">CentOS</option>
-                <option value="alpine">Alpine</option>
-                <option value="macos">macOS</option>
-                <option value="windows">Windows</option>
-                <option value="other">Other</option>
-              </select>
+              <Select value={os} onValueChange={(val) => setOs(val as import("./types").OsKind)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ubuntu">Ubuntu</SelectItem>
+                  <SelectItem value="debian">Debian</SelectItem>
+                  <SelectItem value="centos">CentOS</SelectItem>
+                  <SelectItem value="alpine">Alpine</SelectItem>
+                  <SelectItem value="macos">macOS</SelectItem>
+                  <SelectItem value="windows">Windows</SelectItem>
+                  <SelectItem value="other">Other</SelectItem>
+                </SelectContent>
+              </Select>
             </HostModalRow>
           </div>
           <div className="px-4 pb-2 pt-1.5">
@@ -2605,18 +2708,17 @@ function HostModal({
               </div>
             </HostModalRow>
             <HostModalRow label="SSH Key">
-              <select
-                value={sshKeyId ?? ""}
-                onChange={(e) => setSshKeyId(e.target.value || null)}
-                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                <option value="">No key</option>
-                {sshKeys.map((key) => (
-                  <option key={key.id} value={key.id}>
-                    {key.name}
-                  </option>
-                ))}
-              </select>
+              <Select value={sshKeyId ?? "__none__"} onValueChange={(val) => setSshKeyId(val === "__none__" ? null : val)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">No key</SelectItem>
+                  {sshKeys.map((key) => (
+                    <SelectItem key={key.id} value={key.id}>{key.name}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </HostModalRow>
           </div>
 
@@ -2624,18 +2726,17 @@ function HostModal({
           <HostModalSectionTitle icon={<Tag className="h-4 w-4" />} title="Categorization" />
           <div className="border-t border-border">
             <HostModalRow label="Group">
-              <select
-                value={groupId ?? ""}
-                onChange={(e) => setGroupId(e.target.value || null)}
-                className="h-8 w-40 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                <option value="">Root</option>
-                {groups.map((group) => (
-                  <option key={group.id} value={group.id}>
-                    {groupPath(groups, group.id)}
-                  </option>
-                ))}
-              </select>
+              <Select value={groupId ?? "__none__"} onValueChange={(val) => setGroupId(val === "__none__" ? null : val)}>
+                <SelectTrigger className="h-8 w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__none__">Root</SelectItem>
+                  {groups.map((group) => (
+                    <SelectItem key={group.id} value={group.id}>{groupPath(groups, group.id)}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </HostModalRow>
             <HostModalRow label="Tags">
               <div className="flex w-64 flex-col items-end gap-2">
@@ -2699,7 +2800,7 @@ function HostModal({
           <button
             disabled={!hostname.trim() || !user.trim() || testing}
             onClick={() => void testConnection()}
-            className="rounded-md border border-border bg-[var(--color-surface)] px-4 py-1.5 text-sm font-medium text-foreground transition disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:bg-[var(--color-surface-2)]"
+            className="w-[9.5rem] rounded-md border border-border bg-[var(--color-surface)] px-4 py-1.5 text-center text-sm font-medium text-foreground disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:bg-[var(--color-surface-2)]"
           >
             {testing ? "Testing..." : "Test Connection"}
           </button>
@@ -3177,26 +3278,28 @@ function PortForwardModal({
               <HostModalInput autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. My Database" />
             </HostModalRow>
             <HostModalRow label="Host">
-              <select
-                value={hostId}
-                onChange={(e) => setHostId(e.target.value)}
-                className="h-8 w-48 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                {hosts.map((h) => (
-                  <option key={h.id} value={h.id}>{h.name || h.hostname}</option>
-                ))}
-              </select>
+              <Select value={hostId} onValueChange={setHostId}>
+                <SelectTrigger className="h-8 w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {hosts.map((h) => (
+                    <SelectItem key={h.id} value={h.id}>{h.name || h.hostname}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </HostModalRow>
             <HostModalRow label="Direction">
-              <select
-                value={direction}
-                onChange={(e) => setDirection(e.target.value as import("./types").TunnelDirection)}
-                className="h-8 w-48 rounded-md border border-border bg-[var(--color-surface-2)] px-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-[var(--color-brand-orange)]/40"
-              >
-                <option value="local">Local (-L)</option>
-                <option value="remote">Remote (-R)</option>
-                <option value="dynamic">Dynamic SOCKS (-D)</option>
-              </select>
+              <Select value={direction} onValueChange={(val) => setDirection(val as import("./types").TunnelDirection)}>
+                <SelectTrigger className="h-8 w-48">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="local">Local (-L)</SelectItem>
+                  <SelectItem value="remote">Remote (-R)</SelectItem>
+                  <SelectItem value="dynamic">Dynamic SOCKS (-D)</SelectItem>
+                </SelectContent>
+              </Select>
             </HostModalRow>
             <HostModalRow label="Local Host">
               <HostModalInput value={localHost} onChange={(e) => setLocalHost(e.target.value)} placeholder="127.0.0.1" />
@@ -4374,14 +4477,15 @@ function SortableVariableRow({
         placeholder="name"
         className="h-7 w-24 rounded border border-border bg-transparent px-2 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none"
       />
-      <select
-        value={v.type}
-        onChange={(e) => updateVariable(idx, { type: e.target.value as "text" | "enum" })}
-        className="h-7 rounded border border-border bg-[var(--color-surface)] px-2 text-xs text-foreground focus:outline-none"
-      >
-        <option value="text">text</option>
-        <option value="enum">enum</option>
-      </select>
+      <Select value={v.type} onValueChange={(val) => updateVariable(idx, { type: val as "text" | "enum" })}>
+        <SelectTrigger className="h-7 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="text">text</SelectItem>
+          <SelectItem value="enum">enum</SelectItem>
+        </SelectContent>
+      </Select>
       {v.type === "text" && (
         <input
           value={v.defaultValue ?? ""}

@@ -303,60 +303,76 @@ fn run_ssh_test(
         .take_writer()
         .map_err(|e| format!("Failed to write SSH test input: {}", e))?;
     let mut killer = child.clone_killer();
-    let timeout = Duration::from_secs(timeout_secs + 3);
+    let timeout = Duration::from_secs(timeout_secs);
+
+    // Run the blocking read loop in a dedicated thread and communicate via channel.
+    // This lets us enforce a hard timeout without blocking on reader.read() forever,
+    // which on Linux can hang indefinitely even after the child process is killed.
+    let (tx, rx) = std::sync::mpsc::channel::<Result<TestHostConnectionResult, String>>();
 
     thread::spawn(move || {
-        thread::sleep(timeout);
-        let _ = killer.kill();
+        let mut output = String::new();
+        let mut password_sent = false;
+        let mut buffer = [0_u8; 512];
+
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buffer[..n]);
+                    output.push_str(&chunk);
+                    let lower = output.to_lowercase();
+
+                    if lower.contains("termifai-ssh-ok") {
+                        let _ = child.kill();
+                        let _ = tx.send(Ok(TestHostConnectionResult {
+                            ok: true,
+                            message: "SSH authentication succeeded".to_string(),
+                        }));
+                        return;
+                    }
+
+                    if !password_sent && lower.contains("password:") {
+                        if password.is_empty() {
+                            let _ = child.kill();
+                            let _ = tx.send(Ok(TestHostConnectionResult {
+                                ok: false,
+                                message: "SSH password is required for this host".to_string(),
+                            }));
+                            return;
+                        }
+                        if writer.write_all(format!("{}\r", password).as_bytes()).is_err() {
+                            break;
+                        }
+                        password_sent = true;
+                    }
+                }
+                Err(_) => break,
+            }
+
+            if let Ok(Some(_)) = child.try_wait() {
+                break;
+            }
+        }
+
+        let _ = child.wait();
+        let _ = tx.send(Ok(TestHostConnectionResult {
+            ok: false,
+            message: ssh_failure_message(&output),
+        }));
     });
 
-    let mut output = String::new();
-    let mut password_sent = false;
-    let mut buffer = [0_u8; 512];
-
-    loop {
-        match reader.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => {
-                let chunk = String::from_utf8_lossy(&buffer[..n]);
-                output.push_str(&chunk);
-                let lower = output.to_lowercase();
-
-                if lower.contains("termifai-ssh-ok") {
-                    let _ = child.kill();
-                    return Ok(TestHostConnectionResult {
-                        ok: true,
-                        message: "SSH authentication succeeded".to_string(),
-                    });
-                }
-
-                if !password_sent && lower.contains("password:") {
-                    if password.is_empty() {
-                        let _ = child.kill();
-                        return Ok(TestHostConnectionResult {
-                            ok: false,
-                            message: "SSH password is required for this host".to_string(),
-                        });
-                    }
-                    writer
-                        .write_all(format!("{}\r", password).as_bytes())
-                        .map_err(|e| format!("Failed to send SSH password: {}", e))?;
-                    password_sent = true;
-                }
-            }
-            Err(_) => break,
-        }
-
-        if let Ok(Some(_)) = child.try_wait() {
-            break;
+    // Wait for the result with a hard timeout; kill the child if it expires
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = killer.kill();
+            Ok(TestHostConnectionResult {
+                ok: false,
+                message: "SSH connection test timed out".to_string(),
+            })
         }
     }
-
-    let _ = child.wait();
-    Ok(TestHostConnectionResult {
-        ok: false,
-        message: ssh_failure_message(&output),
-    })
 }
 
 fn ssh_failure_message(output: &str) -> String {
