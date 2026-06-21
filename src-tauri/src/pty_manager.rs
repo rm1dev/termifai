@@ -60,22 +60,20 @@ impl PtyManager {
             .openpty(size)
             .map_err(|e| format!("Failed to open PTY: {}", e))?;
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-        let mut cmd = CommandBuilder::new(&shell);
+        let mut cmd = build_shell_command(initial_command);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
-        if let Some(initial_command) = initial_command.filter(|command| !command.trim().is_empty())
-        {
-            cmd.arg("-lc");
-            cmd.arg(initial_command);
-        } else {
-            cmd.arg("-l");
-        }
 
-        if !cwd.is_empty() {
-            cmd.cwd(cwd);
-        } else if let Ok(home) = std::env::var("HOME") {
-            cmd.cwd(home);
+
+        let cwd_path = if !cwd.is_empty() {
+            Some(cwd.to_string())
+        } else {
+            std::env::var("HOME")
+                .ok()
+                .or_else(|| std::env::var("USERPROFILE").ok())
+        };
+        if let Some(path) = cwd_path {
+            cmd.cwd(path);
         }
 
         pair.slave
@@ -245,6 +243,124 @@ impl PtyManager {
         self.sessions.lock().unwrap().remove(session_id);
         Ok(())
     }
+}
+
+fn build_shell_command(initial_command: Option<&str>) -> CommandBuilder {
+    #[cfg(target_os = "windows")]
+    {
+        // SSH command: parse the POSIX-quoted command line and invoke the executable
+        // directly — bypasses PowerShell so Unix-style quoting is preserved intact.
+        if let Some(command) = initial_command.filter(|c| !c.trim().is_empty()) {
+            let args = parse_posix_command(command);
+            if !args.is_empty() {
+                let mut cmd = CommandBuilder::new(&args[0]);
+                for arg in &args[1..] {
+                    cmd.arg(arg);
+                }
+                return cmd;
+            }
+        }
+
+        // Local terminal (no initial_command): prefer PowerShell, fall back to cmd.exe
+        let pwsh = ["pwsh.exe", "powershell.exe"]
+            .iter()
+            .find(|&&name| which_exists(name))
+            .map(|s| s.to_string());
+
+        if let Some(ps) = pwsh {
+            CommandBuilder::new(&ps)
+        } else {
+            CommandBuilder::new(
+                std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
+            )
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut cmd = CommandBuilder::new(&shell);
+        if let Some(command) = initial_command.filter(|c| !c.trim().is_empty()) {
+            cmd.arg("-lc");
+            cmd.arg(command);
+        } else {
+            cmd.arg("-l");
+        }
+        cmd
+    }
+}
+
+/// Parse a POSIX-style shell command line into individual arguments.
+/// Handles single-quoted strings, double-quoted strings, and backslash escapes —
+/// including the `'\''` pattern used by shellQuote to embed single quotes.
+#[cfg(target_os = "windows")]
+fn parse_posix_command(cmd: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_arg = false;
+    let mut chars = cmd.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => {
+                if in_arg {
+                    args.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+            }
+            '\'' => {
+                in_arg = true;
+                // Read until closing single quote (no escaping inside SQ)
+                for ch in chars.by_ref() {
+                    if ch == '\'' {
+                        break;
+                    }
+                    current.push(ch);
+                }
+            }
+            '"' => {
+                in_arg = true;
+                // Double-quoted: only \\ \" \$ \` \<newline> are special
+                loop {
+                    match chars.next() {
+                        Some('"') => break,
+                        Some('\\') => match chars.next() {
+                            Some(ch @ ('"' | '\\' | '$' | '`' | '\n')) => current.push(ch),
+                            Some(ch) => { current.push('\\'); current.push(ch); }
+                            None => break,
+                        },
+                        Some(ch) => current.push(ch),
+                        None => break,
+                    }
+                }
+            }
+            '\\' => {
+                in_arg = true;
+                if let Some(ch) = chars.next() {
+                    current.push(ch);
+                }
+            }
+            _ => {
+                in_arg = true;
+                current.push(c);
+            }
+        }
+    }
+
+    if in_arg {
+        args.push(current);
+    }
+
+    args
+}
+
+#[cfg(target_os = "windows")]
+fn which_exists(name: &str) -> bool {
+    std::process::Command::new("where")
+        .arg(name)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
 
 struct ConnectionTracker {

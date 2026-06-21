@@ -16,6 +16,7 @@ use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_window_state::StateFlags;
@@ -78,35 +79,32 @@ fn new_window(app: tauri::AppHandle) -> Result<(), String> {
     let count = WINDOW_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
     let label = format!("window-{}", count);
 
-    let mut builder =
-        WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
-            .title("Termifai")
-            .inner_size(800.0, 600.0)
-            .min_inner_size(800.0, 600.0);
+    let app_clone = app.clone();
+    app.run_on_main_thread(move || {
+        let mut builder =
+            WebviewWindowBuilder::new(&app_clone, &label, WebviewUrl::App("index.html".into()))
+                .title("Termifai")
+                .inner_size(800.0, 600.0)
+                .min_inner_size(800.0, 600.0);
 
-    #[cfg(target_os = "macos")]
-    {
-        builder = builder
-            .title_bar_style(tauri::TitleBarStyle::Overlay)
-            .hidden_title(true)
-            .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition::new(
-                12.0, 16.0,
-            )));
-    }
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder
+                .title_bar_style(tauri::TitleBarStyle::Overlay)
+                .hidden_title(true)
+                .traffic_light_position(tauri::Position::Logical(tauri::LogicalPosition::new(
+                    12.0, 16.0,
+                )));
+        }
 
-    #[cfg(target_os = "windows")]
-    {
-        builder = builder.decorations(false);
-    }
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            builder = builder.decorations(false);
+        }
 
-    #[cfg(target_os = "linux")]
-    {
-        builder = builder.decorations(false);
-    }
-
-    builder
-        .build()
-        .map_err(|e| format!("Failed to create window: {}", e))?;
+        let _ = builder.build();
+    })
+    .map_err(|e| format!("Failed to dispatch to main thread: {:?}", e))?;
 
     Ok(())
 }
@@ -299,7 +297,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_window_state::Builder::new()
-                .with_state_flags(StateFlags::all())
+                .with_state_flags(
+                    StateFlags::all() & !StateFlags::VISIBLE,
+                )
                 .build(),
         )
         .manage(AppState {
@@ -336,16 +336,48 @@ pub fn run() {
             run_snippet_script,
         ])
         .setup(|app| {
-            // On Linux, remove native window decorations so the custom frontend titlebar takes over
-            #[cfg(target_os = "linux")]
+            // On Windows: pre-allocate a hidden console so that ConPTY session creation
+            // doesn't flash a black console window each time a terminal tab is opened.
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
+                use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+                AllocConsole();
+                let hwnd = GetConsoleWindow();
+                if !hwnd.is_null() {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+            }
+
+            // On Linux and Windows, remove native decorations so the custom frontend titlebar takes over
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.set_decorations(false);
                 }
             }
 
-            // On Linux the native menubar is replaced by a frontend hamburger menu
-            #[cfg(not(target_os = "linux"))]
+            // Create the settings window hidden at startup — creating it dynamically after
+            // the event loop starts deadlocks on Windows because WebView2 initialization
+            // requires the event loop to be free.
+            WebviewWindowBuilder::new(
+                app,
+                "settings",
+                WebviewUrl::App("index.html?window=settings".into()),
+            )
+            .title("Settings")
+            .inner_size(800.0, 600.0)
+            .min_inner_size(800.0, 600.0)
+            .resizable(false)
+            .decorations(false)
+            .transparent(true)
+            .minimizable(false)
+            .maximizable(false)
+            .visible(false)
+            .build()?;
+
+            // On Linux and Windows the native menubar is replaced by a frontend hamburger menu
+            #[cfg(target_os = "macos")]
             {
                 let new_terminal = MenuItemBuilder::with_id("new-terminal", "New Terminal")
                     .accelerator("CmdOrCtrl+T")
@@ -413,28 +445,12 @@ pub fn run() {
 
 /// Shared logic for opening the settings window (used by both command and menu event).
 fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("settings") {
-        window
-            .set_focus()
-            .map_err(|e| format!("Failed to focus settings window: {}", e))?;
-        return Ok(());
-    }
+    let window = app
+        .get_webview_window("settings")
+        .ok_or_else(|| "Settings window not found".to_string())?;
 
-    WebviewWindowBuilder::new(
-        app,
-        "settings",
-        WebviewUrl::App("index.html?window=settings".into()),
-    )
-    .title("Settings")
-    .inner_size(800.0, 600.0)
-    .min_inner_size(800.0, 600.0)
-    .resizable(false)
-    .decorations(false)
-    .transparent(true)
-    .minimizable(false)
-    .maximizable(false)
-    .build()
-    .map_err(|e| format!("Failed to create settings window: {}", e))?;
+    window.show().map_err(|e| format!("Failed to show settings window: {}", e))?;
+    window.set_focus().map_err(|e| format!("Failed to focus settings window: {}", e))?;
 
     Ok(())
 }

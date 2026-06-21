@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, forwardRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { platform } from "@/lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import {
   Server,
@@ -137,7 +138,6 @@ export function AppShell() {
   ]);
   const [activeTab, setActiveTab] = useState("t-term");
   const [activeSidebar, setActiveSidebar] = useState<SidebarKey>("hosts");
-  const [platform, setPlatform] = useState<string>("macos");
   const shortcutsRef = useRef<ShortcutMap>(loadShortcuts());
   const newTabRef = useRef<(kind: TabKind) => void>(null!);
 
@@ -165,7 +165,7 @@ export function AppShell() {
     const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
     const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
     const remoteBootstrap = `printf '${readyMarker}\\n'; ${cdPart}exec ` + "${SHELL:-/bin/sh}" + " -i";
-    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+    const command = `ssh -v -tt -o StrictHostKeyChecking=no${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
@@ -318,10 +318,6 @@ export function AppShell() {
       unlistenShortcuts?.();
       unlistenMenuNewTerminal?.();
     };
-  }, []);
-
-  useEffect(() => {
-    invoke<string>("get_platform").then(setPlatform).catch(() => {});
   }, []);
 
   const tab = tabs.find((t) => t.id === activeTab);
@@ -497,6 +493,17 @@ function TitleBar({
 
 function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
   const win = getCurrentWindow();
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    win.isFullscreen().then(setIsFullscreen).catch(() => {});
+    win.onResized(() => {
+      win.isFullscreen().then(setIsFullscreen).catch(() => {});
+    }).then((fn) => { unlisten = fn; }).catch(() => {});
+    return () => { unlisten?.(); };
+  }, []);
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -517,8 +524,8 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void win.setFullscreen(true)}>
-          Full Screen
+        <DropdownMenuItem onSelect={() => void win.setFullscreen(!isFullscreen)}>
+          {isFullscreen ? "Exit Full Screen" : "Full Screen"}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
