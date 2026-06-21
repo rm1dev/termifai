@@ -18,7 +18,6 @@ import {
   Plus,
   ChevronDown,
   TerminalSquare,
-  Bell,
   Search,
   Tag,
   LayoutGrid,
@@ -475,10 +474,6 @@ function TitleBar({
           </button>
         </div>
       </div>
-
-      <button className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground self-center mx-1" aria-label="Notifications">
-        <Bell className="h-4 w-4" />
-      </button>
 
       {/* Linux/Windows: hamburger app menu + window controls */}
       {platform !== "macos" && (
