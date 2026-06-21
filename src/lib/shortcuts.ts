@@ -1,11 +1,14 @@
 import { emit } from "@tauri-apps/api/event";
 
+const isMac = typeof navigator !== "undefined" && navigator.platform.toLowerCase().startsWith("mac");
+
 export type ShortcutActionId =
   | "new-terminal"
   | "close-tab"
   | "next-tab"
   | "previous-tab"
-  | "open-settings";
+  | "open-settings"
+  | "open-snippets";
 
 export interface ShortcutBinding {
   key: string;
@@ -33,31 +36,37 @@ export const shortcutDefinitions: ShortcutDefinition[] = [
     id: "new-terminal",
     label: "New terminal",
     description: "Open a new local terminal tab",
-    defaultBinding: binding("t", { metaKey: true, code: "KeyT" }),
+    defaultBinding: cmdOrCtrl("t", { code: "KeyT" }),
   },
   {
     id: "close-tab",
     label: "Close tab",
     description: "Close the current tab when possible",
-    defaultBinding: binding("w", { metaKey: true, code: "KeyW" }),
+    defaultBinding: cmdOrCtrl("w", { code: "KeyW" }),
   },
   {
     id: "next-tab",
     label: "Next tab",
     description: "Switch to the tab on the right",
-    defaultBinding: binding("]", { metaKey: true, shiftKey: true, code: "BracketRight" }),
+    defaultBinding: cmdOrCtrl("]", { shiftKey: true, code: "BracketRight" }),
   },
   {
     id: "previous-tab",
     label: "Previous tab",
     description: "Switch to the tab on the left",
-    defaultBinding: binding("[", { metaKey: true, shiftKey: true, code: "BracketLeft" }),
+    defaultBinding: cmdOrCtrl("[", { shiftKey: true, code: "BracketLeft" }),
   },
   {
     id: "open-settings",
     label: "Open settings",
     description: "Open or focus the Settings window",
-    defaultBinding: binding(",", { metaKey: true, code: "Comma" }),
+    defaultBinding: cmdOrCtrl(",", { code: "Comma" }),
+  },
+  {
+    id: "open-snippets",
+    label: "Snippets",
+    description: "Open snippets list in the terminal",
+    defaultBinding: cmdOrCtrl("s", { shiftKey: true, code: "KeyS" }),
   },
 ];
 
@@ -80,6 +89,17 @@ function binding(
   };
 }
 
+function cmdOrCtrl(
+  key: string,
+  modifiers: Partial<Omit<ShortcutBinding, "key" | "metaKey" | "ctrlKey">> = {}
+): ShortcutBinding {
+  return binding(key, {
+    ...modifiers,
+    metaKey: isMac,
+    ctrlKey: !isMac,
+  });
+}
+
 export function eventToShortcutBinding(event: KeyboardEvent): ShortcutBinding | null {
   const key = keyFromEvent(event);
 
@@ -98,10 +118,10 @@ export function eventToShortcutBinding(event: KeyboardEvent): ShortcutBinding | 
 export function formatShortcut(binding: ShortcutBinding) {
   const keys = [];
 
-  if (binding.metaKey) keys.push("⌘");
+  if (binding.metaKey) keys.push(isMac ? "⌘" : "Ctrl");
   if (binding.ctrlKey) keys.push("Ctrl");
-  if (binding.altKey) keys.push("⌥");
-  if (binding.shiftKey) keys.push("⇧");
+  if (binding.altKey) keys.push(isMac ? "⌥" : "Alt");
+  if (binding.shiftKey) keys.push(isMac ? "⇧" : "Shift");
   keys.push(formatKey(binding.key));
 
   return keys;
@@ -129,9 +149,15 @@ export function loadShortcuts(): ShortcutMap {
     const parsed = JSON.parse(stored) as Partial<ShortcutMap>;
 
     return shortcutDefinitions.reduce((acc, definition) => {
-      acc[definition.id] = isShortcutBinding(parsed[definition.id])
-        ? parsed[definition.id]
-        : definition.defaultBinding;
+      const candidate = parsed[definition.id];
+      // On non-Mac, discard stored bindings that use metaKey (old macOS defaults)
+      if (!isMac && isShortcutBinding(candidate) && candidate.metaKey) {
+        acc[definition.id] = definition.defaultBinding;
+      } else {
+        acc[definition.id] = isShortcutBinding(candidate)
+          ? candidate
+          : definition.defaultBinding;
+      }
       return acc;
     }, {} as ShortcutMap);
   } catch {

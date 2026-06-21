@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
 import { AppShell } from "@/components/app/AppShell";
 import { SettingsWindow } from "@/components/settings/SettingsWindow";
+import { Toaster } from "@/components/ui/sonner";
 import {
   appThemeChangedEvent,
   appThemeStorageKey,
@@ -30,5 +31,6 @@ void listen<AppTheme>(appThemeChangedEvent, (event) => {
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <Root />
+    <Toaster />
   </StrictMode>
 );

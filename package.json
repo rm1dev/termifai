@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:tauri": "tauri build",
+    "build:windows": "tauri build --target x86_64-pc-windows-msvc"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
