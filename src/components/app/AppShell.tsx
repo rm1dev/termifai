@@ -51,7 +51,16 @@ import {
   GripVertical,
   Minus,
   Square,
+  Menu,
+  Maximize2,
 } from "lucide-react";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
@@ -475,9 +484,44 @@ function TitleBar({
         <Bell className="h-4 w-4" />
       </button>
 
-      {/* Custom window controls for Linux and Windows */}
-      {platform !== "macos" && <WindowControls />}
+      {/* Linux/Windows: hamburger app menu + window controls */}
+      {platform !== "macos" && (
+        <>
+          <AppHamburgerMenu onNew={onNew} />
+          <WindowControls />
+        </>
+      )}
     </div>
+  );
+}
+
+function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
+  const win = getCurrentWindow();
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground self-center mr-1"
+          aria-label="App menu"
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-48">
+        <DropdownMenuItem onSelect={() => onNew("terminal")}>
+          New Terminal
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+T</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void invoke("open_settings_window")}>
+          Settings
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => void win.setFullscreen(true)}>
+          Full Screen
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 

@@ -344,57 +344,59 @@ pub fn run() {
                 }
             }
 
-            // Build custom application menu
-            let new_terminal = MenuItemBuilder::with_id("new-terminal", "New Terminal")
-                .accelerator("CmdOrCtrl+T")
-                .build(app)?;
-            let settings = MenuItemBuilder::with_id("open-settings", "Settings...")
-                .accelerator("CmdOrCtrl+,")
-                .build(app)?;
+            // On Linux the native menubar is replaced by a frontend hamburger menu
+            #[cfg(not(target_os = "linux"))]
+            {
+                let new_terminal = MenuItemBuilder::with_id("new-terminal", "New Terminal")
+                    .accelerator("CmdOrCtrl+T")
+                    .build(app)?;
+                let settings = MenuItemBuilder::with_id("open-settings", "Settings...")
+                    .accelerator("CmdOrCtrl+,")
+                    .build(app)?;
 
-            let file_menu = SubmenuBuilder::new(app, "File")
-                .item(&new_terminal)
-                .item(&settings)
-                .separator()
-                .item(&PredefinedMenuItem::close_window(app, None)?)
-                .build()?;
+                let file_menu = SubmenuBuilder::new(app, "File")
+                    .item(&new_terminal)
+                    .item(&settings)
+                    .separator()
+                    .item(&PredefinedMenuItem::close_window(app, None)?)
+                    .build()?;
 
-            let edit_menu = SubmenuBuilder::new(app, "Edit")
-                .undo()
-                .redo()
-                .separator()
-                .cut()
-                .copy()
-                .paste()
-                .select_all()
-                .build()?;
+                let edit_menu = SubmenuBuilder::new(app, "Edit")
+                    .undo()
+                    .redo()
+                    .separator()
+                    .cut()
+                    .copy()
+                    .paste()
+                    .select_all()
+                    .build()?;
 
-            let window_menu = SubmenuBuilder::new(app, "Window")
-                .minimize()
-                .maximize()
-                .separator()
-                .fullscreen()
-                .build()?;
+                let window_menu = SubmenuBuilder::new(app, "Window")
+                    .minimize()
+                    .maximize()
+                    .separator()
+                    .fullscreen()
+                    .build()?;
 
-            let menu = MenuBuilder::new(app)
-                .item(&file_menu)
-                .item(&edit_menu)
-                .item(&window_menu)
-                .build()?;
+                let menu = MenuBuilder::new(app)
+                    .item(&file_menu)
+                    .item(&edit_menu)
+                    .item(&window_menu)
+                    .build()?;
 
-            app.set_menu(menu)?;
+                app.set_menu(menu)?;
 
-            // Handle custom menu events
-            let handle = app.handle().clone();
-            app.on_menu_event(move |_app_handle, event| match event.id().as_ref() {
-                "new-terminal" => {
-                    let _ = handle.emit("menu-new-terminal", ());
-                }
-                "open-settings" => {
-                    let _ = open_settings_window_inner(&handle);
-                }
-                _ => {}
-            });
+                let handle = app.handle().clone();
+                app.on_menu_event(move |_app_handle, event| match event.id().as_ref() {
+                    "new-terminal" => {
+                        let _ = handle.emit("menu-new-terminal", ());
+                    }
+                    "open-settings" => {
+                        let _ = open_settings_window_inner(&handle);
+                    }
+                    _ => {}
+                });
+            }
 
             if cfg!(debug_assertions) {
                 app.handle().plugin(
