@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, forwardRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import {
   Server,
@@ -48,6 +49,8 @@ import {
   
   Gauge,
   GripVertical,
+  Minus,
+  Square,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -125,6 +128,7 @@ export function AppShell() {
   ]);
   const [activeTab, setActiveTab] = useState("t-term");
   const [activeSidebar, setActiveSidebar] = useState<SidebarKey>("hosts");
+  const [platform, setPlatform] = useState<string>("macos");
   const shortcutsRef = useRef<ShortcutMap>(loadShortcuts());
   const newTabRef = useRef<(kind: TabKind) => void>(null!);
 
@@ -307,6 +311,10 @@ export function AppShell() {
     };
   }, []);
 
+  useEffect(() => {
+    invoke<string>("get_platform").then(setPlatform).catch(() => {});
+  }, []);
+
   const tab = tabs.find((t) => t.id === activeTab);
 
   return (
@@ -319,6 +327,7 @@ export function AppShell() {
         onNew={newTab}
         onRename={renameTab}
         onReorder={reorderTab}
+        platform={platform}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -387,6 +396,7 @@ function TitleBar({
   onNew,
   onRename,
   onReorder,
+  platform,
 }: {
   tabs: AppTab[];
   activeTab: string;
@@ -395,6 +405,7 @@ function TitleBar({
   onNew: (kind: TabKind) => void;
   onRename: (id: string, title: string) => void;
   onReorder: (fromId: string, toId: string) => void;
+  platform: string;
 }) {
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -410,9 +421,10 @@ function TitleBar({
   const closableTabs = tabs.filter((t) => t.closable);
 
   return (
-    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] pr-3 select-none" data-tauri-drag-region>
+    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none" data-tauri-drag-region>
       {/* Space for native macOS traffic lights */}
-      <div className="w-[80px] h-full shrink-0 flex items-center" />
+      {platform === "macos" && <div className="w-[80px] h-full shrink-0 flex items-center" />}
+      {platform !== "macos" && <div className="w-3 h-full shrink-0" />}
 
       <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" data-tauri-drag-region>
         {/* Pinned tabs (Hosts) — outside DnD, immovable */}
@@ -459,8 +471,40 @@ function TitleBar({
         </div>
       </div>
 
-      <button className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground self-center" aria-label="Notifications">
+      <button className="flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground self-center mx-1" aria-label="Notifications">
         <Bell className="h-4 w-4" />
+      </button>
+
+      {/* Custom window controls for Linux and Windows */}
+      {platform !== "macos" && <WindowControls />}
+    </div>
+  );
+}
+
+function WindowControls() {
+  const win = getCurrentWindow();
+  return (
+    <div className="flex items-center h-full shrink-0">
+      <button
+        onClick={() => void win.minimize()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground transition-colors"
+        aria-label="Minimize"
+      >
+        <Minus className="h-3.5 w-3.5" />
+      </button>
+      <button
+        onClick={() => void win.toggleMaximize()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground transition-colors"
+        aria-label="Maximize"
+      >
+        <Square className="h-3 w-3" />
+      </button>
+      <button
+        onClick={() => void win.close()}
+        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-red-500 hover:text-white transition-colors"
+        aria-label="Close"
+      >
+        <X className="h-3.5 w-3.5" />
       </button>
     </div>
   );

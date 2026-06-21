@@ -99,11 +99,27 @@ fn new_window(app: tauri::AppHandle) -> Result<(), String> {
         builder = builder.decorations(false);
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.decorations(false);
+    }
+
     builder
         .build()
         .map_err(|e| format!("Failed to create window: {}", e))?;
 
     Ok(())
+}
+
+#[tauri::command]
+fn get_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "linux"
+    }
 }
 
 #[tauri::command]
@@ -296,6 +312,7 @@ pub fn run() {
             resize_session,
             close_session,
             new_window,
+            get_platform,
             open_settings_window,
             list_ssh_keys,
             generate_ssh_key,
@@ -319,6 +336,14 @@ pub fn run() {
             run_snippet_script,
         ])
         .setup(|app| {
+            // On Linux, remove native window decorations so the custom frontend titlebar takes over
+            #[cfg(target_os = "linux")]
+            {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.set_decorations(false);
+                }
+            }
+
             // Build custom application menu
             let new_terminal = MenuItemBuilder::with_id("new-terminal", "New Terminal")
                 .accelerator("CmdOrCtrl+T")
