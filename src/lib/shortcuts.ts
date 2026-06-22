@@ -8,7 +8,9 @@ export type ShortcutActionId =
   | "next-tab"
   | "previous-tab"
   | "open-settings"
-  | "open-snippets";
+  | "open-snippets"
+  | "terminal-copy"
+  | "terminal-paste";
 
 export interface ShortcutBinding {
   key: string;
@@ -67,6 +69,18 @@ export const shortcutDefinitions: ShortcutDefinition[] = [
     label: "Snippets",
     description: "Open snippets list in the terminal",
     defaultBinding: cmdOrCtrl("s", { shiftKey: true, code: "KeyS" }),
+  },
+  {
+    id: "terminal-copy",
+    label: "Terminal copy",
+    description: "Copy selected text in the terminal",
+    defaultBinding: binding("c", { ctrlKey: true, shiftKey: true, code: "KeyC" }),
+  },
+  {
+    id: "terminal-paste",
+    label: "Terminal paste",
+    description: "Paste into the terminal",
+    defaultBinding: binding("v", { ctrlKey: true, shiftKey: true, code: "KeyV" }),
   },
 ];
 

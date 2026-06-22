@@ -198,13 +198,13 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
     termRef.current = term;
     requestAnimationFrame(() => term.focus());
 
-    // Intercept Cmd+Shift+S for snippet palette
+    // Intercept terminal shortcuts before xterm processes them
     term.attachCustomKeyEventHandler((event) => {
       const shortcuts = shortcutsRefLocal.current;
+
       if (shortcuts["open-snippets"] && isShortcutMatch(event, shortcuts["open-snippets"])) {
         if (event.type === "keydown") {
           event.preventDefault();
-          // Load snippets from backend
           invoke<Snippet[]>("list_snippets").then((data) => {
             setSnippets(data);
             setSnippetQuery("");
@@ -212,8 +212,32 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
             setSnippetPalette(true);
           }).catch(() => {});
         }
-        return false; // prevent xterm from processing this key
+        return false;
       }
+
+      if (shortcuts["terminal-copy"] && isShortcutMatch(event, shortcuts["terminal-copy"])) {
+        if (event.type === "keydown") {
+          const selection = term.getSelection();
+          if (selection) {
+            navigator.clipboard.writeText(selection).catch(() => {});
+            term.clearSelection();
+          }
+        }
+        return false;
+      }
+
+      if (shortcuts["terminal-paste"] && isShortcutMatch(event, shortcuts["terminal-paste"])) {
+        if (event.type === "keydown") {
+          const sid = sessionRef.current;
+          if (sid) {
+            navigator.clipboard.readText().then((text) => {
+              invoke("write_to_session", { sessionId: sid, data: text }).catch(() => {});
+            }).catch(() => {});
+          }
+        }
+        return false;
+      }
+
       return true;
     });
 

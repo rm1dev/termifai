@@ -25,6 +25,7 @@
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "transparent": false,
+        "backgroundColor": "#1c1d2b",
         "trafficLightPosition": { "x": 12, "y": 25 }
       }
     ],
@@ -36,14 +37,11 @@
     "active": true,
     "targets": "all",
     "icon": [
-      "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
+      "icons/icon.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "android": {
-      "debugApplicationIdSuffix": ".debug"
-    }
+    ]
   }
 }
