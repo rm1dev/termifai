@@ -2,34 +2,38 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="nailyudha/tauri:latest"
+IMAGE="termifai-windows-builder"
 
-# Cache the Windows SDK between builds (~3GB, avoids re-download each time)
+# Persistent caches (survive between builds)
 XWIN_CACHE="${HOME}/.cache/xwin"
 mkdir -p "$XWIN_CACHE"
 
-echo "==> Building Windows x64 + arm64 installers (NSIS) in a single container..."
+# Build base image — only reruns when Dockerfile.windows changes
+echo "==> Ensuring builder image is up to date..."
+docker build -f "${ROOT}/Dockerfile.windows" -t "$IMAGE" "$ROOT"
+
+# src-tauri/target-win is mounted so Rust incremental builds work across runs
+mkdir -p "${ROOT}/src-tauri/target-win"
+
+echo "==> Building Windows x64 + arm64 installers (NSIS)..."
 docker run --rm \
     -v "${ROOT}:/app" \
+    -v "termifai-win-nm:/app/node_modules" \
     -v "${XWIN_CACHE}:/root/.xwin-cache" \
+    -v "termifai-cargo-registry:/root/.cargo/registry" \
+    -v "termifai-cargo-git:/root/.cargo/git" \
+    -e CARGO_TARGET_DIR=/app/src-tauri/target-win \
     -w /app \
     "$IMAGE" \
     sh -c "
         set -e
+        npm install
 
-        apt-get update -qq && apt-get install -y -qq nsis &&
-        mise install rust@latest && mise use --global rust@latest &&
-        rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc &&
-        cargo install --locked cargo-xwin &&
+        echo '--- Building x64 ---'
+        npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis
 
-        rm -rf node_modules &&
-        bun install &&
-
-        echo '--- Building x64 ---' &&
-        bun tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --bundles nsis &&
-
-        echo '--- Building arm64 ---' &&
-        bun tauri build --runner cargo-xwin --target aarch64-pc-windows-msvc --bundles nsis
+        echo '--- Building arm64 ---'
+        npx tauri build --runner cargo-xwin --target aarch64-pc-windows-msvc --bundles nsis
     "
 
 echo ""
@@ -39,7 +43,7 @@ for arch_pair in "x86_64-pc-windows-msvc:x64" "aarch64-pc-windows-msvc:arm64"; d
     arch="${arch_pair##*:}"
     out="${ROOT}/releases/windows/${arch}"
     mkdir -p "$out"
-    bundle_dir="${ROOT}/src-tauri/target/${target}/release/bundle"
+    bundle_dir="${ROOT}/src-tauri/target-win/${target}/release/bundle"
     if [ -d "$bundle_dir" ]; then
         cp -r "${bundle_dir}/." "$out/"
         echo "  releases/windows/${arch}/ done"
@@ -48,4 +52,4 @@ done
 
 echo ""
 echo "Done! Artifacts:"
-ls -lhR "${ROOT}/releases/windows/"
+ls -lhR "${ROOT}/releases/windows/" 2>/dev/null || true
