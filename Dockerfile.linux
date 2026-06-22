@@ -1,0 +1,60 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+# linuxdeploy needs this to run inside Docker (no FUSE available in containers)
+ENV APPIMAGE_EXTRACT_AND_RUN=1
+
+# System dependencies required by Tauri 2 on Linux
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    curl \
+    file \
+    unzip \
+    pkg-config \
+    libwebkit2gtk-4.1-dev \
+    libssl-dev \
+    libayatana-appindicator3-dev \
+    librsvg2-dev \
+    patchelf \
+    libgtk-3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js LTS (npm properly resolves @tauri-apps/cli native bindings)
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Rust (stable)
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /app
+
+# Cache frontend dependencies
+COPY package.json package-lock.json* ./
+RUN npm install
+
+# Cache Cargo registry
+COPY src-tauri/Cargo.toml src-tauri/Cargo.lock* ./src-tauri/
+RUN mkdir -p src-tauri/src && \
+    echo "fn main() {}" > src-tauri/src/main.rs && \
+    echo "" > src-tauri/src/lib.rs && \
+    cd src-tauri && cargo fetch
+
+# Copy full source
+COPY . .
+
+# Build frontend
+RUN npm run build
+
+# Clear beforeBuildCommand so tauri doesn't re-run it (bun is not in this image)
+RUN node -e "const fs=require('fs'); const c=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8')); c.build.beforeBuildCommand=''; fs.writeFileSync('src-tauri/tauri.conf.json',JSON.stringify(c,null,2))"
+
+# Build Tauri bundle for Linux (AppImage requires FUSE and can't run in Docker)
+RUN npx tauri build --bundles deb && \
+    find src-tauri/target/release -mindepth 1 -maxdepth 1 \
+        ! -name bundle ! -name termifai \
+        -exec rm -rf {} +
+
+# Output artifacts are in src-tauri/target/release/bundle/
