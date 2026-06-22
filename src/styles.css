@@ -299,6 +299,34 @@
   color: color-mix(in oklab, var(--foreground) 72%, transparent) !important;
 }
 
+[data-sonner-toast][data-type="success"] {
+  background: color-mix(in oklab, var(--brand-green) 14%, var(--background)) !important;
+  border-color: color-mix(in oklab, var(--brand-green) 45%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast][data-type="error"] {
+  background: color-mix(in oklab, var(--brand-red) 16%, var(--background)) !important;
+  border-color: color-mix(in oklab, var(--brand-red) 55%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast][data-type="warning"] {
+  background: color-mix(in oklab, var(--brand-yellow) 15%, var(--background)) !important;
+  border-color: color-mix(in oklab, var(--brand-yellow) 50%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast][data-type="info"] {
+  background: color-mix(in oklab, var(--brand-cyan) 14%, var(--background)) !important;
+  border-color: color-mix(in oklab, var(--brand-cyan) 45%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast][data-type] [data-description] {
+  color: color-mix(in oklab, var(--foreground) 72%, transparent) !important;
+}
+
 
 /* Hide native macOS traffic lights when using titleBarStyle overlay
    (we render custom traffic light buttons in the TitleBar component) */
