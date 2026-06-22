@@ -1,8 +1,6 @@
-import { StrictMode } from "react";
+import { lazy, StrictMode, Suspense } from "react";
 import { createRoot } from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
-import { AppShell } from "@/components/app/AppShell";
-import { SettingsWindow } from "@/components/settings/SettingsWindow";
 import { Toaster } from "@/components/ui/sonner";
 import {
   appThemeChangedEvent,
@@ -13,8 +11,12 @@ import {
 } from "@/lib/app-theme";
 import "./styles.css";
 
-const params = new URLSearchParams(window.location.search);
-const Root = params.get("window") === "settings" ? SettingsWindow : AppShell;
+const AppShell = lazy(() =>
+  import("@/components/app/AppShell").then((m) => ({ default: m.AppShell }))
+);
+const SettingsWindow = lazy(() =>
+  import("@/components/settings/SettingsWindow").then((m) => ({ default: m.SettingsWindow }))
+);
 
 applyAppTheme(loadAppTheme());
 window.addEventListener("storage", (event) => {
@@ -28,9 +30,21 @@ void listen<AppTheme>(appThemeChangedEvent, (event) => {
   /* Non-Tauri environments rely on storage events. */
 });
 
+// Prevent Ctrl+scroll and pinch-to-zoom in the webview
+window.addEventListener("wheel", (e) => {
+  if (e.ctrlKey) e.preventDefault();
+}, { passive: false });
+window.addEventListener("gesturestart", (e) => e.preventDefault());
+window.addEventListener("gesturechange", (e) => e.preventDefault());
+
+const params = new URLSearchParams(window.location.search);
+const isSettings = params.get("window") === "settings";
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <Root />
+    <Suspense>
+      {isSettings ? <SettingsWindow /> : <AppShell />}
+    </Suspense>
     <Toaster />
   </StrictMode>
 );

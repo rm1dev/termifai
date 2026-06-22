@@ -224,12 +224,16 @@
   html, body, #root {
     height: 100%;
   }
+  html {
+    overscroll-behavior: none;
+  }
   body {
     background-color: var(--color-background);
     color: var(--color-foreground);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
     overflow: hidden;
+    overscroll-behavior: none;
     user-select: none;
     -webkit-user-select: none;
     -webkit-user-drag: none;
@@ -250,10 +254,49 @@
 /* xterm overrides — let it fill its container */
 .xterm-wrapper .xterm {
   height: 100%;
-  padding: 12px 14px;
+  padding: 12px 0 14px 12px;
 }
 .xterm-wrapper .xterm-viewport {
   background-color: transparent !important;
+}
+.xterm-wrapper .xterm-viewport::-webkit-scrollbar {
+  display: none;
+}
+.xterm-wrapper .xterm-scrollable-element > .scrollbar.vertical {
+  width: 10px !important;
+  right: 4px !important;
+}
+.xterm-wrapper .xterm-scrollable-element > .scrollbar.vertical > .slider {
+  width: 10px !important;
+  border-radius: 10px;
+}
+
+[data-sonner-toast][data-type="success"] {
+  background: color-mix(in oklab, var(--brand-green) 14%, var(--background)) !important;
+  border-color: color-mix(in oklab, var(--brand-green) 45%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast][data-type="error"] {
+  background: color-mix(in oklab, var(--brand-red) 16%, var(--background)) !important;
+  border-color: color-mix(in oklab, var(--brand-red) 55%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast][data-type="warning"] {
+  background: color-mix(in oklab, var(--brand-yellow) 15%, var(--background)) !important;
+  border-color: color-mix(in oklab, var(--brand-yellow) 50%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast][data-type="info"] {
+  background: color-mix(in oklab, var(--brand-cyan) 14%, var(--background)) !important;
+  border-color: color-mix(in oklab, var(--brand-cyan) 45%, transparent) !important;
+  color: var(--foreground) !important;
+}
+
+[data-sonner-toast][data-type] [data-description] {
+  color: color-mix(in oklab, var(--foreground) 72%, transparent) !important;
 }
 
 [data-sonner-toast][data-type="success"] {

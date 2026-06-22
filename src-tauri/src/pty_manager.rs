@@ -261,18 +261,29 @@ fn build_shell_command(initial_command: Option<&str>) -> CommandBuilder {
             }
         }
 
-        // Local terminal (no initial_command): prefer PowerShell, fall back to cmd.exe
+        // Local terminal (no initial_command): prefer PowerShell, fall back to cmd.exe.
+        // Force UTF-8 encoding so Arabic/Persian text isn't mangled by the default codepage.
         let pwsh = ["pwsh.exe", "powershell.exe"]
             .iter()
             .find(|&&name| which_exists(name))
             .map(|s| s.to_string());
 
         if let Some(ps) = pwsh {
-            CommandBuilder::new(&ps)
+            let mut cmd = CommandBuilder::new(&ps);
+            cmd.arg("-NoExit");
+            cmd.arg("-Command");
+            // Set UTF-8 encoding, then remove PSReadLine so its partial BiDi rendering
+            // (which misplaces the first RTL word) is replaced by the simple Console
+            // readline that renders characters exactly in typed order — matching
+            // the LTR pass-through behaviour of Unix PTY on macOS/Linux.
+            cmd.arg("$OutputEncoding = [Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); Remove-Module PSReadLine -ErrorAction SilentlyContinue");
+            cmd
         } else {
-            CommandBuilder::new(
-                std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string()),
-            )
+            let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
+            let mut cmd = CommandBuilder::new(&comspec);
+            cmd.arg("/K");
+            cmd.arg("chcp 65001 > nul");
+            cmd
         }
     }
 
