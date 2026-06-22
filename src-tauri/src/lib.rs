@@ -294,6 +294,11 @@ fn run_snippet_script(
     manager.write_to_session(&session_id, &payload)
 }
 
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -336,7 +341,18 @@ pub fn run() {
             save_snippet,
             remove_snippets,
             run_snippet_script,
+            quit_app,
         ])
+        .on_window_event(|window, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let label = window.label();
+                if label == "main" || label.starts_with("window-") {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
+        })
         .setup(|app| {
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
@@ -393,6 +409,8 @@ pub fn run() {
                     .item(&settings)
                     .separator()
                     .item(&PredefinedMenuItem::close_window(app, None)?)
+                    .separator()
+                    .item(&PredefinedMenuItem::quit(app, None)?)
                     .build()?;
 
                 let edit_menu = SubmenuBuilder::new(app, "Edit")
@@ -441,8 +459,19 @@ pub fn run() {
             }
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+                if !has_visible_windows {
+                    if let Some(window) = app_handle.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+            }
+        });
 }
 
 /// Shared logic for opening the settings window (used by both command and menu event).

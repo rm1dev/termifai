@@ -530,6 +530,11 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
         <DropdownMenuItem onSelect={() => void win.setFullscreen(!isFullscreen)}>
           {isFullscreen ? "Exit Full Screen" : "Full Screen"}
         </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => void invoke("quit_app")}>
+          Quit
+          <span className="ml-auto text-xs text-muted-foreground">Alt+F4</span>
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -623,6 +628,7 @@ const BaseTabChip = forwardRef<HTMLDivElement, BaseTabChipProps>(function BaseTa
       onClick={onClick}
       onDoubleClick={(e) => {
         e.stopPropagation();
+        if (!tab.closable) return;
         setDraft(tab.title);
         setEditing(true);
       }}
