@@ -356,11 +356,17 @@ pub fn run() {
         .setup(|app| {
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
+            // Also set UTF-8 (codepage 65001) so ConPTY correctly interprets multi-byte
+            // Unicode sequences — fixes garbled Arabic/Persian text in RTL sessions.
             #[cfg(target_os = "windows")]
             unsafe {
-                use windows_sys::Win32::System::Console::{AllocConsole, GetConsoleWindow};
+                use windows_sys::Win32::System::Console::{
+                    AllocConsole, GetConsoleWindow, SetConsoleCP, SetConsoleOutputCP,
+                };
                 use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
                 AllocConsole();
+                SetConsoleCP(65001);
+                SetConsoleOutputCP(65001);
                 let hwnd = GetConsoleWindow();
                 if !hwnd.is_null() {
                     ShowWindow(hwnd, SW_HIDE);

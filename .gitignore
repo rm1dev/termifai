@@ -5,6 +5,9 @@ node_modules/
 dist/
 releases/
 src-tauri/target/
+src-tauri/target-win/
+src-tauri/target-linux-x64/
+src-tauri/target-linux-arm64/
 
 # IDE
 .vscode/
@@ -25,3 +28,4 @@ Thumbs.db
 # Bun
 bun.lock
 bun.lockb
+package-lock.json

@@ -1,6 +1,10 @@
 node_modules
 dist
 src-tauri/target
+src-tauri/target-win
+src-tauri/target-linux-x64
+src-tauri/target-linux-arm64
+releases
 .git
 .gitignore
 *.md
