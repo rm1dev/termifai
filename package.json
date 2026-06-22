@@ -9,7 +9,6 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:tauri": "tauri build",
-    "build:windows": "tauri build --target x86_64-pc-windows-msvc",
     "build:linux": "bash scripts/build-linux.sh",
     "build:windows:docker": "bash scripts/build-windows.sh"
   },
