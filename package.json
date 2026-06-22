@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build:tauri": "tauri build",
-    "build:windows": "tauri build --target x86_64-pc-windows-msvc"
+    "build:windows": "tauri build --target x86_64-pc-windows-msvc",
+    "build:linux": "bash scripts/build-linux.sh"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
