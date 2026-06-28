@@ -219,8 +219,10 @@ impl SftpManager {
         let total_bytes = stat.size.unwrap_or(0);
 
         let mut remote_file = sftp.open(remote_p).map_err(|e| format!("open remote: {}", e))?;
-        let mut local_file = std::fs::File::create(local_path)
-            .map_err(|e| format!("create local '{}': {}", local_path, e))?;
+
+        let tmp_path = format!("{}.termifai_dl_tmp", local_path);
+        let mut local_file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("create tmp file '{}': {}", tmp_path, e))?;
 
         let file_name = remote_p
             .file_name()
@@ -230,23 +232,36 @@ impl SftpManager {
         let mut buf = vec![0u8; 32 * 1024];
         let mut bytes_transferred = 0u64;
 
-        loop {
-            use std::io::{Read, Write};
-            let n = remote_file.read(&mut buf).map_err(|e| format!("read remote: {}", e))?;
-            if n == 0 {
-                break;
+        let result = (|| {
+            loop {
+                use std::io::{Read, Write};
+                let n = remote_file.read(&mut buf).map_err(|e| format!("read remote: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                local_file.write_all(&buf[..n]).map_err(|e| format!("write tmp: {}", e))?;
+                bytes_transferred += n as u64;
+                on_progress(TransferProgress {
+                    session_id: session_id.to_string(),
+                    file_name: file_name.clone(),
+                    bytes_transferred,
+                    total_bytes,
+                });
             }
-            local_file.write_all(&buf[..n]).map_err(|e| format!("write local: {}", e))?;
-            bytes_transferred += n as u64;
-            on_progress(TransferProgress {
-                session_id: session_id.to_string(),
-                file_name: file_name.clone(),
-                bytes_transferred,
-                total_bytes,
-            });
+            use std::io::Write;
+            local_file.flush().map_err(|e| format!("flush tmp: {}", e))?;
+            Ok::<(), String>(())
+        })();
+
+        if let Err(e) = result {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
         }
 
-        Ok(())
+        std::fs::rename(&tmp_path, local_path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            format!("rename tmp to '{}': {}", local_path, e)
+        })
     }
 
     pub fn upload_file<F>(
@@ -314,8 +329,11 @@ impl SftpManager {
 
         for path in paths {
             let p = std::path::Path::new(path);
-            if sftp.unlink(p).is_err() {
-                sftp.rmdir(p).map_err(|e| format!("delete '{}': {}", path, e))?;
+            let stat = sftp.stat(p).map_err(|e| format!("stat '{}': {}", path, e))?;
+            if stat.file_type().is_dir() {
+                sftp.rmdir(p).map_err(|e| format!("rmdir '{}': {}", path, e))?;
+            } else {
+                sftp.unlink(p).map_err(|e| format!("unlink '{}': {}", path, e))?;
             }
         }
         Ok(())
