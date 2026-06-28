@@ -198,6 +198,26 @@ export function AppShell() {
     setActiveTab(id);
   };
 
+  const openSftpSession = (host: Host) => {
+    const id = `t-sftp-${host.id}-${Date.now()}`;
+    const baseTitle = host.name || host.hostname;
+    setTabs((currentTabs) => {
+      const existingCount = currentTabs.filter((t) => t.sftpHostId === host.id).length;
+      const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
+      return [
+        ...currentTabs,
+        {
+          id,
+          kind: "sftp" as const,
+          title,
+          closable: true,
+          sftpHostId: host.id,
+        },
+      ];
+    });
+    setActiveTab(id);
+  };
+
   const closeTab = (id: string) => {
     const curr = tabsRef.current;
     const tgt = curr.find((t) => t.id === id);
@@ -379,7 +399,7 @@ export function AppShell() {
                 <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
                 <main className="flex min-w-0 flex-1 flex-col">
                   {activeSidebar === "dashboard" && <DashboardView />}
-                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={() => newTab("sftp")} onConnectHost={(host) => void openSshTerminal(host)} />}
+                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
                   {activeSidebar === "port-forwarding" && <PortForwardingView />}
                   {activeSidebar === "snippets" && <SnippetsView />}
                   {activeSidebar === "ssh-keys" && <SshKeysView />}
@@ -389,7 +409,7 @@ export function AppShell() {
                 </main>
               </>
             )}
-            {t.kind === "sftp" && <SftpView />}
+            {t.kind === "sftp" && <SftpView tab={t} />}
           </div>
           ) : null
         )}
@@ -1862,7 +1882,7 @@ function HostsView({
   onConnectHost,
 }: {
   onNewTerminal?: () => void;
-  onNewSftp?: () => void;
+  onNewSftp?: (host: Host) => void;
   onConnectHost: (host: Host) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -4043,7 +4063,7 @@ function Segmented({
 
 /* ---------------- SFTP view ---------------- */
 
-function SftpView() {
+function SftpView({ tab }: { tab: AppTab }) {
   const files = [
     { n: "Applications", d: "5/9/2026, 1:58 PM", k: "folder" },
     { n: "CascadeProjects", d: "5/28/2025, 7:38 PM", k: "folder" },
