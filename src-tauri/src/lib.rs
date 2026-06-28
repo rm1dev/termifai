@@ -13,7 +13,7 @@ use port_forwarding::{
     PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus,
 };
 use pty_manager::{PtyManager, TabInfo};
-use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager, SftpSessionInfo};
+use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager, SftpSessionInfo, TransferProgress};
 use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -322,6 +322,22 @@ fn sftp_list_remote(
 }
 
 #[tauri::command]
+fn sftp_download(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    let sid = session_id.clone();
+    manager.download_file(&session_id, &remote_path, &local_path, move |progress| {
+        let event = format!("sftp:{}:progress", sid);
+        let _ = app.emit(&event, progress);
+    })
+}
+
+#[tauri::command]
 fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), String> {
     let mut manager = state.sftp_manager.lock().unwrap();
     manager.disconnect(&session_id)
@@ -377,6 +393,7 @@ pub fn run() {
             run_snippet_script,
             sftp_connect_sync,
             sftp_disconnect,
+            sftp_download,
             sftp_list_local,
             sftp_list_remote,
             quit_app,
