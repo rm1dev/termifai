@@ -99,7 +99,7 @@ import {
   PolarAngleAxis,
 } from "recharts";
 import { OsBadge } from "./icons";
-import type { AppTab, Host, HostGroup, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind } from "./types";
+import type { AppTab, Host, HostGroup, LocalFileEntry, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind } from "./types";
 import { XTerminal } from "./XTerminal";
 import {
   isShortcutMatch,
@@ -4063,20 +4063,43 @@ function Segmented({
 
 /* ---------------- SFTP view ---------------- */
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 function SftpView({ tab }: { tab: AppTab }) {
-  const files = [
-    { n: "Applications", d: "5/9/2026, 1:58 PM", k: "folder" },
-    { n: "CascadeProjects", d: "5/28/2025, 7:38 PM", k: "folder" },
-    { n: "Desktop", d: "6/3/2026, 9:14 AM", k: "folder" },
-    { n: "Documents", d: "6/13/2026, 1:51 PM", k: "folder" },
-    { n: "Downloads", d: "6/17/2026, 8:59 AM", k: "folder" },
-    { n: "Library", d: "5/14/2026, 8:21 PM", k: "folder" },
-    { n: "Movies", d: "2/26/2026, 10:05 PM", k: "folder" },
-    { n: "Music", d: "2/4/2026, 7:40 PM", k: "folder" },
-    { n: "Pictures", d: "5/13/2026, 8:32 AM", k: "folder" },
-    { n: "Public", d: "11/17/2024, 7:55 AM", k: "folder" },
-    { n: "Dockerfile", d: "7/23/2025, 10:13 AM", k: "file", size: "1.05 kB" },
-  ];
+  const homeDir = "/Users/" + (typeof window !== "undefined"
+    ? window.navigator.userAgent.match(/Mac/) ? "admin" : "user"
+    : "user");
+
+  const [localPath, setLocalPath] = useState(homeDir);
+  const [localFiles, setLocalFiles] = useState<LocalFileEntry[]>([]);
+  const [localLoading, setLocalLoading] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const loadLocalDir = async (path: string) => {
+    setLocalLoading(true);
+    setLocalError(null);
+    try {
+      const files = await invoke<LocalFileEntry[]>("sftp_list_local", { path });
+      setLocalFiles(files);
+      setLocalPath(path);
+    } catch (e) {
+      setLocalError(String(e));
+    } finally {
+      setLocalLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadLocalDir(localPath);
+  }, []); // load on mount
+
+  const localParent = localPath.split("/").slice(0, -1).join("/") || "/";
+  const localPathParts = localPath.split("/").filter(Boolean);
 
   return (
     <div className="flex h-full min-h-0 flex-1">
@@ -4089,48 +4112,90 @@ function SftpView({ tab }: { tab: AppTab }) {
             </span>
             Local
           </div>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            <button className="flex items-center gap-1 hover:text-foreground"><Search className="h-3.5 w-3.5" /> Filter</button>
-            <button className="flex items-center gap-1 hover:text-foreground">Actions <ChevronDown className="h-3.5 w-3.5" /></button>
-          </div>
         </div>
-        <div className="border-b border-border px-4 py-2 text-xs text-muted-foreground">
-          <span className="text-foreground/80">Users</span> <span className="opacity-50">›</span> <span className="text-foreground">admin</span>
+
+        {/* Breadcrumb */}
+        <div className="flex items-center gap-1 border-b border-border px-4 py-2 text-xs text-muted-foreground overflow-x-auto">
+          <button
+            className="hover:text-foreground"
+            onClick={() => void loadLocalDir("/")}
+          >
+            /
+          </button>
+          {localPathParts.map((part, i) => {
+            const partPath = "/" + localPathParts.slice(0, i + 1).join("/");
+            return (
+              <span key={partPath} className="flex items-center gap-1">
+                <span className="opacity-40">›</span>
+                <button
+                  className="hover:text-foreground"
+                  onClick={() => void loadLocalDir(partPath)}
+                >
+                  {part}
+                </button>
+              </span>
+            );
+          })}
         </div>
+
+        {/* Column headers */}
         <div className="grid grid-cols-[1fr_180px_100px_80px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
           <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
         </div>
+
+        {/* File list */}
         <div className="flex-1 overflow-y-auto">
-          {files.map((f) => (
-            <div key={f.n} className="grid grid-cols-[1fr_180px_100px_80px] items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]">
-              <div className="flex items-center gap-2 text-foreground">
-                <Folder className={`h-4 w-4 ${f.k === "folder" ? "text-[oklch(0.7_0.13_230)]" : "text-muted-foreground"}`} />
-                {f.n}
-              </div>
-              <div className="text-xs text-muted-foreground">{f.d}</div>
-              <div className="text-xs text-muted-foreground">{f.size ?? "—"}</div>
-              <div className="text-xs text-muted-foreground">{f.k}</div>
-            </div>
-          ))}
+          {localLoading && (
+            <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
+          )}
+          {localError && (
+            <div className="px-4 py-8 text-center text-sm text-red-400">{localError}</div>
+          )}
+          {!localLoading && !localError && (
+            <>
+              {localPath !== "/" && (
+                <div
+                  className="grid grid-cols-[1fr_180px_100px_80px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
+                  onDoubleClick={() => void loadLocalDir(localParent)}
+                >
+                  <div className="flex items-center gap-2 text-muted-foreground">
+                    <Folder className="h-4 w-4 text-[oklch(0.7_0.13_230)]" />
+                    ..
+                  </div>
+                  <div /><div /><div />
+                </div>
+              )}
+              {localFiles.map((f) => (
+                <div
+                  key={f.path}
+                  className="grid grid-cols-[1fr_180px_100px_80px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
+                  onDoubleClick={() => {
+                    if (f.is_dir) void loadLocalDir(f.path);
+                  }}
+                >
+                  <div className="flex items-center gap-2 text-foreground">
+                    <Folder className={`h-4 w-4 ${f.is_dir ? "text-[oklch(0.7_0.13_230)]" : "text-muted-foreground"}`} />
+                    {f.name}
+                  </div>
+                  <div className="text-xs text-muted-foreground">{f.modified ?? "—"}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {f.size != null ? formatBytes(f.size) : "—"}
+                  </div>
+                  <div className="text-xs text-muted-foreground">{f.is_dir ? "folder" : "file"}</div>
+                </div>
+              ))}
+            </>
+          )}
         </div>
       </div>
 
-      {/* Remote pane (placeholder) */}
+      {/* Remote pane — placeholder until Task 9 */}
       <div className="flex w-[42%] min-w-[320px] flex-col">
-        <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4 text-sm">
+        <div className="flex h-11 items-center border-b border-border bg-[var(--color-surface)] px-4 text-sm">
           <span className="text-muted-foreground">Remote</span>
         </div>
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-[var(--color-surface-2)]">
-            <Folder className="h-6 w-6 text-muted-foreground" />
-          </div>
-          <h3 className="mt-5 text-base font-semibold">Connect to host</h3>
-          <p className="mt-1 max-w-xs text-sm text-muted-foreground">
-            Start by connecting to a saved host to manage your files with SFTP.
-          </p>
-          <button className="mt-5 rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-foreground hover:bg-white/5">
-            Select host
-          </button>
+        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+          Remote pane coming in next task
         </div>
       </div>
     </div>
