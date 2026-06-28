@@ -354,6 +354,37 @@ fn sftp_upload(
 }
 
 #[tauri::command]
+fn sftp_delete_remote(
+    state: State<AppState>,
+    session_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.delete_remote(&session_id, &paths)
+}
+
+#[tauri::command]
+fn sftp_rename_remote(
+    state: State<AppState>,
+    session_id: String,
+    from_path: String,
+    to_path: String,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.rename_remote(&session_id, &from_path, &to_path)
+}
+
+#[tauri::command]
+fn sftp_mkdir_remote(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.mkdir_remote(&session_id, &path)
+}
+
+#[tauri::command]
 fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), String> {
     let mut manager = state.sftp_manager.lock().unwrap();
     manager.disconnect(&session_id)
@@ -413,6 +444,9 @@ pub fn run() {
             sftp_upload,
             sftp_list_local,
             sftp_list_remote,
+            sftp_delete_remote,
+            sftp_rename_remote,
+            sftp_mkdir_remote,
             quit_app,
         ])
         .on_window_event(|window, event| {
