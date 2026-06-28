@@ -40,6 +40,14 @@ pub struct RemoteFileEntry {
     pub modified: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TransferProgress {
+    pub session_id: String,
+    pub file_name: String,
+    pub bytes_transferred: u64,
+    pub total_bytes: u64,
+}
+
 pub fn list_local(path: &str) -> Result<Vec<LocalFileEntry>, String> {
     let dir = std::fs::read_dir(path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
 
@@ -189,6 +197,58 @@ impl SftpManager {
         Ok(result)
     }
 
+    pub fn download_file<F>(
+        &self,
+        session_id: &str,
+        remote_path: &str,
+        local_path: &str,
+        on_progress: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(TransferProgress),
+    {
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+
+        let remote_p = std::path::Path::new(remote_path);
+        let stat = sftp.stat(remote_p).map_err(|e| format!("stat '{}': {}", remote_path, e))?;
+        let total_bytes = stat.size.unwrap_or(0);
+
+        let mut remote_file = sftp.open(remote_p).map_err(|e| format!("open remote: {}", e))?;
+        let mut local_file = std::fs::File::create(local_path)
+            .map_err(|e| format!("create local '{}': {}", local_path, e))?;
+
+        let file_name = remote_p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| remote_path.to_string());
+
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut bytes_transferred = 0u64;
+
+        loop {
+            use std::io::{Read, Write};
+            let n = remote_file.read(&mut buf).map_err(|e| format!("read remote: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            local_file.write_all(&buf[..n]).map_err(|e| format!("write local: {}", e))?;
+            bytes_transferred += n as u64;
+            on_progress(TransferProgress {
+                session_id: session_id.to_string(),
+                file_name: file_name.clone(),
+                bytes_transferred,
+                total_bytes,
+            });
+        }
+
+        Ok(())
+    }
+
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
         self.sessions
             .remove(session_id)
@@ -220,6 +280,14 @@ mod tests {
     fn test_list_local_nonexistent() {
         let result = list_local("/this/path/does/not/exist/ever");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_download_no_session_returns_error() {
+        let manager = SftpManager::new();
+        let result = manager.download_file("nonexistent", "/remote/file.txt", "/tmp/out.txt", |_| {});
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
     }
 
     #[test]
