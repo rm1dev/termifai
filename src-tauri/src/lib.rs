@@ -338,6 +338,22 @@ fn sftp_download(
 }
 
 #[tauri::command]
+fn sftp_upload(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    local_path: String,
+    remote_path: String,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    let sid = session_id.clone();
+    manager.upload_file(&session_id, &local_path, &remote_path, move |progress| {
+        let event = format!("sftp:{}:progress", sid);
+        let _ = app.emit(&event, progress);
+    })
+}
+
+#[tauri::command]
 fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), String> {
     let mut manager = state.sftp_manager.lock().unwrap();
     manager.disconnect(&session_id)
@@ -394,6 +410,7 @@ pub fn run() {
             sftp_connect_sync,
             sftp_disconnect,
             sftp_download,
+            sftp_upload,
             sftp_list_local,
             sftp_list_remote,
             quit_app,

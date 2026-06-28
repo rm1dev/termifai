@@ -249,6 +249,61 @@ impl SftpManager {
         Ok(())
     }
 
+    pub fn upload_file<F>(
+        &self,
+        session_id: &str,
+        local_path: &str,
+        remote_path: &str,
+        on_progress: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(TransferProgress),
+    {
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+
+        let local_meta = std::fs::metadata(local_path)
+            .map_err(|e| format!("stat local '{}': {}", local_path, e))?;
+        let total_bytes = local_meta.len();
+
+        let mut local_file =
+            std::fs::File::open(local_path).map_err(|e| format!("open local: {}", e))?;
+
+        let mut remote_file = sftp
+            .create(std::path::Path::new(remote_path))
+            .map_err(|e| format!("create remote '{}': {}", remote_path, e))?;
+
+        let file_name = std::path::Path::new(local_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| local_path.to_string());
+
+        let mut buf = vec![0u8; 32 * 1024];
+        let mut bytes_transferred = 0u64;
+
+        loop {
+            use std::io::{Read, Write};
+            let n = local_file.read(&mut buf).map_err(|e| format!("read local: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            remote_file.write_all(&buf[..n]).map_err(|e| format!("write remote: {}", e))?;
+            bytes_transferred += n as u64;
+            on_progress(TransferProgress {
+                session_id: session_id.to_string(),
+                file_name: file_name.clone(),
+                bytes_transferred,
+                total_bytes,
+            });
+        }
+
+        Ok(())
+    }
+
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
         self.sessions
             .remove(session_id)
@@ -286,6 +341,14 @@ mod tests {
     fn test_download_no_session_returns_error() {
         let manager = SftpManager::new();
         let result = manager.download_file("nonexistent", "/remote/file.txt", "/tmp/out.txt", |_| {});
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_upload_no_session_returns_error() {
+        let manager = SftpManager::new();
+        let result = manager.upload_file("nonexistent", "/tmp/local.txt", "/remote/file.txt", |_| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
