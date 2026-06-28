@@ -1,6 +1,7 @@
 mod hosts;
 mod port_forwarding;
 mod pty_manager;
+mod sftp;
 mod snippets;
 mod ssh_keys;
 
@@ -12,6 +13,7 @@ use port_forwarding::{
     PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus,
 };
 use pty_manager::{PtyManager, TabInfo};
+use sftp::{SftpConnectRequest, SftpManager, SftpSessionInfo};
 use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +28,7 @@ static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct AppState {
     pty_manager: Mutex<PtyManager>,
     tunnel_manager: TunnelManagerState,
+    sftp_manager: Mutex<SftpManager>,
 }
 
 #[tauri::command]
@@ -295,6 +298,21 @@ fn run_snippet_script(
 }
 
 #[tauri::command]
+fn sftp_connect_sync(
+    state: State<AppState>,
+    request: SftpConnectRequest,
+) -> Result<SftpSessionInfo, String> {
+    let mut manager = state.sftp_manager.lock().unwrap();
+    manager.connect(request)
+}
+
+#[tauri::command]
+fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), String> {
+    let mut manager = state.sftp_manager.lock().unwrap();
+    manager.disconnect(&session_id)
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
@@ -312,6 +330,7 @@ pub fn run() {
         .manage(AppState {
             pty_manager: Mutex::new(PtyManager::new()),
             tunnel_manager: port_forwarding::new_tunnel_manager(),
+            sftp_manager: Mutex::new(SftpManager::new()),
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
@@ -341,6 +360,8 @@ pub fn run() {
             save_snippet,
             remove_snippets,
             run_snippet_script,
+            sftp_connect_sync,
+            sftp_disconnect,
             quit_app,
         ])
         .on_window_event(|window, event| {
