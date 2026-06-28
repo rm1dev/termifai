@@ -298,10 +298,40 @@ fn run_snippet_script(
 }
 
 #[tauri::command]
-fn sftp_connect_sync(
+fn sftp_connect_from_host(
+    app: tauri::AppHandle,
     state: State<AppState>,
-    request: SftpConnectRequest,
+    host_id: String,
+    session_id: String,
 ) -> Result<SftpSessionInfo, String> {
+    // Resolve host
+    let vault = hosts::list_hosts(&app)?;
+    let host = vault
+        .hosts
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| format!("Host '{}' not found", host_id))?;
+
+    // Resolve private key path if host uses key auth
+    let private_key_path = if let Some(key_id) = &host.ssh_key_id {
+        let keys = ssh_keys::list_ssh_keys(&app)?;
+        keys.into_iter()
+            .find(|k| &k.id == key_id)
+            .map(|k| k.private_key_path)
+    } else {
+        None
+    };
+
+    let request = SftpConnectRequest {
+        session_id,
+        hostname: host.hostname.clone(),
+        port: host.port,
+        username: host.user.clone(),
+        password: host.password.clone(),
+        private_key_path,
+        default_remote_path: host.default_sftp_path.clone(),
+    };
+
     let mut manager = state.sftp_manager.lock().unwrap();
     manager.connect(request)
 }
@@ -438,7 +468,7 @@ pub fn run() {
             save_snippet,
             remove_snippets,
             run_snippet_script,
-            sftp_connect_sync,
+            sftp_connect_from_host,
             sftp_disconnect,
             sftp_download,
             sftp_upload,
