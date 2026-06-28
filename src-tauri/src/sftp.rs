@@ -304,6 +304,54 @@ impl SftpManager {
         Ok(())
     }
 
+    pub fn delete_remote(&self, session_id: &str, paths: &[String]) -> Result<(), String> {
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+
+        for path in paths {
+            let p = std::path::Path::new(path);
+            if sftp.unlink(p).is_err() {
+                sftp.rmdir(p).map_err(|e| format!("delete '{}': {}", path, e))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rename_remote(
+        &self,
+        session_id: &str,
+        from_path: &str,
+        to_path: &str,
+    ) -> Result<(), String> {
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+        sftp.rename(
+            std::path::Path::new(from_path),
+            std::path::Path::new(to_path),
+            None,
+        )
+        .map_err(|e| format!("rename '{}' -> '{}': {}", from_path, to_path, e))
+    }
+
+    pub fn mkdir_remote(&self, session_id: &str, path: &str) -> Result<(), String> {
+        let entry = self
+            .sessions
+            .get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+        sftp.mkdir(std::path::Path::new(path), 0o755)
+            .map_err(|e| format!("mkdir '{}': {}", path, e))
+    }
+
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
         self.sessions
             .remove(session_id)
@@ -349,6 +397,30 @@ mod tests {
     fn test_upload_no_session_returns_error() {
         let manager = SftpManager::new();
         let result = manager.upload_file("nonexistent", "/tmp/local.txt", "/remote/file.txt", |_| {});
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_delete_no_session_returns_error() {
+        let manager = SftpManager::new();
+        let result = manager.delete_remote("nonexistent", &["/remote/file.txt".to_string()]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_rename_no_session_returns_error() {
+        let manager = SftpManager::new();
+        let result = manager.rename_remote("nonexistent", "/remote/old.txt", "/remote/new.txt");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn test_mkdir_no_session_returns_error() {
+        let manager = SftpManager::new();
+        let result = manager.mkdir_remote("nonexistent", "/remote/newdir");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
