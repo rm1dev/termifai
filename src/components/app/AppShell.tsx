@@ -99,7 +99,7 @@ import {
   PolarAngleAxis,
 } from "recharts";
 import { OsBadge } from "./icons";
-import type { AppTab, Host, HostGroup, LocalFileEntry, RemoteFileEntry, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind } from "./types";
+import type { AppTab, Host, HostGroup, LocalFileEntry, RemoteFileEntry, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind, TransferProgress } from "./types";
 import { XTerminal } from "./XTerminal";
 import {
   isShortcutMatch,
@@ -4089,6 +4089,62 @@ function SftpView({ tab }: { tab: AppTab }) {
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
 
+  const [selectedLocal, setSelectedLocal] = useState<string | null>(null);
+  const [selectedRemote, setSelectedRemote] = useState<string | null>(null);
+  const [transferProgress, setTransferProgress] = useState<TransferProgress | null>(null);
+  const [transferError, setTransferError] = useState<string | null>(null);
+
+  // Listen for progress events
+  useEffect(() => {
+    if (!isConnected) return;
+    const unlisten = listen<TransferProgress>(`sftp:${sftpSessionId}:progress`, (event) => {
+      setTransferProgress(event.payload);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [isConnected, sftpSessionId]);
+
+  const handleDownload = async () => {
+    if (!selectedRemote) return;
+    const fileName = selectedRemote.split("/").pop() ?? "file";
+    const localDest = `${localPath}/${fileName}`;
+    setTransferError(null);
+    setTransferProgress(null);
+    try {
+      await invoke("sftp_download", {
+        sessionId: sftpSessionId,
+        remotePath: selectedRemote,
+        localPath: localDest,
+      });
+      setTransferProgress(null);
+      await loadLocalDir(localPath);
+    } catch (e) {
+      setTransferError(String(e));
+      setTransferProgress(null);
+    }
+  };
+
+  const handleUpload = async () => {
+    if (!selectedLocal) return;
+    const fileName = selectedLocal.split("/").pop() ?? "file";
+    const remoteDest = `${remotePath}/${fileName}`;
+    setTransferError(null);
+    setTransferProgress(null);
+    try {
+      await invoke("sftp_upload", {
+        sessionId: sftpSessionId,
+        localPath: selectedLocal,
+        remotePath: remoteDest,
+      });
+      setTransferProgress(null);
+      await loadRemoteDir(remotePath);
+    } catch (e) {
+      setTransferError(String(e));
+      setTransferProgress(null);
+    }
+  };
+
   const handleConnect = async () => {
     if (!tab.sftpHostId) return;
     setIsConnecting(true);
@@ -4158,7 +4214,33 @@ function SftpView({ tab }: { tab: AppTab }) {
   const localPathParts = localPath.split("/").filter(Boolean);
 
   return (
-    <div className="flex h-full min-h-0 flex-1">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
+      {/* Transfer progress bar */}
+      {(transferProgress || transferError) && (
+        <div className="flex h-9 items-center gap-3 border-b border-border bg-[var(--color-surface-2)] px-4 text-xs">
+          {transferError ? (
+            <span className="text-red-400">{transferError}</span>
+          ) : transferProgress ? (
+            <>
+              <span className="text-muted-foreground">{transferProgress.file_name}</span>
+              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-border">
+                <div
+                  className="h-full rounded-full bg-[var(--color-brand-cyan)] transition-all"
+                  style={{
+                    width: transferProgress.total_bytes > 0
+                      ? `${Math.round((transferProgress.bytes_transferred / transferProgress.total_bytes) * 100)}%`
+                      : "0%",
+                  }}
+                />
+              </div>
+              <span className="text-muted-foreground">
+                {formatBytes(transferProgress.bytes_transferred)} / {formatBytes(transferProgress.total_bytes)}
+              </span>
+            </>
+          ) : null}
+        </div>
+      )}
+      <div className="flex min-h-0 flex-1">
       {/* Local pane */}
       <div className="flex min-w-0 flex-1 flex-col border-r border-border">
         <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4">
@@ -4224,7 +4306,12 @@ function SftpView({ tab }: { tab: AppTab }) {
               {localFiles.map((f) => (
                 <div
                   key={f.path}
-                  className="grid grid-cols-[1fr_180px_100px_80px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
+                  className={`grid grid-cols-[1fr_180px_100px_80px] cursor-pointer items-center px-4 py-2 text-sm ${
+                    selectedLocal === f.path
+                      ? "bg-[var(--color-brand-cyan)]/10 ring-1 ring-inset ring-[var(--color-brand-cyan)]/20"
+                      : "hover:bg-[var(--color-surface)]"
+                  }`}
+                  onClick={() => setSelectedLocal(f.path)}
                   onDoubleClick={() => {
                     if (f.is_dir) void loadLocalDir(f.path);
                   }}
@@ -4243,6 +4330,26 @@ function SftpView({ tab }: { tab: AppTab }) {
             </>
           )}
         </div>
+      </div>
+
+      {/* Transfer actions strip */}
+      <div className="flex w-12 flex-col items-center justify-center gap-3 border-r border-border bg-[var(--color-surface)]">
+        <button
+          className="rounded p-1.5 text-xs text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30"
+          title="Download to local"
+          disabled={!isConnected || !selectedRemote}
+          onClick={() => void handleDownload()}
+        >
+          ↓
+        </button>
+        <button
+          className="rounded p-1.5 text-xs text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30"
+          title="Upload to remote"
+          disabled={!isConnected || !selectedLocal}
+          onClick={() => void handleUpload()}
+        >
+          ↑
+        </button>
       </div>
 
       {/* Remote pane */}
@@ -4363,7 +4470,12 @@ function SftpView({ tab }: { tab: AppTab }) {
                   {remoteFiles.map((f) => (
                     <div
                       key={f.path}
-                      className="grid grid-cols-[1fr_160px_90px_70px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
+                      className={`grid grid-cols-[1fr_160px_90px_70px] cursor-pointer items-center px-4 py-2 text-sm ${
+                        selectedRemote === f.path
+                          ? "bg-[oklch(0.45_0.12_145)]/10 ring-1 ring-inset ring-[oklch(0.45_0.12_145)]/20"
+                          : "hover:bg-[var(--color-surface)]"
+                      }`}
+                      onClick={() => setSelectedRemote(f.path)}
                       onDoubleClick={() => {
                         if (f.is_dir) void loadRemoteDir(f.path);
                       }}
@@ -4391,6 +4503,7 @@ function SftpView({ tab }: { tab: AppTab }) {
             </div>
           </>
         )}
+      </div>
       </div>
     </div>
   );
