@@ -47,6 +47,9 @@ export interface AppTab {
   connectionLabel?: string;
   connectionTitle?: string;
   hostId?: string; // present for SSH host tabs — used to distinguish from local terminal
+  // SFTP-specific fields
+  sftpSessionId?: string;     // backend SFTP session ID once connected
+  sftpHostId?: string;        // which host this SFTP tab is for
 }
 
 export type SnippetKind = "text" | "command" | "script";
@@ -112,4 +115,29 @@ export interface TunnelStatus {
   active: boolean;
   pid?: number | null;
   error?: string | null;
+}
+
+export interface LocalFileEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  size: number | null;
+  modified: string | null;
+}
+
+export interface RemoteFileEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  is_symlink: boolean;
+  size: number | null;
+  permissions: number | null;
+  modified: string | null;
+}
+
+export interface TransferProgress {
+  session_id: string;
+  file_name: string;
+  bytes_transferred: number;
+  total_bytes: number;
 }
