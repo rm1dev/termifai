@@ -2167,6 +2167,7 @@ function HostsView({
                 onEditHost={setEditingHost}
                 onDeleteHost={setRemovingHostId}
                 onConnectHost={onConnectHost}
+                onOpenSftp={onNewSftp}
               />
             ))}
 
@@ -2178,6 +2179,7 @@ function HostsView({
               onConnectHost={onConnectHost}
               onEditHost={setEditingHost}
               onDeleteHost={setRemovingHostId}
+              onOpenSftp={onNewSftp}
             />
           </>
         )}
@@ -2221,7 +2223,7 @@ function HostsView({
 
 /* ---- Group rendering (recursive) ---- */
 function GroupNode({
-  group, depth, groups, hosts, viewMode, collapsed, onToggle, onAddSubgroup, onAddHost, onEditGroup, onDeleteGroup, onEditHost, onDeleteHost, onConnectHost,
+  group, depth, groups, hosts, viewMode, collapsed, onToggle, onAddSubgroup, onAddHost, onEditGroup, onDeleteGroup, onEditHost, onDeleteHost, onConnectHost, onOpenSftp,
 }: {
   group: HostGroup;
   depth: number;
@@ -2237,6 +2239,7 @@ function GroupNode({
   onEditHost: (host: Host) => void;
   onDeleteHost: (id: string) => void;
   onConnectHost: (host: Host) => void;
+  onOpenSftp?: (host: Host) => void;
 }) {
   const isOpen = !collapsed[group.id];
   const children = groups.filter((g) => g.parentId === group.id);
@@ -2307,6 +2310,7 @@ function GroupNode({
               onEditHost={onEditHost}
               onDeleteHost={onDeleteHost}
               onConnectHost={onConnectHost}
+              onOpenSftp={onOpenSftp}
             />
           ))}
           {groupHosts.length > 0 && (
@@ -2317,6 +2321,7 @@ function GroupNode({
               onConnectHost={onConnectHost}
               onEditHost={onEditHost}
               onDeleteHost={onDeleteHost}
+              onOpenSftp={onOpenSftp}
             />
           )}
         </div>
@@ -2332,6 +2337,7 @@ function HostsList({
   onConnectHost,
   onEditHost,
   onDeleteHost,
+  onOpenSftp,
 }: {
   hosts: Host[];
   viewMode: "grid" | "list";
@@ -2339,6 +2345,7 @@ function HostsList({
   onConnectHost: (host: Host) => void;
   onEditHost: (host: Host) => void;
   onDeleteHost: (id: string) => void;
+  onOpenSftp?: (host: Host) => void;
 }) {
   if (hosts.length === 0 && query) {
     return (
@@ -2367,6 +2374,15 @@ function HostsList({
               <div className="truncate text-xs text-muted-foreground">ssh, {h.user}</div>
             </div>
             <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+              {onOpenSftp && (
+                <button
+                  title="Open SFTP"
+                  onClick={(e) => { e.stopPropagation(); onOpenSftp(h); }}
+                  className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-[var(--color-brand-cyan)]"
+                >
+                  <Folder className="h-3.5 w-3.5" />
+                </button>
+              )}
               <button
                 title="Edit"
                 onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
@@ -2405,6 +2421,15 @@ function HostsList({
             <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}</div>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            {onOpenSftp && (
+              <button
+                title="Open SFTP"
+                onClick={(e) => { e.stopPropagation(); onOpenSftp(h); }}
+                className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-[var(--color-brand-cyan)] group-hover:opacity-100"
+              >
+                <Folder className="h-3.5 w-3.5" />
+              </button>
+            )}
             <button
               title="Edit"
               onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
