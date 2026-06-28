@@ -99,7 +99,7 @@ import {
   PolarAngleAxis,
 } from "recharts";
 import { OsBadge } from "./icons";
-import type { AppTab, Host, HostGroup, LocalFileEntry, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind } from "./types";
+import type { AppTab, Host, HostGroup, LocalFileEntry, RemoteFileEntry, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind } from "./types";
 import { XTerminal } from "./XTerminal";
 import {
   isShortcutMatch,
@@ -4080,6 +4080,62 @@ function SftpView({ tab }: { tab: AppTab }) {
   const [localLoading, setLocalLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
 
+  const [sftpSessionId] = useState(() => `sftp-${tab.id}-${Date.now()}`);
+  const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [connectError, setConnectError] = useState<string | null>(null);
+  const [remotePath, setRemotePath] = useState("/");
+  const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
+  const [remoteLoading, setRemoteLoading] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+
+  const handleConnect = async () => {
+    if (!tab.sftpHostId) return;
+    setIsConnecting(true);
+    setConnectError(null);
+    try {
+      const info = await invoke<{ session_id: string; remote_path: string }>(
+        "sftp_connect_from_host",
+        { hostId: tab.sftpHostId, sessionId: sftpSessionId }
+      );
+      setIsConnected(true);
+      await loadRemoteDir(info.remote_path);
+    } catch (e) {
+      setConnectError(String(e));
+    } finally {
+      setIsConnecting(false);
+    }
+  };
+
+  const loadRemoteDir = async (path: string) => {
+    setRemoteLoading(true);
+    setRemoteError(null);
+    try {
+      const files = await invoke<RemoteFileEntry[]>("sftp_list_remote", {
+        sessionId: sftpSessionId,
+        path,
+      });
+      setRemoteFiles(files);
+      setRemotePath(path);
+    } catch (e) {
+      setRemoteError(String(e));
+    } finally {
+      setRemoteLoading(false);
+    }
+  };
+
+  // Auto-connect on mount if hostId is set
+  useEffect(() => {
+    if (tab.sftpHostId && !isConnected) {
+      void handleConnect();
+    }
+    return () => {
+      if (isConnected) {
+        void invoke("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
+      }
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   const loadLocalDir = async (path: string) => {
     setLocalLoading(true);
     setLocalError(null);
@@ -4189,14 +4245,152 @@ function SftpView({ tab }: { tab: AppTab }) {
         </div>
       </div>
 
-      {/* Remote pane — placeholder until Task 9 */}
+      {/* Remote pane */}
       <div className="flex w-[42%] min-w-[320px] flex-col">
-        <div className="flex h-11 items-center border-b border-border bg-[var(--color-surface)] px-4 text-sm">
-          <span className="text-muted-foreground">Remote</span>
+        <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <span className="flex h-5 w-5 items-center justify-center rounded bg-[oklch(0.45_0.12_145)]">
+              <Folder className="h-3 w-3 text-white" />
+            </span>
+            Remote
+          </div>
+          {isConnected && (
+            <button
+              className="text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => {
+                void invoke("sftp_disconnect", { sessionId: sftpSessionId });
+                setIsConnected(false);
+                setRemoteFiles([]);
+              }}
+            >
+              Disconnect
+            </button>
+          )}
         </div>
-        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
-          Remote pane coming in next task
-        </div>
+
+        {/* Not connected state */}
+        {!isConnected && !isConnecting && (
+          <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-[var(--color-surface-2)]">
+              <Folder className="h-6 w-6 text-muted-foreground" />
+            </div>
+            {connectError ? (
+              <>
+                <h3 className="mt-5 text-base font-semibold text-red-400">Connection failed</h3>
+                <p className="mt-1 max-w-xs text-xs text-muted-foreground">{connectError}</p>
+                <button
+                  className="mt-5 rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-foreground hover:bg-white/5"
+                  onClick={() => void handleConnect()}
+                >
+                  Retry
+                </button>
+              </>
+            ) : (
+              <>
+                <h3 className="mt-5 text-base font-semibold">Connect to host</h3>
+                <p className="mt-1 max-w-xs text-sm text-muted-foreground">
+                  Start by connecting to a saved host to manage your files with SFTP.
+                </p>
+                <button
+                  className="mt-5 rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-foreground hover:bg-white/5"
+                  onClick={() => void handleConnect()}
+                >
+                  Connect
+                </button>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Connecting spinner */}
+        {isConnecting && (
+          <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+            Connecting...
+          </div>
+        )}
+
+        {/* Connected file browser */}
+        {isConnected && (
+          <>
+            {/* Breadcrumb */}
+            <div className="flex items-center gap-1 border-b border-border px-4 py-2 text-xs text-muted-foreground overflow-x-auto">
+              <button className="hover:text-foreground" onClick={() => void loadRemoteDir("/")}>
+                /
+              </button>
+              {remotePath.split("/").filter(Boolean).map((part, i, arr) => {
+                const partPath = "/" + arr.slice(0, i + 1).join("/");
+                return (
+                  <span key={partPath} className="flex items-center gap-1">
+                    <span className="opacity-40">›</span>
+                    <button className="hover:text-foreground" onClick={() => void loadRemoteDir(partPath)}>
+                      {part}
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+
+            {/* Column headers */}
+            <div className="grid grid-cols-[1fr_160px_90px_70px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
+              <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
+            </div>
+
+            {/* File list */}
+            <div className="flex-1 overflow-y-auto">
+              {remoteLoading && (
+                <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
+              )}
+              {remoteError && (
+                <div className="px-4 py-8 text-center text-sm text-red-400">{remoteError}</div>
+              )}
+              {!remoteLoading && !remoteError && (
+                <>
+                  {remotePath !== "/" && (
+                    <div
+                      className="grid grid-cols-[1fr_160px_90px_70px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
+                      onDoubleClick={() => {
+                        const parent = remotePath.split("/").slice(0, -1).join("/") || "/";
+                        void loadRemoteDir(parent);
+                      }}
+                    >
+                      <div className="flex items-center gap-2 text-muted-foreground">
+                        <Folder className="h-4 w-4 text-[oklch(0.65_0.12_145)]" />
+                        ..
+                      </div>
+                      <div /><div /><div />
+                    </div>
+                  )}
+                  {remoteFiles.map((f) => (
+                    <div
+                      key={f.path}
+                      className="grid grid-cols-[1fr_160px_90px_70px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
+                      onDoubleClick={() => {
+                        if (f.is_dir) void loadRemoteDir(f.path);
+                      }}
+                    >
+                      <div className="flex items-center gap-2 text-foreground">
+                        <Folder
+                          className={`h-4 w-4 ${
+                            f.is_dir ? "text-[oklch(0.65_0.12_145)]" : "text-muted-foreground"
+                          }`}
+                        />
+                        {f.name}
+                        {f.is_symlink && <span className="text-[10px] text-muted-foreground">→</span>}
+                      </div>
+                      <div className="text-xs text-muted-foreground">{f.modified ?? "—"}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {f.size != null ? formatBytes(f.size) : "—"}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {f.is_symlink ? "symlink" : f.is_dir ? "folder" : "file"}
+                      </div>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
