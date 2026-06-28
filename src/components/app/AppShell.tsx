@@ -198,11 +198,11 @@ export function AppShell() {
     setActiveTab(id);
   };
 
-  const openSftpSession = (host: Host) => {
-    const id = `t-sftp-${host.id}-${Date.now()}`;
-    const baseTitle = host.name || host.hostname;
+  const openSftpSession = (host?: Host) => {
+    const id = host ? `t-sftp-${host.id}-${Date.now()}` : `t-sftp-${Date.now()}`;
+    const baseTitle = host ? (host.name || host.hostname) : "SFTP";
     setTabs((currentTabs) => {
-      const existingCount = currentTabs.filter((t) => t.sftpHostId === host.id).length;
+      const existingCount = host ? currentTabs.filter((t) => t.sftpHostId === host.id).length : 0;
       const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
       return [
         ...currentTabs,
@@ -211,7 +211,7 @@ export function AppShell() {
           kind: "sftp" as const,
           title,
           closable: true,
-          sftpHostId: host.id,
+          sftpHostId: host?.id,
         },
       ];
     });
@@ -399,7 +399,7 @@ export function AppShell() {
                 <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
                 <main className="flex min-w-0 flex-1 flex-col">
                   {activeSidebar === "dashboard" && <DashboardView />}
-                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
+                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
                   {activeSidebar === "port-forwarding" && <PortForwardingView />}
                   {activeSidebar === "snippets" && <SnippetsView />}
                   {activeSidebar === "ssh-keys" && <SshKeysView />}
@@ -1882,7 +1882,7 @@ function HostsView({
   onConnectHost,
 }: {
   onNewTerminal?: () => void;
-  onNewSftp?: (host: Host) => void;
+  onNewSftp?: (host?: Host) => void;
   onConnectHost: (host: Host) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -2041,7 +2041,7 @@ function HostsView({
               { label: "New group", icon: <FolderPlus className="h-3.5 w-3.5" />, onClick: () => setGroupModal({ open: true, parentId: null }) },
             ]}
           />
-          {/* <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={onNewSftp} /> */}{/* temporarily hidden */}
+          {onNewSftp && <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={() => onNewSftp()} />}
           <ToolbarButton icon={<TerminalSquare className="h-4 w-4" />} label="Terminal" onClick={onNewTerminal} />
         </div>
         <div className="flex items-center gap-1">
@@ -4106,6 +4106,9 @@ function SftpView({ tab }: { tab: AppTab }) {
   const [localError, setLocalError] = useState<string | null>(null);
 
   const [sftpSessionId] = useState(() => `sftp-${tab.id}-${Date.now()}`);
+  const [pickedHostId, setPickedHostId] = useState<string | undefined>(tab.sftpHostId);
+  const [allHosts, setAllHosts] = useState<Host[]>([]);
+  const [hostQuery, setHostQuery] = useState("");
   const [isConnected, setIsConnected] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
@@ -4113,6 +4116,15 @@ function SftpView({ tab }: { tab: AppTab }) {
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
+
+  // Load hosts for picker (only when no host is pre-selected)
+  useEffect(() => {
+    if (!tab.sftpHostId) {
+      invoke<{ hosts: Host[] }>("list_hosts")
+        .then((v) => setAllHosts(v.hosts))
+        .catch(() => {});
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const [selectedLocal, setSelectedLocal] = useState<string | null>(null);
   const [selectedRemote, setSelectedRemote] = useState<string | null>(null);
@@ -4170,14 +4182,16 @@ function SftpView({ tab }: { tab: AppTab }) {
     }
   };
 
-  const handleConnect = async () => {
-    if (!tab.sftpHostId) return;
+  const handleConnect = async (hostId?: string) => {
+    const targetHostId = hostId ?? pickedHostId;
+    if (!targetHostId) return;
+    if (hostId) setPickedHostId(hostId);
     setIsConnecting(true);
     setConnectError(null);
     try {
       const info = await invoke<{ session_id: string; remote_path: string }>(
         "sftp_connect_from_host",
-        { hostId: tab.sftpHostId, sessionId: sftpSessionId }
+        { hostId: targetHostId, sessionId: sftpSessionId }
       );
       setIsConnected(true);
       await loadRemoteDir(info.remote_path);
@@ -4205,7 +4219,7 @@ function SftpView({ tab }: { tab: AppTab }) {
     }
   };
 
-  // Auto-connect on mount if hostId is set
+  // Auto-connect on mount if hostId is pre-set
   useEffect(() => {
     if (tab.sftpHostId && !isConnected) {
       void handleConnect();
@@ -4402,36 +4416,86 @@ function SftpView({ tab }: { tab: AppTab }) {
 
         {/* Not connected state */}
         {!isConnected && !isConnecting && (
-          <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-            <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-[var(--color-surface-2)]">
-              <Folder className="h-6 w-6 text-muted-foreground" />
+          pickedHostId ? (
+            /* Has a host but not connected yet (or connection failed) */
+            <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
+              <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-[var(--color-surface-2)]">
+                <Folder className="h-6 w-6 text-muted-foreground" />
+              </div>
+              {connectError ? (
+                <>
+                  <h3 className="mt-5 text-base font-semibold text-red-400">Connection failed</h3>
+                  <p className="mt-1 max-w-xs text-xs text-muted-foreground">{connectError}</p>
+                  <div className="mt-5 flex gap-2">
+                    <button
+                      className="rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-foreground hover:bg-white/5"
+                      onClick={() => void handleConnect()}
+                    >
+                      Retry
+                    </button>
+                    <button
+                      className="rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-muted-foreground hover:bg-white/5"
+                      onClick={() => { setPickedHostId(undefined); setConnectError(null); }}
+                    >
+                      Change host
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <h3 className="mt-5 text-base font-semibold">Connect to host</h3>
+                  <button
+                    className="mt-4 rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-foreground hover:bg-white/5"
+                    onClick={() => void handleConnect()}
+                  >
+                    Connect
+                  </button>
+                </>
+              )}
             </div>
-            {connectError ? (
-              <>
-                <h3 className="mt-5 text-base font-semibold text-red-400">Connection failed</h3>
-                <p className="mt-1 max-w-xs text-xs text-muted-foreground">{connectError}</p>
-                <button
-                  className="mt-5 rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-foreground hover:bg-white/5"
-                  onClick={() => void handleConnect()}
-                >
-                  Retry
-                </button>
-              </>
-            ) : (
-              <>
-                <h3 className="mt-5 text-base font-semibold">Connect to host</h3>
-                <p className="mt-1 max-w-xs text-sm text-muted-foreground">
-                  Start by connecting to a saved host to manage your files with SFTP.
-                </p>
-                <button
-                  className="mt-5 rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-foreground hover:bg-white/5"
-                  onClick={() => void handleConnect()}
-                >
-                  Connect
-                </button>
-              </>
-            )}
-          </div>
+          ) : (
+            /* No host selected — show picker */
+            <div className="flex flex-1 flex-col overflow-hidden">
+              <div className="border-b border-border px-4 py-3">
+                <p className="mb-2 text-xs text-muted-foreground">Select a host to connect</p>
+                <div className="flex items-center gap-2 rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-1.5">
+                  <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                  <input
+                    className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                    placeholder="Search hosts..."
+                    value={hostQuery}
+                    onChange={(e) => setHostQuery(e.target.value)}
+                    autoFocus
+                  />
+                </div>
+              </div>
+              <div className="flex-1 overflow-y-auto">
+                {allHosts.length === 0 && (
+                  <div className="px-4 py-8 text-center text-xs text-muted-foreground">No saved hosts</div>
+                )}
+                {allHosts
+                  .filter((h) => {
+                    const q = hostQuery.toLowerCase();
+                    return !q || h.name.toLowerCase().includes(q) || h.hostname.toLowerCase().includes(q) || h.user.toLowerCase().includes(q);
+                  })
+                  .map((h) => (
+                    <button
+                      key={h.id}
+                      className="flex w-full items-center gap-3 border-b border-border px-4 py-2.5 text-left hover:bg-[var(--color-surface)]"
+                      onClick={() => void handleConnect(h.id)}
+                    >
+                      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[var(--color-surface-2)]">
+                        <Server className="h-3.5 w-3.5 text-muted-foreground" />
+                      </div>
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-medium text-foreground">{h.name || h.hostname}</div>
+                        <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}:{h.port}</div>
+                      </div>
+                    </button>
+                  ))}
+              </div>
+            </div>
+          )
         )}
 
         {/* Connecting spinner */}
