@@ -403,6 +403,10 @@ impl SftpManager {
         use std::io::Read;
         channel.read_to_string(&mut output).map_err(|e| format!("Read output: {}", e))?;
         channel.wait_close().map_err(|e| format!("Channel close: {}", e))?;
+        let status = channel.exit_status().map_err(|e| format!("Exit status: {}", e))?;
+        if status != 0 {
+            return Err(format!("Command '{}' exited with status {}", cmd, status));
+        }
         Ok(output)
     }
 
