@@ -1,5 +1,9 @@
 use serde::Serialize;
+use ssh2::Session;
 use std::collections::HashMap;
+use std::io::Read as IoRead;
+use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 // ─── Public types emitted to frontend ────────────────────────────────────────
 
@@ -295,6 +299,320 @@ pub(crate) fn parse_container_cgroup(
 
     let next_cpu = if cpu_usage_ns > 0 { Some(cpu_usage_ns) } else { None };
     (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu)
+}
+
+// ─── Actor types ─────────────────────────────────────────────────────────────
+
+pub(crate) enum ActorCmd {
+    /// Poll system + docker + processes
+    Poll {
+        want_detail: bool,
+        reply: tokio::sync::oneshot::Sender<HostPollResult>,
+    },
+    Disconnect,
+}
+
+pub struct HostActor {
+    pub(crate) tx: std::sync::mpsc::SyncSender<ActorCmd>,
+}
+
+// ─── SSH helpers ──────────────────────────────────────────────────────────────
+
+fn ssh_connect(
+    hostname: &str,
+    port: u16,
+    user: &str,
+    password: Option<&str>,
+    key_path: Option<&std::path::Path>,
+) -> Result<Session, String> {
+    let addr = format!("{}:{}", hostname, port);
+    let tcp = TcpStream::connect(&addr)
+        .map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
+    tcp.set_read_timeout(Some(Duration::from_secs(15))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(15))).ok();
+
+    let mut session = Session::new()
+        .map_err(|e| format!("SSH session init: {}", e))?;
+    session.set_tcp_stream(tcp);
+    session.handshake()
+        .map_err(|e| format!("SSH handshake: {}", e))?;
+
+    if let Some(key) = key_path {
+        session.userauth_pubkey_file(user, None, key, None)
+            .map_err(|e| format!("Key auth: {}", e))?;
+    } else if let Some(pw) = password {
+        session.userauth_password(user, pw)
+            .map_err(|e| format!("Password auth: {}", e))?;
+    } else {
+        session.userauth_agent(user)
+            .map_err(|e| format!("Agent auth: {}", e))?;
+    }
+
+    if !session.authenticated() {
+        return Err("Authentication failed".to_string());
+    }
+
+    // keepalive every 15s — prevents NAT timeout
+    session.set_keepalive(true, 15);
+    Ok(session)
+}
+
+fn exec_cmd(session: &Session, cmd: &str) -> Result<String, String> {
+    let mut ch = session.channel_session()
+        .map_err(|e| format!("Channel open: {}", e))?;
+    ch.exec(cmd)
+        .map_err(|e| format!("Exec '{}': {}", &cmd[..cmd.len().min(40)], e))?;
+    let mut out = String::new();
+    ch.read_to_string(&mut out)
+        .map_err(|e| format!("Read channel: {}", e))?;
+    ch.wait_close().ok();
+    Ok(out)
+}
+
+// ─── Actor internals ──────────────────────────────────────────────────────────
+
+struct ActorState {
+    session: Session,
+    prev_cpu: Option<CpuSnapshot>,
+    prev_net: Option<(u64, u64)>,
+    prev_container_cpu: HashMap<String, u64>,  // container_id → cpu_ns
+    prev_container_net: HashMap<String, (u64, u64)>,
+    has_docker: Option<bool>,
+    last_poll: Option<Instant>,
+}
+
+fn run_actor(
+    host_id: String,
+    hostname: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key_path: Option<std::path::PathBuf>,
+    rx: std::sync::mpsc::Receiver<ActorCmd>,
+) {
+    // Initial connection
+    let session = match ssh_connect(&hostname, port, &user, password.as_deref(), key_path.as_deref()) {
+        Ok(s) => s,
+        Err(e) => {
+            // Drain all pending commands with error
+            while let Ok(cmd) = rx.try_recv() {
+                if let ActorCmd::Poll { reply, .. } = cmd {
+                    let _ = reply.send(HostPollResult {
+                        host_id: host_id.clone(), ok: false,
+                        system: None, containers: None, processes: None,
+                        error: Some(e.clone()),
+                    });
+                }
+            }
+            return;
+        }
+    };
+
+    let mut state = ActorState {
+        session,
+        prev_cpu: None,
+        prev_net: None,
+        prev_container_cpu: HashMap::new(),
+        prev_container_net: HashMap::new(),
+        has_docker: None,
+        last_poll: None,
+    };
+
+    loop {
+        // recv_timeout → send keepalive if idle for 10s
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(ActorCmd::Disconnect) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // keepalive — no poll
+                state.session.keepalive_send().ok();
+                continue;
+            }
+
+            Ok(ActorCmd::Poll { want_detail, reply }) => {
+                let now = Instant::now();
+                let poll_secs = state.last_poll.map(|t| t.elapsed().as_secs_f64()).unwrap_or(30.0);
+                state.last_poll = Some(now);
+
+                let result = do_poll(&mut state, &host_id, want_detail, poll_secs);
+
+                // If session died, attempt one reconnect and retry
+                let result = if result.is_err() {
+                    match ssh_connect(&hostname, port, &user, password.as_deref(), key_path.as_deref()) {
+                        Ok(new_session) => {
+                            state.session = new_session;
+                            state.prev_cpu = None;
+                            state.prev_net = None;
+                            do_poll(&mut state, &host_id, want_detail, poll_secs)
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    result
+                };
+
+                let payload = match result {
+                    Ok(r) => r,
+                    Err(e) => HostPollResult {
+                        host_id: host_id.clone(), ok: false,
+                        system: None, containers: None, processes: None,
+                        error: Some(e),
+                    },
+                };
+                let _ = reply.send(payload);
+            }
+        }
+    }
+}
+
+fn do_poll(state: &mut ActorState, host_id: &str, want_detail: bool, poll_secs: f64) -> Result<HostPollResult, String> {
+    // System metrics — single channel, single cat
+    let sys_raw = exec_cmd(
+        &state.session,
+        "cat /proc/stat /proc/meminfo /proc/loadavg /proc/uptime /proc/net/dev",
+    )?;
+
+    let (mut system, new_cpu, new_net) =
+        parse_proc_output(&sys_raw, state.prev_cpu.as_ref(), state.prev_net, poll_secs);
+    state.prev_cpu = Some(new_cpu);
+    state.prev_net = Some(new_net);
+
+    // IP from hostname -I
+    if let Ok(ip_raw) = exec_cmd(&state.session, "hostname -I 2>/dev/null | awk '{print $1}'") {
+        system.ip = ip_raw.trim().to_string();
+    }
+
+    // Docker detection — done once and cached
+    if state.has_docker.is_none() {
+        state.has_docker = Some(
+            exec_cmd(&state.session, "command -v docker >/dev/null 2>&1 && echo yes || echo no")
+                .map(|o| o.trim() == "yes")
+                .unwrap_or(false),
+        );
+    }
+
+    let containers = if state.has_docker == Some(true) {
+        Some(collect_docker_metrics(state, poll_secs)?)
+    } else {
+        None
+    };
+
+    let processes = if want_detail {
+        Some(collect_processes(state)?)
+    } else {
+        None
+    };
+
+    Ok(HostPollResult {
+        host_id: host_id.to_string(),
+        ok: true,
+        system: Some(system),
+        containers,
+        processes,
+        error: None,
+    })
+}
+
+fn collect_docker_metrics(state: &mut ActorState, poll_secs: f64) -> Result<Vec<ContainerMetric>, String> {
+    let ps_raw = exec_cmd(
+        &state.session,
+        r#"docker ps -a --no-trunc --format '{"id":"{{.ID}}","name":"{{.Names}}","state":"{{.State}}"}' 2>/dev/null || echo '__nodock__'"#,
+    )?;
+
+    if ps_raw.contains("__nodock__") {
+        state.has_docker = Some(false);
+        return Ok(vec![]);
+    }
+
+    let container_list = parse_docker_ps(&ps_raw);
+    let mut result = Vec::new();
+
+    for (id, name, container_state) in &container_list {
+        if container_state != "running" {
+            result.push(ContainerMetric {
+                id: id.clone(), name: name.clone(), state: container_state.clone(),
+                cpu_pct: 0.0, mem_used_bytes: 0, mem_limit_bytes: 0,
+                net_rx_rate: 0.0, net_tx_rate: 0.0,
+            });
+            continue;
+        }
+
+        // Get PID via docker inspect, then read cgroup + network from /proc/<pid>/
+        let cgroup_cmd = format!(
+            r#"pid=$(docker inspect --format '{{{{.State.Pid}}}}' {id} 2>/dev/null); \
+[ -z "$pid" ] || [ "$pid" = "0" ] || {{ \
+  cgpath=$(awk -F: 'NR==1{{print $3}}' /proc/$pid/cgroup 2>/dev/null); \
+  echo "PID=$pid"; \
+  cat /sys/fs/cgroup$cgpath/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/docker/{id}/memory.usage_in_bytes 2>/dev/null || echo 0; \
+  cat /sys/fs/cgroup$cgpath/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/docker/{id}/memory.limit_in_bytes 2>/dev/null || echo 0; \
+  grep '^usage_usec\|^usage ' /sys/fs/cgroup$cgpath/cpu.stat 2>/dev/null || cat /sys/fs/cgroup/cpu/docker/{id}/cpuacct.usage 2>/dev/null || echo 'usage 0'; \
+  cat /proc/$pid/net/dev 2>/dev/null; \
+}}"#,
+            id = id
+        );
+
+        let cgroup_raw = exec_cmd(&state.session, &cgroup_cmd).unwrap_or_default();
+
+        let prev_cpu_ns = state.prev_container_cpu.get(id).copied();
+        let prev_net = state.prev_container_net.get(id).copied();
+
+        let (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu) =
+            parse_container_cgroup(&cgroup_raw, prev_cpu_ns, prev_net, poll_secs);
+
+        if let Some(ns) = next_cpu {
+            state.prev_container_cpu.insert(id.clone(), ns);
+        }
+
+        result.push(ContainerMetric {
+            id: id.clone(), name: name.clone(), state: container_state.clone(),
+            cpu_pct, mem_used_bytes: mem_used, mem_limit_bytes: mem_limit,
+            net_rx_rate: rx_rate, net_tx_rate: tx_rate,
+        });
+    }
+
+    Ok(result)
+}
+
+fn collect_processes(state: &mut ActorState) -> Result<Vec<ProcessInfo>, String> {
+    let raw = exec_cmd(
+        &state.session,
+        "ps -eo pid,comm,user,%cpu,%mem --no-headers --sort=-%cpu 2>/dev/null | head -20",
+    )?;
+
+    Ok(raw.lines()
+        .filter_map(|line| {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() < 5 { return None; }
+            Some(ProcessInfo {
+                pid: p[0].parse().unwrap_or(0),
+                name: p[1].to_string(),
+                user: p[2].to_string(),
+                cpu_pct: p[3].parse().unwrap_or(0.0),
+                mem_kb: p[4].parse().unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+// ─── Public spawn function ────────────────────────────────────────────────────
+
+pub fn spawn_host_actor(
+    host_id: String,
+    hostname: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key_path: Option<std::path::PathBuf>,
+) -> HostActor {
+    // SyncSender with buffer=4 — prevents blocking Tauri commands
+    let (tx, rx) = std::sync::mpsc::sync_channel::<ActorCmd>(4);
+
+    std::thread::Builder::new()
+        .name(format!("dashboard-{}", host_id))
+        .spawn(move || run_actor(host_id, hostname, port, user, password, key_path, rx))
+        .expect("dashboard actor thread spawn");
+
+    HostActor { tx }
 }
 
 #[cfg(test)]
