@@ -80,6 +80,10 @@ pub fn list_local(path: &str) -> Result<Vec<LocalFileEntry>, String> {
     Ok(entries)
 }
 
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn format_unix_timestamp(secs: u64) -> String {
     let secs = secs as i64;
     let (y, mo, d, h, mi) = unix_to_ymd_hm(secs);
@@ -418,7 +422,7 @@ impl SftpManager {
             .map_err(|e| format!("stat '{}': {}", path, e))?;
         let permissions = stat.perm.unwrap_or(0) & 0o7777;
         // get owner/group via SSH exec since libssh2 stat doesn't return names
-        let owner_out = self.exec_command(session_id, &format!("stat -c '%U %G' \"{}\" 2>/dev/null || echo 'root root'", path))?;
+        let owner_out = self.exec_command(session_id, &format!("stat -c '%U %G' {} 2>/dev/null || echo 'root root'", shell_escape(path)))?;
         let parts: Vec<&str> = owner_out.trim().splitn(2, ' ').collect();
         let owner = parts.first().unwrap_or(&"root").to_string();
         let group = parts.get(1).unwrap_or(&"root").to_string();
@@ -426,22 +430,30 @@ impl SftpManager {
     }
 
     pub fn chmod(&self, session_id: &str, path: &str, mode: &str, recursive: bool) -> Result<(), String> {
+        if !mode.chars().all(|c| c.is_ascii_digit()) || mode.is_empty() || mode.len() > 4 {
+            return Err(format!("Invalid chmod mode: '{}'", mode));
+        }
         let flag = if recursive { "-R " } else { "" };
-        let cmd = format!("chmod {}{} \"{}\"", flag, mode, path);
+        let cmd = format!("chmod {}{} {}", flag, mode, shell_escape(path));
         self.exec_command(session_id, &cmd)?;
         Ok(())
     }
 
     pub fn chown(&self, session_id: &str, path: &str, user: &str, group: &str, recursive: bool) -> Result<(), String> {
+        fn is_valid_name(s: &str) -> bool {
+            !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '@' || c == ':')
+        }
+        if !is_valid_name(user) { return Err(format!("Invalid user name: '{}'", user)); }
+        if !is_valid_name(group) { return Err(format!("Invalid group name: '{}'", group)); }
         let flag = if recursive { "-R " } else { "" };
-        let cmd = format!("chown {}{}:{} \"{}\"", flag, user, group, path);
+        let cmd = format!("chown {}{}:{} {}", flag, user, group, shell_escape(path));
         self.exec_command(session_id, &cmd)?;
         Ok(())
     }
 
     pub fn copy_remote(&self, session_id: &str, paths: &[String], dest_dir: &str) -> Result<(), String> {
         for path in paths {
-            let cmd = format!("cp -a \"{}\" \"{}/\"", path, dest_dir);
+            let cmd = format!("cp -a {} {}/", shell_escape(path), shell_escape(dest_dir));
             self.exec_command(session_id, &cmd)?;
         }
         Ok(())
