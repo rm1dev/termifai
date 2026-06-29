@@ -5008,8 +5008,8 @@ function SftpView({ tab }: { tab: AppTab }) {
                 if (e.key === "Enter" && openWithApp.trim()) {
                   if (openWithTarget.isLocal) handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
                   else void invoke("sftp_open_remote", { sessionId: sftpSessionId, remotePath: openWithTarget.path })
-                    .then((tmp) => invoke("sftp_open_with_local", { path: tmp as string, app: openWithApp.trim() }))
-                    .then(() => invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: openWithTarget.path, remotePath: openWithTarget.path }))
+                    .then((tmp) => invoke("sftp_open_with_local", { path: tmp as string, app: openWithApp.trim() }).then(() => tmp))
+                    .then((tmp) => invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: openWithTarget.path }))
                     .catch((e: unknown) => toast.error(String(e)));
                   setOpenWithTarget(null);
                   setOpenWithApp("");
@@ -5023,7 +5023,16 @@ function SftpView({ tab }: { tab: AppTab }) {
                 className="rounded bg-[var(--color-brand-cyan)] px-3 py-1.5 text-xs font-medium text-black"
                 onClick={() => {
                   if (openWithApp.trim()) {
-                    if (openWithTarget.isLocal) handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
+                    if (openWithTarget.isLocal) {
+                      handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
+                    } else {
+                      const app = openWithApp.trim();
+                      const target = openWithTarget;
+                      invoke<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: target.path })
+                        .then((tmp) => invoke("sftp_open_with_local", { path: tmp, app }).then(() => tmp))
+                        .then((tmp) => invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: target.path }))
+                        .catch((e: unknown) => toast.error(String(e)));
+                    }
                   }
                   setOpenWithTarget(null); setOpenWithApp("");
                 }}
