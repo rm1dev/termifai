@@ -129,9 +129,12 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { toast } from "sonner";
+import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import { SftpContextMenu } from "./SftpContextMenu";
 import { SftpRenameDialog } from "./SftpRenameDialog";
 import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
+import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
+import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
   // { key: "dashboard", label: "Dashboard", icon: LayoutDashboard }, // temporarily hidden
@@ -4202,6 +4205,8 @@ function SftpView({ tab }: { tab: AppTab }) {
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
   const [watchedFile, setWatchedFile] = useState<{ tmpPath: string; remotePath: string; changed: boolean } | null>(null);
+  const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
+  const [newFolderTarget, setNewFolderTarget] = useState<"local" | "remote" | null>(null);
 
   // Load hosts for picker (only when no host is pre-selected)
   useEffect(() => {
@@ -4363,7 +4368,12 @@ function SftpView({ tab }: { tab: AppTab }) {
       }
       await loadLocalDir(localPath);
     } catch (e) {
-      setTransferError(String(e));
+      if (!String(e).includes("Cancelled")) {
+        setTransferError(String(e));
+      } else {
+        setTransferOverall(null);
+        setTransferProgress(null);
+      }
     } finally {
       setTransferProgress(null);
       setTransferOverall(null);
@@ -4388,7 +4398,12 @@ function SftpView({ tab }: { tab: AppTab }) {
       }
       await loadRemoteDir(remotePath);
     } catch (e) {
-      setTransferError(String(e));
+      if (!String(e).includes("Cancelled")) {
+        setTransferError(String(e));
+      } else {
+        setTransferOverall(null);
+        setTransferProgress(null);
+      }
     } finally {
       setTransferProgress(null);
       setTransferOverall(null);
@@ -4450,6 +4465,15 @@ function SftpView({ tab }: { tab: AppTab }) {
   };
 
   const connectCleanupRef = useRef<(() => void) | null>(null);
+
+  const performDisconnect = () => {
+    void invoke("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
+    setIsConnected(false);
+    setPickedHostId(undefined);
+    setConnectError(null);
+    setRemoteFiles([]);
+    invoke<{ hosts: Host[] }>("list_hosts").then((v) => setAllHosts(v.hosts)).catch(() => {});
+  };
 
   const handleConnect = async (hostId?: string, hostObj?: Host) => {
     const targetHostId = hostId ?? pickedHostId;
@@ -4579,6 +4603,12 @@ function SftpView({ tab }: { tab: AppTab }) {
                 <span className="shrink-0 tabular-nums text-muted-foreground">
                   {Math.round(overallPct)}%
                 </span>
+                <button
+                  className="shrink-0 rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+                  onClick={() => void invoke("sftp_cancel_transfer", { sessionId: sftpSessionId })}
+                >
+                  Cancel
+                </button>
               </>
             );
           })() : null}
@@ -4661,6 +4691,10 @@ function SftpView({ tab }: { tab: AppTab }) {
           <div className="grid min-w-[560px] grid-cols-[1fr_180px_100px_80px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
             <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
           </div>
+          <SftpEmptyContextMenu
+            onNewFolder={() => setNewFolderTarget("local")}
+            onRefresh={() => void loadLocalDir(localPath)}
+          >
           <div className="flex-1 overflow-y-auto">
             {localLoading && (
               <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
@@ -4737,6 +4771,7 @@ function SftpView({ tab }: { tab: AppTab }) {
               </>
             )}
           </div>
+          </SftpEmptyContextMenu>
         </div>
       </div>
 
@@ -4776,12 +4811,11 @@ function SftpView({ tab }: { tab: AppTab }) {
               <button
                 className="text-xs text-muted-foreground hover:text-foreground"
                 onClick={() => {
-                  void invoke("sftp_disconnect", { sessionId: sftpSessionId });
-                  setIsConnected(false);
-                  setPickedHostId(undefined);
-                  setConnectError(null);
-                  setRemoteFiles([]);
-                  invoke<{ hosts: Host[] }>("list_hosts").then((v) => setAllHosts(v.hosts)).catch(() => {});
+                  if (transferOverall !== null) {
+                    setShowDisconnectConfirm(true);
+                  } else {
+                    performDisconnect();
+                  }
                 }}
               >
                 Disconnect
@@ -4893,6 +4927,10 @@ function SftpView({ tab }: { tab: AppTab }) {
               <div className="grid min-w-[500px] grid-cols-[1fr_160px_90px_70px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
                 <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
               </div>
+              <SftpEmptyContextMenu
+                onNewFolder={() => setNewFolderTarget("remote")}
+                onRefresh={() => remotePath && void loadRemoteDir(remotePath)}
+              >
               <div className="flex-1 overflow-y-auto">
                 {remoteLoading && (
                   <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
@@ -4977,6 +5015,7 @@ function SftpView({ tab }: { tab: AppTab }) {
                   </>
                 )}
               </div>
+              </SftpEmptyContextMenu>
             </div>
           </>
         )}
@@ -5085,6 +5124,55 @@ function SftpView({ tab }: { tab: AppTab }) {
           </div>
         </div>
       )}
+
+      {/* New folder dialog */}
+      <SftpNewFolderDialog
+        open={newFolderTarget !== null}
+        onConfirm={(name) => {
+          if (newFolderTarget === "local") {
+            void invoke("sftp_mkdir_local", { path: `${localPath}/${name}` })
+              .then(() => loadLocalDir(localPath))
+              .catch((e: unknown) => toast.error(String(e)));
+          } else if (newFolderTarget === "remote" && remotePath) {
+            void invoke("sftp_mkdir_remote", { sessionId: sftpSessionId, path: `${remotePath}/${name}` })
+              .then(() => loadRemoteDir(remotePath))
+              .catch((e: unknown) => toast.error(String(e)));
+          }
+        }}
+        onClose={() => setNewFolderTarget(null)}
+      />
+
+      {/* Disconnect-during-transfer confirmation */}
+      <AlertDialog.Root open={showDisconnectConfirm} onOpenChange={setShowDisconnectConfirm}>
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/40" />
+          <AlertDialog.Content className="fixed left-1/2 top-1/2 z-50 w-96 -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-[var(--color-surface-2)] p-5 shadow-xl">
+            <AlertDialog.Title className="text-sm font-medium text-foreground">Transfer in progress</AlertDialog.Title>
+            <AlertDialog.Description className="mt-2 text-xs text-muted-foreground">
+              Cancelling will interrupt the current transfer. This may leave a partial file on the remote server.
+            </AlertDialog.Description>
+            <div className="mt-4 flex justify-end gap-2">
+              <AlertDialog.Cancel asChild>
+                <button className="rounded px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground">
+                  Keep transferring
+                </button>
+              </AlertDialog.Cancel>
+              <AlertDialog.Action asChild>
+                <button
+                  className="rounded bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500"
+                  onClick={() => {
+                    void invoke("sftp_cancel_transfer", { sessionId: sftpSessionId });
+                    setShowDisconnectConfirm(false);
+                    performDisconnect();
+                  }}
+                >
+                  Cancel transfer &amp; disconnect
+                </button>
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
     </div>
   );
 }
