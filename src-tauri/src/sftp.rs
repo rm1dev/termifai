@@ -106,6 +106,19 @@ fn unix_to_ymd_hm(secs: i64) -> (i32, u32, u32, u32, u32) {
     (y as i32, mo as u32, d as u32, h, mi)
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RemoteStatResult {
+    pub permissions: u32,
+    pub owner: String,
+    pub group: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UsersGroups {
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+}
+
 pub struct SftpEntry {
     pub session: Session,
 }
@@ -378,6 +391,64 @@ impl SftpManager {
         let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
         sftp.mkdir(std::path::Path::new(path), 0o755)
             .map_err(|e| format!("mkdir '{}': {}", path, e))
+    }
+
+    pub fn exec_command(&self, session_id: &str, cmd: &str) -> Result<String, String> {
+        let entry = self.sessions.get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+        let mut channel = entry.session.channel_session()
+            .map_err(|e| format!("Channel open: {}", e))?;
+        channel.exec(cmd).map_err(|e| format!("Exec '{}': {}", cmd, e))?;
+        let mut output = String::new();
+        use std::io::Read;
+        channel.read_to_string(&mut output).map_err(|e| format!("Read output: {}", e))?;
+        channel.wait_close().map_err(|e| format!("Channel close: {}", e))?;
+        Ok(output)
+    }
+
+    pub fn stat_remote(&self, session_id: &str, path: &str) -> Result<RemoteStatResult, String> {
+        let entry = self.sessions.get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+        let stat = sftp.stat(std::path::Path::new(path))
+            .map_err(|e| format!("stat '{}': {}", path, e))?;
+        let permissions = stat.perm.unwrap_or(0) & 0o7777;
+        // get owner/group via SSH exec since libssh2 stat doesn't return names
+        let owner_out = self.exec_command(session_id, &format!("stat -c '%U %G' \"{}\" 2>/dev/null || echo 'root root'", path))?;
+        let parts: Vec<&str> = owner_out.trim().splitn(2, ' ').collect();
+        let owner = parts.first().unwrap_or(&"root").to_string();
+        let group = parts.get(1).unwrap_or(&"root").to_string();
+        Ok(RemoteStatResult { permissions, owner, group })
+    }
+
+    pub fn chmod(&self, session_id: &str, path: &str, mode: &str, recursive: bool) -> Result<(), String> {
+        let flag = if recursive { "-R " } else { "" };
+        let cmd = format!("chmod {}{} \"{}\"", flag, mode, path);
+        self.exec_command(session_id, &cmd)?;
+        Ok(())
+    }
+
+    pub fn chown(&self, session_id: &str, path: &str, user: &str, group: &str, recursive: bool) -> Result<(), String> {
+        let flag = if recursive { "-R " } else { "" };
+        let cmd = format!("chown {}{}:{} \"{}\"", flag, user, group, path);
+        self.exec_command(session_id, &cmd)?;
+        Ok(())
+    }
+
+    pub fn copy_remote(&self, session_id: &str, paths: &[String], dest_dir: &str) -> Result<(), String> {
+        for path in paths {
+            let cmd = format!("cp -a \"{}\" \"{}/\"", path, dest_dir);
+            self.exec_command(session_id, &cmd)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_users_groups(&self, session_id: &str) -> Result<UsersGroups, String> {
+        let users_out = self.exec_command(session_id, "getent passwd | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/passwd")?;
+        let groups_out = self.exec_command(session_id, "getent group | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/group")?;
+        let users = users_out.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let groups = groups_out.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        Ok(UsersGroups { users, groups })
     }
 
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
