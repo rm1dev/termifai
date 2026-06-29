@@ -49,6 +49,7 @@ struct AppState {
     pty_manager: Mutex<PtyManager>,
     tunnel_manager: TunnelManagerState,
     sftp_manager: Mutex<SftpManager>,
+    watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[tauri::command]
@@ -583,6 +584,87 @@ fn sftp_open_with_local(path: String, app: String) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize, Clone)]
+struct SftpFileChangedEvent {
+    tmp_path: String,
+    remote_path: String,
+}
+
+#[tauri::command]
+async fn sftp_open_remote(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    remote_path: String,
+) -> Result<String, String> {
+    let tmp_path = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.open_remote(&session_id, &remote_path)?
+    };
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&tmp_path).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(&tmp_path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/c", "start", "", &tmp_path]).spawn();
+    Ok(tmp_path)
+}
+
+#[tauri::command]
+async fn sftp_watch_remote(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    tmp_path: String,
+    remote_path: String,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut handles = state.watch_handles.lock().unwrap();
+        handles.insert(tmp_path.clone(), tx);
+    }
+    let app_bg = app.clone();
+    let sid = session_id.clone();
+    let tp = tmp_path.clone();
+    let rp = remote_path.clone();
+    tokio::spawn(async move {
+        let initial_mtime = std::fs::metadata(&tp)
+            .and_then(|m| m.modified())
+            .ok();
+        let mut last_mtime = initial_mtime;
+        let mut rx = rx;
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                    let current = std::fs::metadata(&tp).and_then(|m| m.modified()).ok();
+                    if current != last_mtime && current.is_some() {
+                        last_mtime = current;
+                        let _ = app_bg.emit(
+                            &format!("sftp:{}:file-changed", sid),
+                            SftpFileChangedEvent { tmp_path: tp.clone(), remote_path: rp.clone() },
+                        );
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_stop_watch(
+    state: State<AppState>,
+    tmp_path: String,
+) -> Result<(), String> {
+    let mut handles = state.watch_handles.lock().unwrap();
+    if let Some(tx) = handles.remove(&tmp_path) {
+        let _ = tx.send(());
+    }
+    let _ = std::fs::remove_file(&tmp_path);
+    Ok(())
+}
+
 #[tauri::command]
 fn sftp_chmod(
     state: State<AppState>,
@@ -647,6 +729,7 @@ pub fn run() {
             pty_manager: Mutex::new(PtyManager::new()),
             tunnel_manager: port_forwarding::new_tunnel_manager(),
             sftp_manager: Mutex::new(SftpManager::new()),
+            watch_handles: Mutex::new(std::collections::HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
@@ -695,6 +778,9 @@ pub fn run() {
             sftp_copy_local,
             sftp_open_local,
             sftp_open_with_local,
+            sftp_open_remote,
+            sftp_watch_remote,
+            sftp_stop_watch,
             quit_app,
         ])
         .on_window_event(|window, event| {
