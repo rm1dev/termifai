@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use ssh2::Session;
 use std::collections::HashMap;
 use std::net::TcpStream;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SftpConnectRequest {
@@ -229,6 +230,7 @@ impl SftpManager {
         session_id: &str,
         remote_path: &str,
         local_path: &str,
+        cancel: Arc<AtomicBool>,
         on_progress: F,
     ) -> Result<(), String>
     where
@@ -262,6 +264,10 @@ impl SftpManager {
         let result = (|| {
             loop {
                 use std::io::{Read, Write};
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err("Cancelled".to_string());
+                }
                 let n = remote_file.read(&mut buf).map_err(|e| format!("read remote: {}", e))?;
                 if n == 0 {
                     break;
@@ -296,6 +302,7 @@ impl SftpManager {
         session_id: &str,
         local_path: &str,
         remote_path: &str,
+        cancel: Arc<AtomicBool>,
         on_progress: F,
     ) -> Result<(), String>
     where
@@ -329,6 +336,9 @@ impl SftpManager {
 
         loop {
             use std::io::{Read, Write};
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".to_string());
+            }
             let n = local_file.read(&mut buf).map_err(|e| format!("read local: {}", e))?;
             if n == 0 {
                 break;
