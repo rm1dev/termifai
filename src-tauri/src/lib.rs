@@ -621,6 +621,10 @@ async fn sftp_watch_remote(
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
         let mut handles = state.watch_handles.lock().unwrap();
+        // Cancel any existing watch for this tmp_path
+        if let Some(old_tx) = handles.remove(&tmp_path) {
+            let _ = old_tx.send(());
+        }
         handles.insert(tmp_path.clone(), tx);
     }
     let app_bg = app.clone();
