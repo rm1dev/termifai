@@ -128,7 +128,9 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { toast } from "sonner";
-
+import { SftpContextMenu } from "./SftpContextMenu";
+import { SftpRenameDialog } from "./SftpRenameDialog";
+import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
   // { key: "dashboard", label: "Dashboard", icon: LayoutDashboard }, // temporarily hidden
@@ -4221,6 +4223,12 @@ function SftpView({ tab }: { tab: AppTab }) {
   const [showHiddenRemote, setShowHiddenRemote] = useState(false);
   const [localMenuOpen, setLocalMenuOpen] = useState(false);
   const [remoteMenuOpen, setRemoteMenuOpen] = useState(false);
+  const [localClipboard, setLocalClipboard] = useState<string[]>([]);
+  const [remoteClipboard, setRemoteClipboard] = useState<string[]>([]);
+  const [renameTarget, setRenameTarget] = useState<{ path: string; name: string; isLocal: boolean } | null>(null);
+  const [permTarget, setPermTarget] = useState<string | null>(null);
+  const [openWithTarget, setOpenWithTarget] = useState<{ path: string; isLocal: boolean } | null>(null);
+  const [openWithApp, setOpenWithApp] = useState("");
 
   // Resizable divider — 50% default
   const [localWidthPct, setLocalWidthPct] = useState(50);
@@ -4367,6 +4375,60 @@ function SftpView({ tab }: { tab: AppTab }) {
       setTransferProgress(null);
       setTransferOverall(null);
     }
+  };
+
+  const handleOpenLocal = (path: string) => {
+    void invoke("sftp_open_local", { path });
+  };
+
+  const handleOpenWithLocal = (path: string, app: string) => {
+    void invoke("sftp_open_with_local", { path, app });
+  };
+
+  const handleOpenRemote = async (path: string) => {
+    const tmpPath = await invoke<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: path });
+    await invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath, remotePath: path });
+  };
+
+  const handleCopyLocal = (paths: string[]) => setLocalClipboard(paths);
+  const handlePasteLocal = () => {
+    if (!localClipboard.length) return;
+    void invoke("sftp_copy_local", { paths: localClipboard, destDir: localPath })
+      .then(() => loadLocalDir(localPath))
+      .catch((e: unknown) => toast.error(String(e)));
+  };
+
+  const handleCopyRemote = (paths: string[]) => setRemoteClipboard(paths);
+  const handlePasteRemote = () => {
+    if (!remoteClipboard.length || !remotePath) return;
+    void invoke("sftp_copy_remote", { sessionId: sftpSessionId, paths: remoteClipboard, destDir: remotePath })
+      .then(() => loadRemoteDir(remotePath))
+      .catch((e: unknown) => toast.error(String(e)));
+  };
+
+  const handleDeleteLocal = (paths: string[]) => {
+    void invoke("sftp_delete_local", { paths })
+      .then(() => loadLocalDir(localPath))
+      .catch((e: unknown) => toast.error(String(e)));
+  };
+
+  const handleRenameConfirm = async (newName: string) => {
+    if (!renameTarget) return;
+    try {
+      if (renameTarget.isLocal) {
+        await invoke("sftp_rename_local", { path: renameTarget.path, newName });
+        await loadLocalDir(localPath);
+      } else {
+        const dir = renameTarget.path.substring(0, renameTarget.path.lastIndexOf("/")) || "/";
+        await invoke("sftp_rename_remote", {
+          sessionId: sftpSessionId,
+          fromPath: renameTarget.path,
+          toPath: `${dir}/${newName}`,
+        });
+        if (remotePath) await loadRemoteDir(remotePath);
+      }
+    } catch (e) { toast.error(String(e)); }
+    setRenameTarget(null);
   };
 
   const connectCleanupRef = useRef<(() => void) | null>(null);
@@ -4603,8 +4665,24 @@ function SftpView({ tab }: { tab: AppTab }) {
                   </div>
                 )}
                 {localFiles.filter((f) => showHiddenLocal || !f.name.startsWith(".")).map((f) => (
-                  <div
+                  <SftpContextMenu
                     key={f.path}
+                    isLocal={true}
+                    isConnected={isConnected}
+                    file={f}
+                    hasClipboard={localClipboard.length > 0}
+                    onOpen={() => handleOpenLocal(f.path)}
+                    onOpenWith={() => setOpenWithTarget({ path: f.path, isLocal: true })}
+                    onDownload={() => {}}
+                    onUpload={() => void handleUpload([f.path])}
+                    onCopy={() => handleCopyLocal(selectedLocal.size > 0 ? [...selectedLocal] : [f.path])}
+                    onPaste={handlePasteLocal}
+                    onRename={() => setRenameTarget({ path: f.path, name: f.name, isLocal: true })}
+                    onDelete={() => handleDeleteLocal(selectedLocal.size > 0 ? [...selectedLocal] : [f.path])}
+                    onRefresh={() => void loadLocalDir(localPath)}
+                    onEditPermissions={() => {}}
+                  >
+                  <div
                     draggable={!f.is_dir}
                     onDragStart={(e) => {
                       const toDrag = selectedLocal.has(f.path) ? [...selectedLocal].filter((p) => !localFiles.find((lf) => lf.path === p)?.is_dir) : [f.path];
@@ -4631,6 +4709,7 @@ function SftpView({ tab }: { tab: AppTab }) {
                     </div>
                     <div className="text-xs text-muted-foreground">{f.is_dir ? "folder" : "file"}</div>
                   </div>
+                  </SftpContextMenu>
                 ))}
               </>
             )}
@@ -4831,8 +4910,29 @@ function SftpView({ tab }: { tab: AppTab }) {
                       </div>
                     )}
                     {remoteFiles.filter((f) => showHiddenRemote || !f.name.startsWith(".")).map((f) => (
-                      <div
+                      <SftpContextMenu
                         key={f.path}
+                        isLocal={false}
+                        isConnected={isConnected}
+                        file={f}
+                        hasClipboard={remoteClipboard.length > 0}
+                        onOpen={() => void handleOpenRemote(f.path).catch((e: unknown) => toast.error(String(e)))}
+                        onOpenWith={() => setOpenWithTarget({ path: f.path, isLocal: false })}
+                        onDownload={() => void handleDownload([f.path])}
+                        onUpload={() => {}}
+                        onCopy={() => handleCopyRemote(selectedRemote.size > 0 ? [...selectedRemote] : [f.path])}
+                        onPaste={handlePasteRemote}
+                        onRename={() => setRenameTarget({ path: f.path, name: f.name, isLocal: false })}
+                        onDelete={() => {
+                          const targets = selectedRemote.size > 0 ? [...selectedRemote] : [f.path];
+                          void invoke("sftp_delete_remote", { sessionId: sftpSessionId, paths: targets })
+                            .then(() => remotePath && loadRemoteDir(remotePath))
+                            .catch((e: unknown) => toast.error(String(e)));
+                        }}
+                        onRefresh={() => remotePath && void loadRemoteDir(remotePath)}
+                        onEditPermissions={() => setPermTarget(f.path)}
+                      >
+                      <div
                         draggable={!f.is_dir}
                         onDragStart={(e) => {
                           const toDrag = selectedRemote.has(f.path) ? [...selectedRemote].filter((p) => !remoteFiles.find((rf) => rf.path === p)?.is_dir) : [f.path];
@@ -4866,6 +4966,7 @@ function SftpView({ tab }: { tab: AppTab }) {
                           {f.is_symlink ? "symlink" : f.is_dir ? "folder" : "file"}
                         </div>
                       </div>
+                      </SftpContextMenu>
                     ))}
                   </>
                 )}
@@ -4875,6 +4976,62 @@ function SftpView({ tab }: { tab: AppTab }) {
         )}
       </div>
       </div>
+
+      {/* Rename dialog */}
+      <SftpRenameDialog
+        open={renameTarget !== null}
+        currentName={renameTarget?.name ?? ""}
+        onConfirm={(n) => void handleRenameConfirm(n)}
+        onClose={() => setRenameTarget(null)}
+      />
+
+      {/* Edit Permissions dialog */}
+      <SftpPermissionsDialog
+        open={permTarget !== null}
+        sessionId={sftpSessionId}
+        path={permTarget ?? ""}
+        onClose={() => setPermTarget(null)}
+      />
+
+      {/* Open With dialog */}
+      {openWithTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="w-80 rounded-xl border border-border bg-[var(--color-surface)] p-5 shadow-xl">
+            <p className="mb-3 text-sm font-semibold text-foreground">Open With</p>
+            <input
+              autoFocus
+              placeholder="App name or path…"
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[var(--color-brand-cyan)]"
+              value={openWithApp}
+              onChange={(e) => setOpenWithApp(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && openWithApp.trim()) {
+                  if (openWithTarget.isLocal) handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
+                  else void invoke("sftp_open_remote", { sessionId: sftpSessionId, remotePath: openWithTarget.path })
+                    .then((tmp) => invoke("sftp_open_with_local", { path: tmp as string, app: openWithApp.trim() }))
+                    .then(() => invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: openWithTarget.path, remotePath: openWithTarget.path }))
+                    .catch((e: unknown) => toast.error(String(e)));
+                  setOpenWithTarget(null);
+                  setOpenWithApp("");
+                }
+                if (e.key === "Escape") { setOpenWithTarget(null); setOpenWithApp(""); }
+              }}
+            />
+            <div className="mt-3 flex justify-end gap-2">
+              <button className="rounded px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground" onClick={() => { setOpenWithTarget(null); setOpenWithApp(""); }}>Cancel</button>
+              <button
+                className="rounded bg-[var(--color-brand-cyan)] px-3 py-1.5 text-xs font-medium text-black"
+                onClick={() => {
+                  if (openWithApp.trim()) {
+                    if (openWithTarget.isLocal) handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
+                  }
+                  setOpenWithTarget(null); setOpenWithApp("");
+                }}
+              >Open</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
