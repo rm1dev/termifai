@@ -4695,7 +4695,10 @@ function SftpView({ tab }: { tab: AppTab }) {
                     onCopy={() => handleCopyLocal(selectedLocal.size > 0 ? [...selectedLocal] : [f.path])}
                     onPaste={handlePasteLocal}
                     onRename={() => setRenameTarget({ path: f.path, name: f.name, isLocal: true })}
-                    onDelete={() => handleDeleteLocal(selectedLocal.size > 0 ? [...selectedLocal] : [f.path])}
+                    onDelete={() => {
+                      const targets = selectedLocal.has(f.path) ? [...selectedLocal] : [f.path];
+                      handleDeleteLocal(targets);
+                    }}
                     onRefresh={() => void loadLocalDir(localPath)}
                     onEditPermissions={() => {}}
                   >
@@ -4926,7 +4929,7 @@ function SftpView({ tab }: { tab: AppTab }) {
                         onPaste={handlePasteRemote}
                         onRename={() => setRenameTarget({ path: f.path, name: f.name, isLocal: false })}
                         onDelete={() => {
-                          const targets = selectedRemote.size > 0 ? [...selectedRemote] : [f.path];
+                          const targets = selectedRemote.has(f.path) ? [...selectedRemote] : [f.path];
                           void invoke("sftp_delete_remote", { sessionId: sftpSessionId, paths: targets })
                             .then(() => remotePath && loadRemoteDir(remotePath))
                             .catch((e: unknown) => toast.error(String(e)));
