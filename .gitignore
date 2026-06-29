@@ -15,6 +15,7 @@ src-tauri/target-linux-arm64/
 .kiro/
 .amazonq/
 .claude/
+docs/
 AGENTS.md
 
 # OS
