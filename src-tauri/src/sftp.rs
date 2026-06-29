@@ -455,6 +455,24 @@ impl SftpManager {
         Ok(UsersGroups { users, groups })
     }
 
+    pub fn open_remote(&self, session_id: &str, remote_path: &str) -> Result<String, String> {
+        let file_name = std::path::Path::new(remote_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        let tmp_path = format!("/tmp/termifai_{}_{}", session_id, file_name);
+        let entry = self.sessions.get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+        let mut remote_file = sftp.open(std::path::Path::new(remote_path))
+            .map_err(|e| format!("Open remote '{}': {}", remote_path, e))?;
+        let mut local_file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Create tmp '{}': {}", tmp_path, e))?;
+        std::io::copy(&mut remote_file, &mut local_file)
+            .map_err(|e| format!("Copy to tmp: {}", e))?;
+        Ok(tmp_path)
+    }
+
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
         self.sessions
             .remove(session_id)
