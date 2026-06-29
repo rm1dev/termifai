@@ -565,6 +565,8 @@ fn sftp_open_local(path: String) -> Result<(), String> {
     std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
     std::process::Command::new("cmd").args(["/c", "start", "", &path]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    return Err("Platform not supported for open_local".to_string());
     Ok(())
 }
 
@@ -576,6 +578,8 @@ fn sftp_open_with_local(path: String, app: String) -> Result<(), String> {
     std::process::Command::new(&app).arg(&path).spawn().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
     std::process::Command::new("cmd").args(["/c", "start", "", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    return Err("Platform not supported for open_with_local".to_string());
     Ok(())
 }
 
