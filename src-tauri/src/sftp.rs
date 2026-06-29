@@ -121,26 +121,35 @@ impl SftpManager {
         }
     }
 
-    pub fn connect(&mut self, req: SftpConnectRequest) -> Result<SftpSessionInfo, String> {
+    /// `log(stage, message)` — stage is one of "connecting", "handshaking", "authenticating", "ready"
+    pub fn connect<F>(&mut self, req: SftpConnectRequest, log: F) -> Result<SftpSessionInfo, String>
+    where
+        F: Fn(&str, &str),
+    {
         let addr = format!("{}:{}", req.hostname, req.port);
+
+        log("connecting", &format!("Opening TCP connection to {}...", addr));
         let tcp = TcpStream::connect(&addr)
             .map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
 
+        log("handshaking", "TCP connected. Starting SSH handshake...");
         let mut session = Session::new().map_err(|e| format!("SSH session init: {}", e))?;
         session.set_tcp_stream(tcp);
         session.handshake().map_err(|e| format!("SSH handshake: {}", e))?;
 
-        // Auth: try key first, fall back to password
+        log("authenticating", &format!("Authenticating as {}...", req.username));
         if let Some(key_path) = &req.private_key_path {
+            log("authenticating", &format!("Using public key: {}", key_path));
             session
                 .userauth_pubkey_file(&req.username, None, std::path::Path::new(key_path), None)
                 .map_err(|e| format!("Key auth failed: {}", e))?;
         } else if let Some(password) = &req.password {
+            log("authenticating", "Using password authentication...");
             session
                 .userauth_password(&req.username, password)
                 .map_err(|e| format!("Password auth failed: {}", e))?;
         } else {
-            // Try SSH agent
+            log("authenticating", "Trying SSH agent...");
             session
                 .userauth_agent(&req.username)
                 .map_err(|e| format!("Agent auth failed: {}", e))?;
@@ -153,6 +162,7 @@ impl SftpManager {
         let remote_path = req.default_remote_path.clone().unwrap_or_else(|| "/".to_string());
         self.sessions.insert(req.session_id.clone(), SftpEntry { session });
 
+        log("ready", &format!("Authenticated. Opening {}...", remote_path));
         Ok(SftpSessionInfo {
             session_id: req.session_id,
             remote_path,
