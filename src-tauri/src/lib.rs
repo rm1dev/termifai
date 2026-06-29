@@ -14,6 +14,26 @@ use port_forwarding::{
 };
 use pty_manager::{PtyManager, TabInfo};
 use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager, SftpSessionInfo, TransferProgress};
+use serde::Serialize;
+
+#[derive(Serialize, Clone)]
+struct SftpConnectEvent {
+    stage: String,
+    message: String,
+}
+
+#[derive(Serialize, Clone)]
+struct SftpConnectDone {
+    ok: bool,
+    remote_path: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct SftpTransferDone {
+    ok: bool,
+    error: Option<String>,
+}
 use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -298,13 +318,12 @@ fn run_snippet_script(
 }
 
 #[tauri::command]
-fn sftp_connect_from_host(
+async fn sftp_connect_from_host(
     app: tauri::AppHandle,
-    state: State<AppState>,
     host_id: String,
     session_id: String,
-) -> Result<SftpSessionInfo, String> {
-    // Resolve host
+) -> Result<(), String> {
+    // Resolve credentials synchronously (fast local file reads) before spawning
     let vault = hosts::list_hosts(&app)?;
     let host = vault
         .hosts
@@ -312,7 +331,6 @@ fn sftp_connect_from_host(
         .find(|h| h.id == host_id)
         .ok_or_else(|| format!("Host '{}' not found", host_id))?;
 
-    // Resolve private key path if host uses key auth
     let private_key_path = if let Some(key_id) = &host.ssh_key_id {
         let keys = ssh_keys::list_ssh_keys(&app)?;
         keys.into_iter()
@@ -323,7 +341,7 @@ fn sftp_connect_from_host(
     };
 
     let request = SftpConnectRequest {
-        session_id,
+        session_id: session_id.clone(),
         hostname: host.hostname.clone(),
         port: host.port,
         username: host.user.clone(),
@@ -332,8 +350,37 @@ fn sftp_connect_from_host(
         default_remote_path: host.default_sftp_path.clone(),
     };
 
-    let mut manager = state.sftp_manager.lock().unwrap();
-    manager.connect(request)
+    // Spawn blocking work in background — command returns immediately so the
+    // loading screen appears before any network round-trips begin.
+    let app_bg = app.clone();
+    tokio::spawn(async move {
+        let app_inner = app_bg.clone();
+        let sid = session_id.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let app_log = app_inner.clone();
+            let sid_log = sid.clone();
+            let log = move |stage: &str, msg: &str| {
+                let _ = app_log.emit(
+                    &format!("sftp:{}:connect", sid_log),
+                    SftpConnectEvent { stage: stage.to_string(), message: msg.to_string() },
+                );
+            };
+            let state = app_inner.state::<AppState>();
+            let mut manager = state.sftp_manager.lock().unwrap();
+            manager.connect(request, log)
+        })
+        .await;
+
+        let done = match result {
+            Ok(Ok(info)) => SftpConnectDone { ok: true, remote_path: Some(info.remote_path), error: None },
+            Ok(Err(e)) => SftpConnectDone { ok: false, remote_path: None, error: Some(e) },
+            Err(e) => SftpConnectDone { ok: false, remote_path: None, error: Some(format!("Task panic: {e}")) },
+        };
+        let _ = app_bg.emit(&format!("sftp:{}:done", session_id), done);
+    });
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -352,35 +399,63 @@ fn sftp_list_remote(
 }
 
 #[tauri::command]
-fn sftp_download(
+async fn sftp_download(
     app: tauri::AppHandle,
-    state: State<AppState>,
     session_id: String,
     remote_path: String,
     local_path: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
+    let app_bg = app.clone();
     let sid = session_id.clone();
-    manager.download_file(&session_id, &remote_path, &local_path, move |progress| {
-        let event = format!("sftp:{}:progress", sid);
-        let _ = app.emit(&event, progress);
-    })
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let app_prog = app_bg.clone();
+            let sid_prog = sid.clone();
+            let state = app_bg.state::<AppState>();
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.download_file(&sid, &remote_path, &local_path, move |progress| {
+                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+            })
+        })
+        .await;
+        let done = match result {
+            Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
+            Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
+            Err(e) => SftpTransferDone { ok: false, error: Some(format!("Task panic: {e}")) },
+        };
+        let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
+    });
+    Ok(())
 }
 
 #[tauri::command]
-fn sftp_upload(
+async fn sftp_upload(
     app: tauri::AppHandle,
-    state: State<AppState>,
     session_id: String,
     local_path: String,
     remote_path: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
+    let app_bg = app.clone();
     let sid = session_id.clone();
-    manager.upload_file(&session_id, &local_path, &remote_path, move |progress| {
-        let event = format!("sftp:{}:progress", sid);
-        let _ = app.emit(&event, progress);
-    })
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let app_prog = app_bg.clone();
+            let sid_prog = sid.clone();
+            let state = app_bg.state::<AppState>();
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.upload_file(&sid, &local_path, &remote_path, move |progress| {
+                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+            })
+        })
+        .await;
+        let done = match result {
+            Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
+            Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
+            Err(e) => SftpTransferDone { ok: false, error: Some(format!("Task panic: {e}")) },
+        };
+        let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
+    });
+    Ok(())
 }
 
 #[tauri::command]
