@@ -506,6 +506,80 @@ fn sftp_stat_remote(
 }
 
 #[tauri::command]
+fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    let dest = p.parent()
+        .ok_or("No parent dir")?
+        .join(&new_name);
+    std::fs::rename(&p, &dest).map_err(|e| format!("Rename: {}", e))
+}
+
+#[tauri::command]
+fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
+    for path in &paths {
+        let p = std::path::Path::new(path);
+        if p.is_dir() {
+            std::fs::remove_dir_all(p).map_err(|e| format!("Delete dir '{}': {}", path, e))?;
+        } else {
+            std::fs::remove_file(p).map_err(|e| format!("Delete '{}': {}", path, e))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_copy_local(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
+    let dest = std::path::Path::new(&dest_dir);
+    for path in &paths {
+        let src = std::path::Path::new(path);
+        let name = src.file_name().ok_or("No file name")?;
+        let target = dest.join(name);
+        if src.is_dir() {
+            copy_dir_all(src, &target).map_err(|e| format!("Copy dir '{}': {}", path, e))?;
+        } else {
+            std::fs::copy(src, &target).map_err(|e| format!("Copy '{}': {}", path, e))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_open_local(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("cmd").args(["/c", "start", "", &path]).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_open_with_local(path: String, app: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").args(["-a", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    std::process::Command::new(&app).arg(&path).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("cmd").args(["/c", "start", "", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn sftp_chmod(
     state: State<AppState>,
     session_id: String,
@@ -612,6 +686,11 @@ pub fn run() {
             sftp_chown,
             sftp_copy_remote,
             sftp_get_users_groups,
+            sftp_rename_local,
+            sftp_delete_local,
+            sftp_copy_local,
+            sftp_open_local,
+            sftp_open_with_local,
             quit_app,
         ])
         .on_window_event(|window, event| {
