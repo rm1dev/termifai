@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   KeyRound,
   Clipboard,
+  File,
   FileUp,
   FileText,
   Eye,
@@ -47,7 +48,7 @@ import {
   ArrowDownToLine,
   ArrowUpFromLine,
   Container,
-  
+
   Gauge,
   GripVertical,
   Minus,
@@ -4720,7 +4721,9 @@ function SftpView({ tab }: { tab: AppTab }) {
                     }}
                   >
                     <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-foreground">
-                      <Folder className={`h-4 w-4 shrink-0 ${f.is_dir ? "text-[oklch(0.7_0.13_230)]" : "text-muted-foreground"}`} />
+                      {f.is_dir
+                        ? <Folder className="h-4 w-4 shrink-0 text-[oklch(0.7_0.13_230)]" />
+                        : <File   className="h-4 w-4 shrink-0 text-muted-foreground" />}
                       {f.name}
                     </div>
                     <div className="text-xs text-muted-foreground">{f.modified ?? "—"}</div>
@@ -4955,11 +4958,9 @@ function SftpView({ tab }: { tab: AppTab }) {
                         }}
                       >
                         <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-foreground">
-                          <Folder
-                            className={`h-4 w-4 shrink-0 ${
-                              f.is_dir ? "text-[oklch(0.65_0.12_145)]" : "text-muted-foreground"
-                            }`}
-                          />
+                          {f.is_dir
+                            ? <Folder className="h-4 w-4 shrink-0 text-[oklch(0.65_0.12_145)]" />
+                            : <File   className="h-4 w-4 shrink-0 text-muted-foreground" />}
                           {f.name}
                           {f.is_symlink && <span className="text-[10px] text-muted-foreground">→</span>}
                         </div>
