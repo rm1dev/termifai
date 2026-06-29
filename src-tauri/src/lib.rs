@@ -36,8 +36,8 @@ struct SftpTransferDone {
 }
 use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -50,6 +50,7 @@ struct AppState {
     tunnel_manager: TunnelManagerState,
     sftp_manager: Mutex<SftpManager>,
     watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
 }
 
 #[tauri::command]
@@ -408,17 +409,26 @@ async fn sftp_download(
 ) -> Result<(), String> {
     let app_bg = app.clone();
     let sid = session_id.clone();
+    let cancel_flag = {
+        let state = app.state::<AppState>();
+        let mut flags = state.transfer_cancel_flags.lock().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        flags.insert(session_id.clone(), Arc::clone(&flag));
+        flag
+    };
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let app_prog = app_bg.clone();
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
             let manager = state.sftp_manager.lock().unwrap();
-            manager.download_file(&sid, &remote_path, &local_path, move |progress| {
+            manager.download_file(&sid, &remote_path, &local_path, Arc::clone(&cancel_flag), move |progress| {
                 let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
             })
         })
         .await;
+        let state = app.state::<AppState>();
+        state.transfer_cancel_flags.lock().unwrap().remove(&session_id);
         let done = match result {
             Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
             Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
@@ -438,17 +448,26 @@ async fn sftp_upload(
 ) -> Result<(), String> {
     let app_bg = app.clone();
     let sid = session_id.clone();
+    let cancel_flag = {
+        let state = app.state::<AppState>();
+        let mut flags = state.transfer_cancel_flags.lock().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        flags.insert(session_id.clone(), Arc::clone(&flag));
+        flag
+    };
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             let app_prog = app_bg.clone();
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
             let manager = state.sftp_manager.lock().unwrap();
-            manager.upload_file(&sid, &local_path, &remote_path, move |progress| {
+            manager.upload_file(&sid, &local_path, &remote_path, Arc::clone(&cancel_flag), move |progress| {
                 let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
             })
         })
         .await;
+        let state = app.state::<AppState>();
+        state.transfer_cancel_flags.lock().unwrap().remove(&session_id);
         let done = match result {
             Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
             Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
@@ -494,6 +513,18 @@ fn sftp_mkdir_remote(
 fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), String> {
     let mut manager = state.sftp_manager.lock().unwrap();
     manager.disconnect(&session_id)
+}
+
+#[tauri::command]
+fn sftp_cancel_transfer(
+    state: State<AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let flags = state.transfer_cancel_flags.lock().unwrap();
+    if let Some(flag) = flags.get(&session_id) {
+        flag.store(true, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -740,6 +771,7 @@ pub fn run() {
             tunnel_manager: port_forwarding::new_tunnel_manager(),
             sftp_manager: Mutex::new(SftpManager::new()),
             watch_handles: Mutex::new(std::collections::HashMap::new()),
+            transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
@@ -771,6 +803,7 @@ pub fn run() {
             run_snippet_script,
             sftp_connect_from_host,
             sftp_disconnect,
+            sftp_cancel_transfer,
             sftp_download,
             sftp_upload,
             sftp_list_local,
