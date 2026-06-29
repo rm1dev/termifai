@@ -4,6 +4,7 @@ mod pty_manager;
 mod sftp;
 mod snippets;
 mod ssh_keys;
+pub mod dashboard;
 
 use hosts::{
     Host, HostGroup, HostsVault, SaveHostGroupRequest, SaveHostRequest, TestHostConnectionRequest,

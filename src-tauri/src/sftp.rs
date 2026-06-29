@@ -532,7 +532,7 @@ mod tests {
     #[test]
     fn test_download_no_session_returns_error() {
         let manager = SftpManager::new();
-        let result = manager.download_file("nonexistent", "/remote/file.txt", "/tmp/out.txt", |_| {});
+        let result = manager.download_file("nonexistent", "/remote/file.txt", "/tmp/out.txt", Arc::new(AtomicBool::new(false)), |_| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn test_upload_no_session_returns_error() {
         let manager = SftpManager::new();
-        let result = manager.upload_file("nonexistent", "/tmp/local.txt", "/remote/file.txt", |_| {});
+        let result = manager.upload_file("nonexistent", "/tmp/local.txt", "/remote/file.txt", Arc::new(AtomicBool::new(false)), |_| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
