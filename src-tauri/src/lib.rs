@@ -529,6 +529,12 @@ fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn sftp_mkdir_local(path: String) -> Result<(), String> {
+    std::fs::create_dir_all(&path)
+        .map_err(|e| format!("Create dir '{}': {}", path, e))
+}
+
+#[tauri::command]
 fn sftp_copy_local(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
     let dest = std::path::Path::new(&dest_dir);
     for path in &paths {
@@ -779,6 +785,7 @@ pub fn run() {
             sftp_get_users_groups,
             sftp_rename_local,
             sftp_delete_local,
+            sftp_mkdir_local,
             sftp_copy_local,
             sftp_open_local,
             sftp_open_with_local,
