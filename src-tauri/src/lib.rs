@@ -496,6 +496,61 @@ fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), Str
 }
 
 #[tauri::command]
+fn sftp_stat_remote(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+) -> Result<sftp::RemoteStatResult, String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.stat_remote(&session_id, &path)
+}
+
+#[tauri::command]
+fn sftp_chmod(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+    mode: String,
+    recursive: bool,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.chmod(&session_id, &path, &mode, recursive)
+}
+
+#[tauri::command]
+fn sftp_chown(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+    user: String,
+    group: String,
+    recursive: bool,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.chown(&session_id, &path, &user, &group, recursive)
+}
+
+#[tauri::command]
+fn sftp_copy_remote(
+    state: State<AppState>,
+    session_id: String,
+    paths: Vec<String>,
+    dest_dir: String,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.copy_remote(&session_id, &paths, &dest_dir)
+}
+
+#[tauri::command]
+fn sftp_get_users_groups(
+    state: State<AppState>,
+    session_id: String,
+) -> Result<sftp::UsersGroups, String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.get_users_groups(&session_id)
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
@@ -552,6 +607,11 @@ pub fn run() {
             sftp_delete_remote,
             sftp_rename_remote,
             sftp_mkdir_remote,
+            sftp_stat_remote,
+            sftp_chmod,
+            sftp_chown,
+            sftp_copy_remote,
+            sftp_get_users_groups,
             quit_app,
         ])
         .on_window_event(|window, event| {
