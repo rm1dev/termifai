@@ -245,7 +245,7 @@ pub(crate) fn parse_container_cgroup(
     prev_cpu_ns: Option<u64>,
     prev_net: Option<(u64, u64)>,
     poll_secs: f64,
-) -> (f32, u64, u64, f64, f64, Option<u64>) {
+) -> (f32, u64, u64, f64, f64, Option<u64>, Option<(u64, u64)>) {
     let mut mem_used: u64 = 0;
     let mut mem_limit: u64 = u64::MAX;
     let mut cpu_usage_ns: u64 = 0;
@@ -298,7 +298,8 @@ pub(crate) fn parse_container_cgroup(
     };
 
     let next_cpu = if cpu_usage_ns > 0 { Some(cpu_usage_ns) } else { None };
-    (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu)
+    let next_net = if net_rx > 0 || net_tx > 0 { Some((net_rx, net_tx)) } else { None };
+    (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu, next_net)
 }
 
 // ─── Actor types ─────────────────────────────────────────────────────────────
@@ -443,6 +444,8 @@ fn run_actor(
                             state.session = new_session;
                             state.prev_cpu = None;
                             state.prev_net = None;
+                            state.prev_container_cpu.clear();
+                            state.prev_container_net.clear();
                             do_poll(&mut state, &host_id, want_detail, poll_secs)
                         }
                         Err(e) => Err(e),
@@ -556,11 +559,14 @@ fn collect_docker_metrics(state: &mut ActorState, poll_secs: f64) -> Result<Vec<
         let prev_cpu_ns = state.prev_container_cpu.get(id).copied();
         let prev_net = state.prev_container_net.get(id).copied();
 
-        let (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu) =
+        let (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu, next_net) =
             parse_container_cgroup(&cgroup_raw, prev_cpu_ns, prev_net, poll_secs);
 
         if let Some(ns) = next_cpu {
             state.prev_container_cpu.insert(id.clone(), ns);
+        }
+        if let Some(net) = next_net {
+            state.prev_container_net.insert(id.clone(), net);
         }
 
         result.push(ContainerMetric {
@@ -695,7 +701,7 @@ eth0: 5100000 0 0 0 0 0 0 0 2100000 0
     #[test]
     fn test_parse_container_cgroup_first_poll() {
         let raw = "10485760\n8589934592\nusage_usec 500000\n";
-        let (cpu, mem_used, mem_limit, _, _, next_cpu) = parse_container_cgroup(raw, None, None, 30.0);
+        let (cpu, mem_used, mem_limit, _, _, next_cpu, _) = parse_container_cgroup(raw, None, None, 30.0);
         assert_eq!(cpu, 0.0);
         assert_eq!(mem_used, 10485760);
         assert_eq!(mem_limit, 8589934592);
