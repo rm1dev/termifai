@@ -258,7 +258,7 @@ pub(crate) fn parse_container_cgroup(
         }
         if parts.len() == 2 {
             match parts[0] {
-                "usage_usec" => { cpu_usage_ns = parts[1].parse().unwrap_or(0) * 1_000_000; }
+                "usage_usec" => { cpu_usage_ns = parts[1].parse().unwrap_or(0) * 1_000; }
                 "usage" => { cpu_usage_ns = parts[1].parse().unwrap_or(0); }
                 _ => {}
             }
@@ -381,6 +381,6 @@ eth0: 5100000 0 0 0 0 0 0 0 2100000 0
         assert_eq!(cpu, 0.0);
         assert_eq!(mem_used, 10485760);
         assert_eq!(mem_limit, 8589934592);
-        assert_eq!(next_cpu, Some(500_000_000_000)); // * 1000
+        assert_eq!(next_cpu, Some(500_000_000)); // 500_000 µs × 1000 = 500_000_000 ns
     }
 }
