@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use ssh2::Session;
 use std::collections::HashMap;
 use std::net::TcpStream;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SftpConnectRequest {
@@ -80,6 +81,10 @@ pub fn list_local(path: &str) -> Result<Vec<LocalFileEntry>, String> {
     Ok(entries)
 }
 
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn format_unix_timestamp(secs: u64) -> String {
     let secs = secs as i64;
     let (y, mo, d, h, mi) = unix_to_ymd_hm(secs);
@@ -106,6 +111,19 @@ fn unix_to_ymd_hm(secs: i64) -> (i32, u32, u32, u32, u32) {
     (y as i32, mo as u32, d as u32, h, mi)
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RemoteStatResult {
+    pub permissions: u32,
+    pub owner: String,
+    pub group: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct UsersGroups {
+    pub users: Vec<String>,
+    pub groups: Vec<String>,
+}
+
 pub struct SftpEntry {
     pub session: Session,
 }
@@ -121,26 +139,35 @@ impl SftpManager {
         }
     }
 
-    pub fn connect(&mut self, req: SftpConnectRequest) -> Result<SftpSessionInfo, String> {
+    /// `log(stage, message)` — stage is one of "connecting", "handshaking", "authenticating", "ready"
+    pub fn connect<F>(&mut self, req: SftpConnectRequest, log: F) -> Result<SftpSessionInfo, String>
+    where
+        F: Fn(&str, &str),
+    {
         let addr = format!("{}:{}", req.hostname, req.port);
+
+        log("connecting", &format!("Opening TCP connection to {}...", addr));
         let tcp = TcpStream::connect(&addr)
             .map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
 
+        log("handshaking", "TCP connected. Starting SSH handshake...");
         let mut session = Session::new().map_err(|e| format!("SSH session init: {}", e))?;
         session.set_tcp_stream(tcp);
         session.handshake().map_err(|e| format!("SSH handshake: {}", e))?;
 
-        // Auth: try key first, fall back to password
+        log("authenticating", &format!("Authenticating as {}...", req.username));
         if let Some(key_path) = &req.private_key_path {
+            log("authenticating", &format!("Using public key: {}", key_path));
             session
                 .userauth_pubkey_file(&req.username, None, std::path::Path::new(key_path), None)
                 .map_err(|e| format!("Key auth failed: {}", e))?;
         } else if let Some(password) = &req.password {
+            log("authenticating", "Using password authentication...");
             session
                 .userauth_password(&req.username, password)
                 .map_err(|e| format!("Password auth failed: {}", e))?;
         } else {
-            // Try SSH agent
+            log("authenticating", "Trying SSH agent...");
             session
                 .userauth_agent(&req.username)
                 .map_err(|e| format!("Agent auth failed: {}", e))?;
@@ -153,6 +180,7 @@ impl SftpManager {
         let remote_path = req.default_remote_path.clone().unwrap_or_else(|| "/".to_string());
         self.sessions.insert(req.session_id.clone(), SftpEntry { session });
 
+        log("ready", &format!("Authenticated. Opening {}...", remote_path));
         Ok(SftpSessionInfo {
             session_id: req.session_id,
             remote_path,
@@ -202,6 +230,7 @@ impl SftpManager {
         session_id: &str,
         remote_path: &str,
         local_path: &str,
+        cancel: Arc<AtomicBool>,
         on_progress: F,
     ) -> Result<(), String>
     where
@@ -235,6 +264,10 @@ impl SftpManager {
         let result = (|| {
             loop {
                 use std::io::{Read, Write};
+                if cancel.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    return Err("Cancelled".to_string());
+                }
                 let n = remote_file.read(&mut buf).map_err(|e| format!("read remote: {}", e))?;
                 if n == 0 {
                     break;
@@ -269,6 +302,7 @@ impl SftpManager {
         session_id: &str,
         local_path: &str,
         remote_path: &str,
+        cancel: Arc<AtomicBool>,
         on_progress: F,
     ) -> Result<(), String>
     where
@@ -302,6 +336,10 @@ impl SftpManager {
 
         loop {
             use std::io::{Read, Write};
+            if cancel.load(Ordering::Relaxed) {
+                let _ = sftp.unlink(std::path::Path::new(remote_path));
+                return Err("Cancelled".to_string());
+            }
             let n = local_file.read(&mut buf).map_err(|e| format!("read local: {}", e))?;
             if n == 0 {
                 break;
@@ -368,6 +406,94 @@ impl SftpManager {
         let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
         sftp.mkdir(std::path::Path::new(path), 0o755)
             .map_err(|e| format!("mkdir '{}': {}", path, e))
+    }
+
+    pub fn exec_command(&self, session_id: &str, cmd: &str) -> Result<String, String> {
+        let entry = self.sessions.get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+        let mut channel = entry.session.channel_session()
+            .map_err(|e| format!("Channel open: {}", e))?;
+        channel.exec(cmd).map_err(|e| format!("Exec '{}': {}", cmd, e))?;
+        let mut output = String::new();
+        use std::io::Read;
+        channel.read_to_string(&mut output).map_err(|e| format!("Read output: {}", e))?;
+        channel.wait_close().map_err(|e| format!("Channel close: {}", e))?;
+        let status = channel.exit_status().map_err(|e| format!("Exit status: {}", e))?;
+        if status != 0 {
+            return Err(format!("Command '{}' exited with status {}", cmd, status));
+        }
+        Ok(output)
+    }
+
+    pub fn stat_remote(&self, session_id: &str, path: &str) -> Result<RemoteStatResult, String> {
+        let entry = self.sessions.get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+        let stat = sftp.stat(std::path::Path::new(path))
+            .map_err(|e| format!("stat '{}': {}", path, e))?;
+        let permissions = stat.perm.unwrap_or(0) & 0o7777;
+        // get owner/group via SSH exec since libssh2 stat doesn't return names
+        let owner_out = self.exec_command(session_id, &format!("stat -c '%U %G' {} 2>/dev/null || echo 'root root'", shell_escape(path)))?;
+        let parts: Vec<&str> = owner_out.trim().splitn(2, ' ').collect();
+        let owner = parts.first().unwrap_or(&"root").to_string();
+        let group = parts.get(1).unwrap_or(&"root").to_string();
+        Ok(RemoteStatResult { permissions, owner, group })
+    }
+
+    pub fn chmod(&self, session_id: &str, path: &str, mode: &str, recursive: bool) -> Result<(), String> {
+        if !mode.chars().all(|c| c.is_ascii_digit()) || mode.is_empty() || mode.len() > 4 {
+            return Err(format!("Invalid chmod mode: '{}'", mode));
+        }
+        let flag = if recursive { "-R " } else { "" };
+        let cmd = format!("chmod {}{} {}", flag, mode, shell_escape(path));
+        self.exec_command(session_id, &cmd)?;
+        Ok(())
+    }
+
+    pub fn chown(&self, session_id: &str, path: &str, user: &str, group: &str, recursive: bool) -> Result<(), String> {
+        fn is_valid_name(s: &str) -> bool {
+            !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '@' || c == ':')
+        }
+        if !is_valid_name(user) { return Err(format!("Invalid user name: '{}'", user)); }
+        if !is_valid_name(group) { return Err(format!("Invalid group name: '{}'", group)); }
+        let flag = if recursive { "-R " } else { "" };
+        let cmd = format!("chown {}{}:{} {}", flag, user, group, shell_escape(path));
+        self.exec_command(session_id, &cmd)?;
+        Ok(())
+    }
+
+    pub fn copy_remote(&self, session_id: &str, paths: &[String], dest_dir: &str) -> Result<(), String> {
+        for path in paths {
+            let cmd = format!("cp -a {} {}/", shell_escape(path), shell_escape(dest_dir));
+            self.exec_command(session_id, &cmd)?;
+        }
+        Ok(())
+    }
+
+    pub fn get_users_groups(&self, session_id: &str) -> Result<UsersGroups, String> {
+        let users_out = self.exec_command(session_id, "getent passwd | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/passwd")?;
+        let groups_out = self.exec_command(session_id, "getent group | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/group")?;
+        let users = users_out.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let groups = groups_out.lines().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        Ok(UsersGroups { users, groups })
+    }
+
+    pub fn open_remote(&self, session_id: &str, remote_path: &str) -> Result<String, String> {
+        let file_name = std::path::Path::new(remote_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        let tmp_path = format!("/tmp/termifai_{}_{}", session_id, file_name);
+        let entry = self.sessions.get(session_id)
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+        let sftp = entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+        let mut remote_file = sftp.open(std::path::Path::new(remote_path))
+            .map_err(|e| format!("Open remote '{}': {}", remote_path, e))?;
+        let mut local_file = std::fs::File::create(&tmp_path)
+            .map_err(|e| format!("Create tmp '{}': {}", tmp_path, e))?;
+        std::io::copy(&mut remote_file, &mut local_file)
+            .map_err(|e| format!("Copy to tmp: {}", e))?;
+        Ok(tmp_path)
     }
 
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
