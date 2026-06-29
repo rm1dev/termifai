@@ -4206,6 +4206,7 @@ function SftpView({ tab }: { tab: AppTab }) {
   const [remoteError, setRemoteError] = useState<string | null>(null);
   const [watchedFile, setWatchedFile] = useState<{ tmpPath: string; remotePath: string; changed: boolean } | null>(null);
   const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ targets: string[]; isLocal: boolean; label: string } | null>(null);
   const [newFolderTarget, setNewFolderTarget] = useState<"local" | "remote" | null>(null);
 
   // Load hosts for picker (only when no host is pre-selected)
@@ -4304,6 +4305,11 @@ function SftpView({ tab }: { tab: AppTab }) {
         return next;
       });
     } else {
+      if (selectedLocal.size === 1 && selectedLocal.has(path)) {
+        setSelectedLocal(new Set());
+        setLastLocalClick(null);
+        return;
+      }
       setSelectedLocal(new Set([path]));
     }
     setLastLocalClick(path);
@@ -4323,6 +4329,11 @@ function SftpView({ tab }: { tab: AppTab }) {
         return next;
       });
     } else {
+      if (selectedRemote.size === 1 && selectedRemote.has(path)) {
+        setSelectedRemote(new Set());
+        setLastRemoteClick(null);
+        return;
+      }
       setSelectedRemote(new Set([path]));
     }
     setLastRemoteClick(path);
@@ -4574,9 +4585,9 @@ function SftpView({ tab }: { tab: AppTab }) {
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
-      {/* Transfer progress bar */}
+      {/* Transfer progress — fixed bottom sheet, does not affect layout */}
       {(transferOverall || transferError) && (
-        <div className="flex h-9 items-center gap-3 border-b border-border bg-[var(--color-surface-2)] px-4 text-xs">
+        <div className="fixed bottom-0 left-0 right-0 z-40 flex h-12 items-center gap-3 border-t border-border bg-[var(--color-surface-2)] px-4 text-xs shadow-[0_-4px_24px_rgba(0,0,0,0.3)]">
           {transferError ? (
             <span className="text-red-400">{transferError}</span>
           ) : transferOverall ? (() => {
@@ -4695,7 +4706,7 @@ function SftpView({ tab }: { tab: AppTab }) {
             onNewFolder={() => setNewFolderTarget("local")}
             onRefresh={() => void loadLocalDir(localPath)}
           >
-          <div className="flex-1 overflow-y-auto">
+          <div className="flex-1 overflow-y-auto" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedLocal(new Set()); setLastLocalClick(null); } }}>
             {localLoading && (
               <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
             )}
@@ -4726,13 +4737,24 @@ function SftpView({ tab }: { tab: AppTab }) {
                     onOpen={() => handleOpenLocal(f.path)}
                     onOpenWith={() => setOpenWithTarget({ path: f.path, isLocal: true })}
                     onDownload={() => {}}
-                    onUpload={() => void handleUpload([f.path])}
+                    onUpload={() => void handleUpload(selectedLocal.has(f.path) ? [...selectedLocal] : [f.path])}
                     onCopy={() => handleCopyLocal(selectedLocal.size > 0 ? [...selectedLocal] : [f.path])}
                     onPaste={handlePasteLocal}
                     onRename={() => setRenameTarget({ path: f.path, name: f.name, isLocal: true })}
                     onDelete={() => {
                       const targets = selectedLocal.has(f.path) ? [...selectedLocal] : [f.path];
-                      handleDeleteLocal(targets);
+                      const allEntries = localFiles;
+                      const label = targets.length === 1
+                        ? (allEntries.find((e) => e.path === targets[0])?.name ?? targets[0])
+                        : (() => {
+                            const dirs = targets.filter((p) => allEntries.find((e) => e.path === p)?.is_dir).length;
+                            const files = targets.length - dirs;
+                            const parts = [];
+                            if (files > 0) parts.push(`${files} file${files > 1 ? "s" : ""}`);
+                            if (dirs > 0) parts.push(`${dirs} folder${dirs > 1 ? "s" : ""}`);
+                            return parts.join(" and ");
+                          })();
+                      setTimeout(() => setDeleteConfirm({ targets, isLocal: true, label }), 0);
                     }}
                     onRefresh={() => void loadLocalDir(localPath)}
                     onEditPermissions={() => {}}
@@ -4931,7 +4953,7 @@ function SftpView({ tab }: { tab: AppTab }) {
                 onNewFolder={() => setNewFolderTarget("remote")}
                 onRefresh={() => remotePath && void loadRemoteDir(remotePath)}
               >
-              <div className="flex-1 overflow-y-auto">
+              <div className="flex-1 overflow-y-auto" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedRemote(new Set()); setLastRemoteClick(null); } }}>
                 {remoteLoading && (
                   <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
                 )}
@@ -4964,16 +4986,25 @@ function SftpView({ tab }: { tab: AppTab }) {
                         hasClipboard={remoteClipboard.length > 0}
                         onOpen={() => void handleOpenRemote(f.path).catch((e: unknown) => toast.error(String(e)))}
                         onOpenWith={() => setOpenWithTarget({ path: f.path, isLocal: false })}
-                        onDownload={() => void handleDownload([f.path])}
+                        onDownload={() => void handleDownload(selectedRemote.has(f.path) ? [...selectedRemote] : [f.path])}
                         onUpload={() => {}}
                         onCopy={() => handleCopyRemote(selectedRemote.size > 0 ? [...selectedRemote] : [f.path])}
                         onPaste={handlePasteRemote}
                         onRename={() => setRenameTarget({ path: f.path, name: f.name, isLocal: false })}
                         onDelete={() => {
                           const targets = selectedRemote.has(f.path) ? [...selectedRemote] : [f.path];
-                          void invoke("sftp_delete_remote", { sessionId: sftpSessionId, paths: targets })
-                            .then(() => remotePath && loadRemoteDir(remotePath))
-                            .catch((e: unknown) => toast.error(String(e)));
+                          const allEntries = remoteFiles;
+                          const label = targets.length === 1
+                            ? (allEntries.find((e) => e.path === targets[0])?.name ?? targets[0])
+                            : (() => {
+                                const dirs = targets.filter((p) => allEntries.find((e) => e.path === p)?.is_dir).length;
+                                const files = targets.length - dirs;
+                                const parts = [];
+                                if (files > 0) parts.push(`${files} file${files > 1 ? "s" : ""}`);
+                                if (dirs > 0) parts.push(`${dirs} folder${dirs > 1 ? "s" : ""}`);
+                                return parts.join(" and ");
+                              })();
+                          setTimeout(() => setDeleteConfirm({ targets, isLocal: false, label }), 0);
                         }}
                         onRefresh={() => remotePath && void loadRemoteDir(remotePath)}
                         onEditPermissions={() => setPermTarget(f.path)}
@@ -5143,6 +5174,46 @@ function SftpView({ tab }: { tab: AppTab }) {
       />
 
       {/* Disconnect-during-transfer confirmation */}
+      <AlertDialog.Root open={!!deleteConfirm} onOpenChange={(open) => { if (!open) setDeleteConfirm(null); }}>
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/40" />
+          <AlertDialog.Content className="fixed left-1/2 top-1/2 z-50 w-96 -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-[var(--color-surface-2)] p-5 shadow-xl">
+            <AlertDialog.Title className="text-sm font-medium text-foreground">Delete</AlertDialog.Title>
+            <AlertDialog.Description className="mt-2 text-xs text-muted-foreground">
+              {deleteConfirm && deleteConfirm.targets.length === 1
+                ? <>Are you sure you want to delete <span className="font-medium text-foreground">"{deleteConfirm.label}"</span>? This action cannot be undone.</>
+                : <>Are you sure you want to delete <span className="font-medium text-foreground">{deleteConfirm?.label}</span>? This action cannot be undone.</>
+              }
+            </AlertDialog.Description>
+            <div className="mt-4 flex justify-end gap-2">
+              <AlertDialog.Cancel asChild>
+                <button className="rounded px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground">
+                  Cancel
+                </button>
+              </AlertDialog.Cancel>
+              <AlertDialog.Action asChild>
+                <button
+                  className="rounded bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500"
+                  onClick={() => {
+                    if (!deleteConfirm) return;
+                    if (deleteConfirm.isLocal) {
+                      handleDeleteLocal(deleteConfirm.targets);
+                    } else {
+                      void invoke("sftp_delete_remote", { sessionId: sftpSessionId, paths: deleteConfirm.targets })
+                        .then(() => remotePath && loadRemoteDir(remotePath))
+                        .catch((e: unknown) => toast.error(String(e)));
+                    }
+                    setDeleteConfirm(null);
+                  }}
+                >
+                  Delete
+                </button>
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
+
       <AlertDialog.Root open={showDisconnectConfirm} onOpenChange={setShowDisconnectConfirm}>
         <AlertDialog.Portal>
           <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/40" />
