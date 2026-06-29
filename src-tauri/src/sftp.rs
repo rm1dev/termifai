@@ -337,6 +337,7 @@ impl SftpManager {
         loop {
             use std::io::{Read, Write};
             if cancel.load(Ordering::Relaxed) {
+                let _ = sftp.unlink(std::path::Path::new(remote_path));
                 return Err("Cancelled".to_string());
             }
             let n = local_file.read(&mut buf).map_err(|e| format!("read local: {}", e))?;
