@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import type { JSX } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
 
 interface SftpNewFolderDialogProps {
@@ -7,7 +8,7 @@ interface SftpNewFolderDialogProps {
   onClose: () => void;
 }
 
-export function SftpNewFolderDialog({ open, onConfirm, onClose }: SftpNewFolderDialogProps) {
+export function SftpNewFolderDialog({ open, onConfirm, onClose }: SftpNewFolderDialogProps): JSX.Element {
   const [name, setName] = useState("");
 
   useEffect(() => {

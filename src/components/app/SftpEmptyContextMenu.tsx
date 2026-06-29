@@ -1,4 +1,5 @@
 import React from "react";
+import type { JSX } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import { FolderPlus, RefreshCw } from "lucide-react";
 
@@ -8,7 +9,7 @@ interface SftpEmptyContextMenuProps {
   onRefresh: () => void;
 }
 
-export function SftpEmptyContextMenu({ children, onNewFolder, onRefresh }: SftpEmptyContextMenuProps) {
+export function SftpEmptyContextMenu({ children, onNewFolder, onRefresh }: SftpEmptyContextMenuProps): JSX.Element {
   return (
     <ContextMenu.Root>
       <ContextMenu.Trigger asChild>{children}</ContextMenu.Trigger>
