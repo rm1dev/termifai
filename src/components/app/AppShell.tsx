@@ -4200,6 +4200,7 @@ function SftpView({ tab }: { tab: AppTab }) {
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [watchedFile, setWatchedFile] = useState<{ tmpPath: string; remotePath: string; changed: boolean } | null>(null);
 
   // Load hosts for picker (only when no host is pre-selected)
   useEffect(() => {
@@ -4266,6 +4267,22 @@ function SftpView({ tab }: { tab: AppTab }) {
       void unlisten.then((fn) => fn());
     };
   }, [isConnected, sftpSessionId]);
+
+  // Listen for file-changed events (remote watch)
+  useEffect(() => {
+    if (!sftpSessionId) return;
+    const unlisten = listen<{ tmp_path: string; remote_path: string }>(
+      `sftp:${sftpSessionId}:file-changed`,
+      (ev) => {
+        setWatchedFile({
+          tmpPath: ev.payload.tmp_path,
+          remotePath: ev.payload.remote_path,
+          changed: true,
+        });
+      }
+    );
+    return () => { void unlisten.then((fn) => fn()); };
+  }, [sftpSessionId]);
 
   const handleLocalClick = (e: React.MouseEvent, path: string) => {
     if (e.shiftKey && lastLocalClick) {
@@ -4717,33 +4734,18 @@ function SftpView({ tab }: { tab: AppTab }) {
         </div>
       </div>
 
-      {/* Transfer actions strip / resizable divider */}
+      {/* Resizable divider */}
       <div
-        className="flex w-12 flex-shrink-0 cursor-col-resize flex-col items-center justify-center gap-3 border-r border-border bg-[var(--color-surface)] select-none"
+        className="flex w-6 flex-shrink-0 cursor-col-resize items-center justify-center border-r border-border bg-[var(--color-surface)] select-none"
         onMouseDown={onDividerMouseDown}
       >
-        <button
-          className="rounded p-1.5 text-xs text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30"
-          title="Download to local"
-          disabled={!isConnected || selectedRemote.size === 0}
-          onClick={(e) => { e.stopPropagation(); void handleDownload(); }}
-        >
-          ↓
-        </button>
-        <button
-          className="rounded p-1.5 text-xs text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30"
-          title="Upload to remote"
-          disabled={!isConnected || selectedLocal.size === 0}
-          onClick={(e) => { e.stopPropagation(); void handleUpload(); }}
-        >
-          ↑
-        </button>
+        <GripVertical className="h-3.5 w-3.5 text-muted-foreground" />
       </div>
 
       {/* Remote pane */}
       <div
         className={`flex flex-col overflow-hidden transition-colors ${remoteDragOver ? "bg-[oklch(0.45_0.12_145)]/5" : ""}`}
-        style={{ width: `calc(100% - ${localWidthPct}% - 48px)` }}
+        style={{ width: `calc(100% - ${localWidthPct}% - 24px)` }}
         onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setRemoteDragOver(true); }}
         onDragLeave={() => setRemoteDragOver(false)}
         onDrop={(e) => {
@@ -4973,6 +4975,44 @@ function SftpView({ tab }: { tab: AppTab }) {
               </div>
             </div>
           </>
+        )}
+
+        {/* Remote file watch bar */}
+        {watchedFile?.changed && (
+          <div className="flex h-10 flex-shrink-0 items-center justify-between border-t border-border bg-[var(--color-surface)] px-4">
+            <span className="text-xs text-muted-foreground">
+              <span className="mr-1 text-foreground">{watchedFile.remotePath.split("/").pop()}</span>
+              was modified locally
+            </span>
+            <div className="flex gap-2">
+              <button
+                className="rounded px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => {
+                  void invoke("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
+                  setWatchedFile(null);
+                }}
+              >
+                Reject
+              </button>
+              <button
+                className="rounded bg-[oklch(0.45_0.12_145)] px-2.5 py-1 text-xs font-medium text-white hover:bg-[oklch(0.5_0.12_145)]"
+                onClick={async () => {
+                  try {
+                    await invokeTransfer("sftp_upload", {
+                      sessionId: sftpSessionId,
+                      localPath: watchedFile.tmpPath,
+                      remotePath: watchedFile.remotePath,
+                    });
+                    await invoke("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
+                    setWatchedFile(null);
+                    if (remotePath) await loadRemoteDir(remotePath);
+                  } catch (e) { toast.error(String(e)); }
+                }}
+              >
+                Upload
+              </button>
+            </div>
+          </div>
         )}
       </div>
       </div>
