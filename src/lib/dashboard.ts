@@ -2,8 +2,18 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState } from "react";
 
+export interface CoreMetrics {
+  total: number;
+  user: number;
+  system: number;
+  nice: number;
+  iowait: number;
+  steal: number;
+}
+
 export interface SystemMetrics {
   cpuPct: number;
+  cpuCores: CoreMetrics[];
   memTotalKb: number;
   memUsedKb: number;
   memCachedKb: number;

@@ -10,8 +10,20 @@ use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CoreMetrics {
+    pub total: f32,
+    pub user: f32,
+    pub system: f32,
+    pub nice: f32,
+    pub iowait: f32,
+    pub steal: f32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SystemMetrics {
     pub cpu_pct: f32,
+    pub cpu_cores: Vec<CoreMetrics>,
     pub mem_total_kb: u64,
     pub mem_used_kb: u64,
     pub mem_cached_kb: u64,
@@ -84,13 +96,17 @@ impl CpuSnapshot {
 /// prev_cpu: snapshot from previous poll for delta CPU
 /// prev_net: (rx_bytes, tx_bytes) from previous poll for rate
 /// poll_secs: interval between polls for rate calculation
+/// prev_cpu_cores: per-core snapshots from previous poll for per-core delta
+/// Returns (metrics, aggregate_snap, net, per_core_snaps)
 pub(crate) fn parse_proc_output(
     raw: &str,
     prev_cpu: Option<&CpuSnapshot>,
     prev_net: Option<(u64, u64)>,
     poll_secs: f64,
-) -> (SystemMetrics, CpuSnapshot, (u64, u64)) {
+    prev_cpu_cores: &[CpuSnapshot],
+) -> (SystemMetrics, CpuSnapshot, (u64, u64), Vec<CpuSnapshot>) {
     let mut cpu_snap = CpuSnapshot { user:0, nice:0, system:0, idle:0, iowait:0, irq:0, softirq:0 };
+    let mut cpu_core_snaps: Vec<CpuSnapshot> = Vec::new();
     let mut mem: HashMap<&str, u64> = HashMap::new();
     let mut load_1m = 0f32; let mut load_5m = 0f32; let mut load_15m = 0f32;
     let mut uptime_secs = 0u64;
@@ -112,9 +128,17 @@ pub(crate) fn parse_proc_output(
                 };
             }
         }
-        // /proc/stat — per-core lines for core count
+        // /proc/stat — per-core lines: count and snapshot each core
         if line.starts_with("cpu") && line.len() > 3 && line.chars().nth(3).map(|c| c.is_ascii_digit()).unwrap_or(false) {
             cores += 1;
+            let p: Vec<u64> = line.split_whitespace().skip(1)
+                .filter_map(|v| v.parse().ok()).collect();
+            if p.len() >= 7 {
+                cpu_core_snaps.push(CpuSnapshot {
+                    user: p[0], nice: p[1], system: p[2], idle: p[3],
+                    iowait: p[4], irq: p[5], softirq: p[6],
+                });
+            }
         }
         // /proc/meminfo
         if let Some((k, v)) = line.split_once(':') {
@@ -164,7 +188,7 @@ pub(crate) fn parse_proc_output(
         }
     }
 
-    // CPU% delta
+    // Aggregate CPU% delta
     let cpu_pct = match prev_cpu {
         Some(prev) => {
             let d_total = cpu_snap.total().saturating_sub(prev.total()) as f64;
@@ -172,6 +196,35 @@ pub(crate) fn parse_proc_output(
             if d_total > 0.0 { ((1.0 - d_idle / d_total) * 100.0) as f32 } else { 0.0 }
         }
         None => 0.0,
+    };
+
+    // Per-core CPU% delta (empty on first poll — no previous snapshots)
+    let cpu_cores: Vec<CoreMetrics> = if prev_cpu_cores.len() == cpu_core_snaps.len() && !prev_cpu_cores.is_empty() {
+        cpu_core_snaps.iter().zip(prev_cpu_cores.iter()).map(|(cur, prev)| {
+            let d_total = cur.total().saturating_sub(prev.total()) as f64;
+            let d_idle  = cur.idle_total().saturating_sub(prev.idle_total()) as f64;
+            let d_user  = cur.user.saturating_sub(prev.user) as f64;
+            let d_sys   = cur.system.saturating_sub(prev.system) as f64;
+            let d_nice  = cur.nice.saturating_sub(prev.nice) as f64;
+            let d_io    = cur.iowait.saturating_sub(prev.iowait) as f64;
+            let d_steal = cur.softirq.saturating_sub(prev.softirq) as f64; // steal not in CpuSnapshot; use softirq placeholder
+            if d_total > 0.0 {
+                let scale = 100.0 / d_total;
+                let total = ((1.0 - d_idle / d_total) * 100.0) as f32;
+                CoreMetrics {
+                    total,
+                    user:   (d_user   * scale) as f32,
+                    system: (d_sys    * scale) as f32,
+                    nice:   (d_nice   * scale) as f32,
+                    iowait: (d_io     * scale) as f32,
+                    steal:  (d_steal  * scale) as f32,
+                }
+            } else {
+                CoreMetrics { total: 0.0, user: 0.0, system: 0.0, nice: 0.0, iowait: 0.0, steal: 0.0 }
+            }
+        }).collect()
+    } else {
+        vec![]
     };
 
     // Network rate
@@ -192,6 +245,7 @@ pub(crate) fn parse_proc_output(
 
     let metrics = SystemMetrics {
         cpu_pct,
+        cpu_cores,
         mem_total_kb: mem_total,
         mem_used_kb: mem_used,
         mem_cached_kb: mem_cached,
@@ -208,7 +262,7 @@ pub(crate) fn parse_proc_output(
         ip,
     };
 
-    (metrics, cpu_snap, (net_rx, net_tx))
+    (metrics, cpu_snap, (net_rx, net_tx), cpu_core_snaps)
 }
 
 /// raw = output of docker ps --no-trunc --format '{"id":"{{.ID}}","name":"{{.Names}}","state":"{{.State}}"}'
@@ -374,6 +428,7 @@ fn exec_cmd(session: &Session, cmd: &str) -> Result<String, String> {
 struct ActorState {
     session: Session,
     prev_cpu: Option<CpuSnapshot>,
+    prev_cpu_cores: Vec<CpuSnapshot>,
     prev_net: Option<(u64, u64)>,
     prev_container_cpu: HashMap<String, u64>,  // container_id → cpu_ns
     prev_container_net: HashMap<String, (u64, u64)>,
@@ -421,6 +476,7 @@ fn run_actor(
     let mut state = ActorState {
         session,
         prev_cpu: None,
+        prev_cpu_cores: vec![],
         prev_net: None,
         prev_container_cpu: HashMap::new(),
         prev_container_net: HashMap::new(),
@@ -484,10 +540,11 @@ fn do_poll(state: &mut ActorState, host_id: &str, want_detail: bool, poll_secs: 
         "cat /proc/stat /proc/meminfo /proc/loadavg /proc/uptime /proc/net/dev",
     )?;
 
-    let (mut system, new_cpu, new_net) =
-        parse_proc_output(&sys_raw, state.prev_cpu.as_ref(), state.prev_net, poll_secs);
+    let (mut system, new_cpu, new_net, new_cpu_cores) =
+        parse_proc_output(&sys_raw, state.prev_cpu.as_ref(), state.prev_net, poll_secs, &state.prev_cpu_cores);
     state.prev_cpu = Some(new_cpu);
     state.prev_net = Some(new_net);
+    state.prev_cpu_cores = new_cpu_cores;
 
     // Disk usage from df
     if let Ok(df_raw) = exec_cmd(&state.session, "df -k / 2>/dev/null | tail -1") {
@@ -703,10 +760,12 @@ Inter-|   Receive   |  Transmit
 
     #[test]
     fn test_parse_cpu_first_poll_returns_zero() {
-        let (metrics, snap, _) = parse_proc_output(SAMPLE_PROC, None, None, 30.0);
+        let (metrics, snap, _, core_snaps) = parse_proc_output(SAMPLE_PROC, None, None, 30.0, &[]);
         assert_eq!(metrics.cpu_pct, 0.0, "first poll should be zero");
+        assert!(metrics.cpu_cores.is_empty(), "first poll: no prev cores → empty cpu_cores");
         assert_eq!(snap.user, 100);
         assert_eq!(snap.idle, 800);
+        assert_eq!(core_snaps.len(), 2, "should collect 2 per-core snapshots");
         assert!((metrics.load_1m - 0.45).abs() < 0.001, "load1m should be 0.45, got {}", metrics.load_1m);
         assert!((metrics.load_5m - 0.32).abs() < 0.001, "load5m should be 0.32, got {}", metrics.load_5m);
         assert!((metrics.load_15m - 0.28).abs() < 0.001, "load15m should be 0.28, got {}", metrics.load_15m);
@@ -715,6 +774,10 @@ Inter-|   Receive   |  Transmit
     #[test]
     fn test_parse_cpu_delta() {
         let prev = CpuSnapshot { user: 100, nice: 10, system: 50, idle: 800, iowait: 5, irq: 2, softirq: 3 };
+        let prev_cores = vec![
+            CpuSnapshot { user: 50, nice: 5, system: 25, idle: 400, iowait: 2, irq: 1, softirq: 1 },
+            CpuSnapshot { user: 50, nice: 5, system: 25, idle: 400, iowait: 3, irq: 1, softirq: 2 },
+        ];
         // second poll: 50 ticks work, 200 ticks idle
         let raw2 = "\
 cpu  150 10 50 1000 5 2 3 0 0 0
@@ -731,9 +794,12 @@ SwapFree: 0 kB
 lo: 0 0 0 0 0 0 0 0 0 0
 eth0: 5100000 0 0 0 0 0 0 0 2100000 0
 ";
-        let (metrics, _, _) = parse_proc_output(raw2, Some(&prev), Some((5000000, 2000000)), 30.0);
+        let (metrics, _, _, _) = parse_proc_output(raw2, Some(&prev), Some((5000000, 2000000)), 30.0, &prev_cores);
         // delta: total=250 idle=200 → cpu=(250-200)/250*100 = 20%
         assert!((metrics.cpu_pct - 20.0).abs() < 1.0, "CPU should be ~20%, was: {}", metrics.cpu_pct);
+        assert_eq!(metrics.cpu_cores.len(), 2, "should compute 2 per-core metrics");
+        // cpu0: d_total=125 d_idle=100 → 20%
+        assert!((metrics.cpu_cores[0].total - 20.0).abs() < 1.0, "core0 should be ~20%");
         assert_eq!(metrics.cores, 2);
         assert_eq!(metrics.mem_total_kb, 16384000);
         // net rate: (5100000-5000000)/30 = 3333 bytes/sec
