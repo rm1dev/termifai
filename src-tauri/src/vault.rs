@@ -121,8 +121,8 @@ pub fn op_try_cached_unlock(app: &AppHandle) -> Result<bool, String> {
 }
 
 pub fn op_lock() {
-    clear();
     forget_master_password();
+    clear();
 }
 
 pub fn op_change_master_password(app: &AppHandle, old: &str, new: &str) -> Result<(), String> {

@@ -536,7 +536,7 @@ fn encrypt_password_for_save(password: Option<String>) -> Option<String> {
     let pw = password.filter(|value| !value.is_empty())?;
     let guard = crate::vault::current_key();
     match guard.as_ref() {
-        Some(key) => crate::crypto::encrypt_field(key, &pw).ok().or(Some(pw)),
+        Some(key) => crate::crypto::encrypt_field(key, &pw).ok(),
         None => Some(pw),
     }
 }
