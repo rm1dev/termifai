@@ -600,6 +600,40 @@ fn collect_processes(state: &mut ActorState) -> Result<Vec<ProcessInfo>, String>
         .collect())
 }
 
+// ─── DashboardManager ────────────────────────────────────────────────────────
+
+pub struct DashboardManager {
+    actors: HashMap<String, HostActor>,
+}
+
+impl DashboardManager {
+    pub fn new() -> Self {
+        Self { actors: HashMap::new() }
+    }
+
+    pub fn connect(&mut self, host_id: String, actor: HostActor) {
+        if let Some(old) = self.actors.remove(&host_id) {
+            let _ = old.tx.try_send(ActorCmd::Disconnect);
+        }
+        self.actors.insert(host_id, actor);
+    }
+
+    pub fn disconnect(&mut self, host_id: &str) {
+        if let Some(actor) = self.actors.remove(host_id) {
+            let _ = actor.tx.try_send(ActorCmd::Disconnect);
+        }
+    }
+
+    /// Returns cloned senders only — Mutex is released immediately after.
+    pub fn senders(&self) -> Vec<(String, std::sync::mpsc::SyncSender<ActorCmd>)> {
+        self.actors.iter().map(|(id, a)| (id.clone(), a.tx.clone())).collect()
+    }
+
+    pub fn sender(&self, host_id: &str) -> Option<std::sync::mpsc::SyncSender<ActorCmd>> {
+        self.actors.get(host_id).map(|a| a.tx.clone())
+    }
+}
+
 // ─── Public spawn function ────────────────────────────────────────────────────
 
 pub fn spawn_host_actor(
