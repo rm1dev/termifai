@@ -1715,9 +1715,9 @@ function HostDashboardView({
                 <TableHeader className="sticky top-0 z-10 bg-[var(--color-surface)] backdrop-blur">
                   <TableRow className="border-border hover:bg-transparent">
                     <TableHead className="h-6 px-3 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Process</TableHead>
-                    <TableHead className="h-6 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">User</TableHead>
-                    <TableHead className="h-6 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">CPU%</TableHead>
-                    <TableHead className="h-6 px-3 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Mem</TableHead>
+                    <TableHead className="h-6 w-16 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">User</TableHead>
+                    <TableHead className="h-6 w-12 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">CPU%</TableHead>
+                    <TableHead className="h-6 w-14 px-3 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Mem</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -1755,9 +1755,9 @@ function HostDashboardView({
                             <div className="font-medium leading-tight text-foreground">{p.name}</div>
                             <div className="font-mono text-[9px] leading-tight text-muted-foreground/60">{p.pid}</div>
                           </TableCell>
-                          <TableCell className="py-1 font-mono text-muted-foreground">{p.user}</TableCell>
+                          <TableCell className="w-16 max-w-[4rem] truncate py-1 font-mono text-muted-foreground">{p.user}</TableCell>
                           <TableCell
-                            className="py-1 text-right font-mono font-bold tabular-nums"
+                            className="w-12 py-1 text-right font-mono font-bold tabular-nums"
                             style={{
                               color: isHot
                                 ? "var(--color-brand-red)"
@@ -1768,7 +1768,7 @@ function HostDashboardView({
                           >
                             {p.cpuPct.toFixed(1)}
                           </TableCell>
-                          <TableCell className="px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
+                          <TableCell className="w-14 px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
                         </TableRow>
                       );
                     });
