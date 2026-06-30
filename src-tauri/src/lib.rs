@@ -15,7 +15,7 @@ use port_forwarding::{
     PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus,
 };
 use pty_manager::{PtyManager, TabInfo};
-use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager, SftpSessionInfo, TransferProgress};
+use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
 use serde::Serialize;
 
 #[derive(Serialize, Clone)]
@@ -632,7 +632,7 @@ struct SftpFileChangedEvent {
 
 #[tauri::command]
 async fn sftp_open_remote(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: State<'_, AppState>,
     session_id: String,
     remote_path: String,
@@ -803,7 +803,7 @@ async fn dashboard_poll(
         }
     };
 
-    let handles: Vec<_> = senders.into_iter().map(|(id, tx)| {
+    let handles: Vec<_> = senders.into_iter().map(|(_id, tx)| {
         let app = app.clone();
         tokio::spawn(async move {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();

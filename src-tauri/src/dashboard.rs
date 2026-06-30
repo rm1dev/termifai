@@ -127,9 +127,9 @@ pub(crate) fn parse_proc_output(
     let mut uptime_secs = 0u64;
     let mut net_iface = String::new();
     let mut net_rx = 0u64; let mut net_tx = 0u64;
-    let mut disk_total_kb = 0u64; let mut disk_used_kb = 0u64;
+    let disk_total_kb = 0u64; let disk_used_kb = 0u64;
     let mut cores = 0u32;
-    let mut ip = String::new();
+    let ip = String::new();
     // Collect all real disk devices from /proc/diskstats; pick highest-traffic one
     let mut disk_snaps: Vec<DiskSnapshot> = Vec::new();
 
@@ -438,7 +438,7 @@ pub(crate) fn parse_container_cgroup(
 
 // ─── Actor types ─────────────────────────────────────────────────────────────
 
-pub(crate) enum ActorCmd {
+pub enum ActorCmd {
     /// Poll system + docker + processes
     Poll {
         want_detail: bool,
