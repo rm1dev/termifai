@@ -895,66 +895,81 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
-/// Polls for macOS screen-lock events every 5 seconds.
-/// When the screen locks and policy is OnScreenLock, the vault is locked.
+/// Global AppHandle for the screen-lock notification callback.
+/// Populated once in `start_screen_lock_monitor` before the observer is registered.
+#[cfg(target_os = "macos")]
+static SCREEN_LOCK_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// CoreFoundation callback fired when macOS emits `com.apple.screenIsLocked`.
+/// Runs on the main thread (the Cocoa run loop delivers it there).
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn screen_locked_callback(
+    _center: *mut std::ffi::c_void,
+    _observer: *const std::ffi::c_void,
+    _name: *mut std::ffi::c_void,
+    _object: *const std::ffi::c_void,
+    _user_info: *mut std::ffi::c_void,
+) {
+    if let Some(app) = SCREEN_LOCK_APP.get() {
+        vault::on_screen_lock(app);
+    }
+}
+
+/// Registers for the `com.apple.screenIsLocked` Darwin distributed notification
+/// on the main thread so delivery uses the existing Cocoa run loop.
+///
+/// Unlike the old polling approach this fires only on a genuine lock transition,
+/// never on transient display-sleep states or polling races at startup.
 #[cfg(target_os = "macos")]
 fn start_screen_lock_monitor(app: tauri::AppHandle) {
     use std::ffi::c_void;
     use std::ptr;
 
-    // Use CoreGraphics CGSessionCopyCurrentDictionary + CoreFoundation to
-    // detect screen lock without any extra crates.
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGSessionCopyCurrentDictionary() -> *const c_void;
-    }
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFDictionaryGetValueIfPresent(
-            dict: *const c_void,
-            key: *const c_void,
-            value: *mut *const c_void,
-        ) -> bool;
-        fn CFBooleanGetValue(boolean: *const c_void) -> bool;
-        fn CFRelease(cf: *const c_void);
-        fn CFStringCreateWithCString(
-            alloc: *const c_void,
-            c_str: *const i8,
-            encoding: u32,
-        ) -> *const c_void;
-    }
-    const KCF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    let _ = SCREEN_LOCK_APP.set(app.clone());
 
-    fn is_screen_locked() -> bool {
-        unsafe {
-            let dict = CGSessionCopyCurrentDictionary();
-            if dict.is_null() {
-                return false;
-            }
-            let key_bytes = b"CGSSessionScreenIsLocked\0";
-            let key = CFStringCreateWithCString(
-                ptr::null(),
-                key_bytes.as_ptr() as *const i8,
-                KCF_STRING_ENCODING_UTF8,
+    let _ = app.run_on_main_thread(|| unsafe {
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFNotificationCenterGetDistributedCenter() -> *mut c_void;
+            fn CFNotificationCenterAddObserver(
+                center: *mut c_void,
+                observer: *const c_void,
+                callback: unsafe extern "C" fn(
+                    *mut c_void,
+                    *const c_void,
+                    *mut c_void,
+                    *const c_void,
+                    *mut c_void,
+                ),
+                name: *mut c_void,
+                object: *const c_void,
+                suspension_behavior: isize,
             );
-            let mut value: *const c_void = ptr::null();
-            let found = CFDictionaryGetValueIfPresent(dict, key, &mut value);
-            CFRelease(key);
-            CFRelease(dict);
-            found && !value.is_null() && CFBooleanGetValue(value)
+            fn CFStringCreateWithCString(
+                alloc: *const c_void,
+                c_str: *const i8,
+                encoding: u32,
+            ) -> *mut c_void;
+            fn CFRelease(cf: *const c_void);
         }
-    }
 
-    std::thread::spawn(move || {
-        let mut prev_locked = false;
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            let locked = is_screen_locked();
-            if locked && !prev_locked {
-                vault::on_screen_lock(&app);
-            }
-            prev_locked = locked;
-        }
+        let center = CFNotificationCenterGetDistributedCenter();
+        let name_bytes = b"com.apple.screenIsLocked\0";
+        let name = CFStringCreateWithCString(
+            ptr::null(),
+            name_bytes.as_ptr() as *const i8,
+            0x0800_0100u32, // kCFStringEncodingUTF8
+        );
+        // kCFNotificationSuspensionBehaviorDeliverImmediately = 4
+        CFNotificationCenterAddObserver(
+            center,
+            ptr::null(),
+            screen_locked_callback,
+            name,
+            ptr::null(),
+            4,
+        );
+        CFRelease(name as *const c_void); // AddObserver retains; we release our ref
     });
 }
 
