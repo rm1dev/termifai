@@ -135,9 +135,10 @@ import { SftpRenameDialog } from "./SftpRenameDialog";
 import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
 import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
+import { useDashboard, fmtBytes, fmtUptime } from "@/lib/dashboard";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
-  // { key: "dashboard", label: "Dashboard", icon: LayoutDashboard }, // temporarily hidden
+  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { key: "hosts", label: "Hosts", icon: Server },
   { key: "port-forwarding", label: "Port Forwarding", icon: Network },
   { key: "snippets", label: "Snippets", icon: Braces },
@@ -809,6 +810,18 @@ function CircularGauge({ value, label }: { value: number; label: string }) {
   );
 }
 
+function ringGaugeColor(pct: number): { from: string; to: string } {
+  // cyan(210°) → yellow(85°) → orange(42°) → red #ff5f57
+  const bands = [
+    { at: 45,  from: "oklch(0.78 0.14 210)", to: "oklch(0.58 0.14 210)" },
+    { at: 70,  from: "oklch(0.92 0.16 85)",  to: "oklch(0.72 0.16 85)"  },
+    { at: 85,  from: "oklch(0.64 0.18 42)",  to: "oklch(0.48 0.18 42)"  },
+    { at: 100, from: "#ff5f57",               to: "#c0120a"               },
+  ];
+  const band = bands.find((b) => pct <= b.at) ?? bands[bands.length - 1];
+  return { from: band.from, to: band.to };
+}
+
 function RingGauge({
   value,
   label,
@@ -821,8 +834,8 @@ function RingGauge({
   value: number;
   label: string;
   gradientId: string;
-  from: string;
-  to: string;
+  from?: string;
+  to?: string;
   size?: number;
   stroke?: number;
 }) {
@@ -830,6 +843,9 @@ function RingGauge({
   const c = 2 * Math.PI * r;
   const pct = Math.max(0, Math.min(100, value));
   const offset = c - (pct / 100) * c;
+  const colors = ringGaugeColor(pct);
+  const colorFrom = from ?? colors.from;
+  const colorTo = to ?? colors.to;
   return (
     <div className="flex flex-col items-center gap-1">
       <span className="text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
@@ -839,8 +855,8 @@ function RingGauge({
         <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="-rotate-90">
           <defs>
             <linearGradient id={gradientId} x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor={from} />
-              <stop offset="100%" stopColor={to} />
+              <stop offset="0%" stopColor={colorFrom} />
+              <stop offset="100%" stopColor={colorTo} />
             </linearGradient>
           </defs>
           <circle
@@ -938,7 +954,7 @@ const DASHBOARD_SERVERS: ServerStat[] = [
     netDown: "151", netDownUnit: "K/s", netUp: "11.1", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
   { id: "h2", name: "Ariyapanel Bot", status: "error", cores: 8, ram: "0 B", storage: "0 B", uptime: "0 Minutes", cpu: 0, ramUsed: 0, diskUsed: 0, os: "Debian 11", ip: "—", cpuSamples: [0, 0, 0, 0, 0, 0, 0, 0],
     netDown: "0", netDownUnit: "B/s", netUp: "0", netUpUnit: "B/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h3", name: "AriyaPanel Monitoring", status: "online", cores: 8, ram: "2.90 G", storage: "26.2 G", uptime: "134 Days", cpu: 68, ramUsed: 74, diskUsed: 60, os: "Debian 11", ip: "192.168.90.198/24", cpuSamples: [82, 47, 91, 55, 73, 38, 88, 70],
+  { id: "h3", name: "AriyaPanel Monitoring", status: "online", cores: 8, ram: "2.90 G", storage: "26.2 G", uptime: "134 Days", cpu: 68, ramUsed: 95, diskUsed: 60, os: "Debian 11", ip: "192.168.90.198/24", cpuSamples: [82, 47, 91, 55, 73, 38, 88, 70],
     netDown: "31.6", netDownUnit: "K/s", netUp: "9.99", netUpUnit: "K/s", diskRead: "1.30", diskReadUnit: "M/s", diskWrite: "0", diskWriteUnit: "B/s" },
   { id: "h4", name: "AriyaPanel DB", status: "online", cores: 8, ram: "19.6 G", storage: "299 G", uptime: "167 Days", cpu: 23, ramUsed: 82, diskUsed: 71, os: "Ubuntu 20.04", ip: "192.168.90.200/24", cpuSamples: [12, 34, 8, 41, 18, 27, 15, 29],
     netDown: "401", netDownUnit: "K/s", netUp: "165", netUpUnit: "K/s", diskRead: "188", diskReadUnit: "K/s", diskWrite: "380", diskWriteUnit: "K/s" },
@@ -950,16 +966,48 @@ const DASHBOARD_SERVERS: ServerStat[] = [
 
 function DashboardView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const selected = DASHBOARD_SERVERS.find((s) => s.id === selectedId) ?? null;
+  const [hosts, setHosts] = useState<Host[]>([]);
 
-  if (selected) {
-    return <HostDashboardView host={selected} onBack={() => setSelectedId(null)} />;
+  // Load hosts that have showStatusInDashboard enabled
+  useEffect(() => {
+    invoke<{ hosts: Host[] }>("list_hosts")
+      .then((v) => setHosts(v.hosts.filter((h) => h.showStatusInDashboard)))
+      .catch(console.error);
+  }, []);
+
+  const hostIds = hosts.map((h) => h.id);
+  const { stats, loading } = useDashboard(hostIds);
+
+  if (selectedId) {
+    const host = hosts.find((h) => h.id === selectedId);
+    if (host) {
+      const sys = stats[selectedId]?.system;
+      // Build a ServerStat stub for HostDashboardView (Task 6 will change this signature)
+      const stub: ServerStat = {
+        id: host.id,
+        name: host.name,
+        status: stats[selectedId]?.ok ? "online" : "error",
+        cores: sys?.cores ?? 0,
+        ram: "—",
+        storage: "—",
+        uptime: "—",
+        cpu: sys?.cpuPct ?? 0,
+        ramUsed: sys && sys.memTotalKb > 0 ? Math.round((sys.memUsedKb / sys.memTotalKb) * 100) : 0,
+        diskUsed: sys && sys.diskTotalKb > 0 ? Math.round((sys.diskUsedKb / sys.diskTotalKb) * 100) : 0,
+        os: "—",
+        ip: sys?.ip ?? "—",
+        netDown: "—", netDownUnit: "",
+        netUp: "—", netUpUnit: "",
+        diskRead: "—", diskReadUnit: "",
+        diskWrite: "—", diskWriteUnit: "",
+      };
+      return <HostDashboardView host={stub} onBack={() => setSelectedId(null)} />;
+    }
   }
 
-  const servers = DASHBOARD_SERVERS;
-  const total = servers.length;
-  const online = servers.filter((s) => s.status === "online").length;
-  const offline = servers.filter((s) => s.status === "error").length;
+  const total = hosts.length;
+  const online = hosts.filter((h) => stats[h.id]?.ok).length;
+  const offline = hosts.filter((h) => stats[h.id] && !stats[h.id].ok).length;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-y-auto p-5">
@@ -988,67 +1036,98 @@ function DashboardView() {
         </div>
       </div>
 
+      {hosts.length === 0 && (
+        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+          No hosts configured for dashboard display.
+          <br />
+          Enable "Show in Dashboard" in host settings.
+        </div>
+      )}
+
       {/* Server cards */}
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        {servers.map((s) => (
-          <button
-            key={s.id}
-            type="button"
-            onClick={() => setSelectedId(s.id)}
-            className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
-          >
-            {/* Header */}
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold text-foreground">{s.name}</span>
-              <div className="flex items-center gap-1.5">
-                <span className={`h-2 w-2 rounded-full ${s.status === "online" ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
-                <span className="text-xs text-muted-foreground">{s.status === "online" ? "Online" : "Error"}</span>
-              </div>
-            </div>
+        {hosts.map((host) => {
+          const poll = stats[host.id];
+          const isLoading = loading.has(host.id);
+          const sys = poll?.system;
 
-            {/* Specs */}
-            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-              <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {s.cores} Cores</span>
-              <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {s.ram}</span>
-              <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {s.storage}</span>
-              <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {s.uptime}</span>
-            </div>
-
-            {/* Gauges & Stats */}
-            <div className="mt-4 flex items-start gap-6">
-              <CircularGauge value={s.cpu} label="CPU" />
-              <CircularGauge value={s.ramUsed} label="RAM" />
-
-              <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Network</div>
-                <div className="flex items-center gap-3 text-[11px] text-foreground">
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground" />
-                    {s.netDown} {s.netDownUnit}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground opacity-50" />
-                    {s.netUp} {s.netUpUnit}
+          return (
+            <button
+              key={host.id}
+              type="button"
+              onClick={() => setSelectedId(host.id)}
+              className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-foreground">{host.name}</span>
+                <div className="flex items-center gap-1.5">
+                  {isLoading ? (
+                    <span className="h-2 w-2 rounded-full bg-muted-foreground/40 animate-pulse" />
+                  ) : (
+                    <span className={`h-2 w-2 rounded-full ${poll?.ok ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
+                  )}
+                  <span className="text-xs text-muted-foreground">
+                    {isLoading ? "Connecting…" : poll?.ok ? "Online" : poll?.error ? "Error" : "—"}
                   </span>
                 </div>
               </div>
 
-              <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Disk</div>
-                <div className="flex items-center gap-3 text-[11px] text-foreground">
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground" />
-                    {s.diskRead} {s.diskReadUnit}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground opacity-50" />
-                    {s.diskWrite} {s.diskWriteUnit}
-                  </span>
-                </div>
+              {/* Specs from real system data */}
+              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                {sys && (
+                  <>
+                    <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys.cores} Cores</span>
+                    <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes(sys.memTotalKb * 1024)}</span>
+                    <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes(sys.diskTotalKb * 1024)}</span>
+                    <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {fmtUptime(sys.uptimeSecs)}</span>
+                  </>
+                )}
+                {isLoading && !sys && (
+                  <span className="h-3 w-32 rounded bg-border/60 animate-pulse inline-block" />
+                )}
               </div>
-            </div>
-          </button>
-        ))}
+
+              {/* Gauges */}
+              {sys ? (
+                <div className="mt-4 flex items-start gap-6">
+                  <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} />
+                  <RingGauge
+                    value={sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
+                    label="RAM"
+                    gradientId={`g-dash-ram-${host.id}`}
+                  />
+                  <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
+                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Network</div>
+                    <div className="flex items-center gap-3 text-[11px] text-foreground">
+                      <span className="flex items-center gap-1">
+                        <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground" />
+                        {fmtBytes(sys.netRxRate)}/s
+                      </span>
+                      <span className="flex items-center gap-1">
+                        <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground opacity-50" />
+                        {fmtBytes(sys.netTxRate)}/s
+                      </span>
+                    </div>
+                  </div>
+                  <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
+                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Disk</div>
+                    <div className="text-[11px] text-foreground">
+                      {sys.diskTotalKb > 0
+                        ? `${Math.round((sys.diskUsedKb / sys.diskTotalKb) * 100)}%`
+                        : "—"}
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="mt-4 flex gap-6">
+                  <div className="h-14 w-14 rounded-full border-2 border-border/50 animate-pulse bg-border/20" />
+                  <div className="h-14 w-14 rounded-full border-2 border-border/50 animate-pulse bg-border/20" />
+                </div>
+              )}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -1749,8 +1828,6 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                 value={host.diskUsed}
                 label="DISK"
                 gradientId="g-disk"
-                from="oklch(0.78 0.16 150)"
-                to="oklch(0.62 0.18 145)"
                 size={52}
                 stroke={5}
               />
@@ -1838,20 +1915,8 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                   </div>
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <div className="flex items-center gap-3">
-                      <RingGauge
-                        value={c.cpu}
-                        label="CPU"
-                        gradientId={`g-cpu-${c.name}`}
-                        from="oklch(0.78 0.16 200)"
-                        to="oklch(0.62 0.18 240)"
-                      />
-                      <RingGauge
-                        value={c.ram}
-                        label="RAM"
-                        gradientId={`g-ram-${c.name}`}
-                        from="oklch(0.88 0.18 95)"
-                        to="oklch(0.72 0.20 55)"
-                      />
+                      <RingGauge value={c.cpu} label="CPU" gradientId={`g-cpu-${c.name}`} />
+                      <RingGauge value={c.ram} label="RAM" gradientId={`g-ram-${c.name}`} />
                     </div>
                     <div className="flex flex-1 items-stretch gap-3 text-[10px]">
                       <IoStat
