@@ -121,16 +121,16 @@ pub fn generate_ssh_key(app: &AppHandle, request: GenerateSshKeyRequest) -> Resu
     }
 
     set_private_key_permissions(&key_path)?;
-    let key = build_key_metadata(
-        key_id,
+    let key = build_key_metadata(KeyMetadataRequest {
+        id: key_id,
         name,
-        request.key_type,
-        saved_size,
-        request.remark,
-        !passphrase.is_empty(),
-        key_path,
+        key_type: request.key_type,
+        size: saved_size,
+        remark: request.remark,
+        has_passphrase: !passphrase.is_empty(),
+        private_key_path: key_path,
         public_key_path,
-    )?;
+    })?;
     save_metadata(app, &key)?;
     Ok(key)
 }
@@ -178,16 +178,16 @@ pub fn import_ssh_key(app: &AppHandle, request: ImportSshKeyRequest) -> Result<S
         .as_deref()
         .map(|value| !value.is_empty())
         .unwrap_or(false);
-    let key = build_key_metadata(
-        key_id,
+    let key = build_key_metadata(KeyMetadataRequest {
+        id: key_id,
         name,
         key_type,
         size,
-        request.remark,
+        remark: request.remark,
         has_passphrase,
-        key_path,
+        private_key_path: key_path,
         public_key_path,
-    )?;
+    })?;
     save_metadata(app, &key)?;
     Ok(key)
 }
@@ -223,7 +223,7 @@ pub fn private_key_path(app: &AppHandle, id: &str) -> Result<String, String> {
     Ok(key.private_key_path)
 }
 
-fn build_key_metadata(
+struct KeyMetadataRequest {
     id: String,
     name: String,
     key_type: SshKeyType,
@@ -232,7 +232,10 @@ fn build_key_metadata(
     has_passphrase: bool,
     private_key_path: PathBuf,
     public_key_path: PathBuf,
-) -> Result<SshKey, String> {
+}
+
+fn build_key_metadata(req: KeyMetadataRequest) -> Result<SshKey, String> {
+    let KeyMetadataRequest { id, name, key_type, size, remark, has_passphrase, private_key_path, public_key_path } = req;
     let public_key = fs::read_to_string(&public_key_path)
         .map_err(|e| format!("Failed to read public key: {}", e))?;
     let fingerprint = fingerprint(&public_key_path)?;

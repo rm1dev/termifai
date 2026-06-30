@@ -577,7 +577,7 @@ fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
     let dest = p.parent()
         .ok_or("No parent dir")?
         .join(&new_name);
-    std::fs::rename(&p, &dest).map_err(|e| format!("Rename: {}", e))
+    std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
 }
 
 #[tauri::command]
@@ -1071,7 +1071,7 @@ pub fn run() {
             }
             // Try to unlock the vault silently using the keychain-cached master password,
             // so a returning user on this device isn't prompted again.
-            let _ = vault::op_try_cached_unlock(&app.handle());
+            let _ = vault::op_try_cached_unlock(app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
