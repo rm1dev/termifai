@@ -967,6 +967,9 @@ const DASHBOARD_SERVERS: ServerStat[] = [
 function DashboardView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hosts, setHosts] = useState<Host[]>([]);
+  // Cache the last full detail result (including processes) per host.
+  // Stored in a ref so re-entering a host shows data instantly without re-fetching.
+  const detailCacheRef = useRef<Record<string, HostPollResult>>({});
 
   // Load hosts that have showStatusInDashboard enabled
   useEffect(() => {
@@ -984,7 +987,8 @@ function DashboardView() {
       return (
         <HostDashboardView
           host={selectedHost}
-          initialStats={stats[selectedId] ?? null}
+          initialStats={detailCacheRef.current[selectedId] ?? stats[selectedId] ?? null}
+          onDetailUpdate={(result) => { detailCacheRef.current[selectedId] = result; }}
           onBack={() => setSelectedId(null)}
         />
       );
@@ -1457,17 +1461,26 @@ function SectionLabel({
 function HostDashboardView({
   host,
   initialStats,
+  onDetailUpdate,
   onBack,
 }: {
   host: Host;
   initialStats: HostPollResult | null;
+  onDetailUpdate?: (result: HostPollResult) => void;
   onBack: () => void;
 }) {
   const { detail, refresh } = useHostDetail(host.id);
   const poll = detail ?? initialStats;
   const sys = poll?.system ?? null;
-  const pollProcesses = poll?.processes ?? [];
+  const pollProcesses = poll?.processes ?? null;
   const pollContainers = poll?.containers ?? null; // null = docker not installed
+
+  // Persist detail (with processes) to parent cache so re-entry is instant
+  useEffect(() => {
+    if (detail?.ok && detail.processes !== null) {
+      onDetailUpdate?.(detail);
+    }
+  }, [detail]);
 
   // Accumulate load average history for the chart (max 32 points)
   const loadHistoryRef = useRef<{ t: number; m1: number; m5: number; m15: number }[]>([]);
@@ -1692,12 +1705,17 @@ function HostDashboardView({
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {pollProcesses.length === 0 && (
+                  {pollProcesses === null && (
                     <TableRow>
                       <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">Loading processes…</TableCell>
                     </TableRow>
                   )}
-                  {pollProcesses.map((p) => {
+                  {pollProcesses !== null && pollProcesses.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">No processes found</TableCell>
+                    </TableRow>
+                  )}
+                  {(pollProcesses ?? []).map((p) => {
                     const isHot = p.cpuPct >= 100;
                     const isWarm = p.cpuPct >= 4 && p.cpuPct < 100;
                     return (
