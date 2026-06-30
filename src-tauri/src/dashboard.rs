@@ -434,6 +434,8 @@ struct ActorState {
     prev_container_net: HashMap<String, (u64, u64)>,
     has_docker: Option<bool>,
     last_poll: Option<Instant>,
+    prev_proc_ticks: HashMap<u32, u64>,  // pid → utime+stime at last sample
+    prev_total_ticks_for_proc: u64,      // aggregate CPU ticks at last process sample
 }
 
 fn run_actor(
@@ -482,6 +484,8 @@ fn run_actor(
         prev_container_net: HashMap::new(),
         has_docker: None,
         last_poll: None,
+        prev_proc_ticks: HashMap::new(),
+        prev_total_ticks_for_proc: 0,
     };
 
     loop {
@@ -569,7 +573,9 @@ fn do_poll(state: &mut ActorState, host_id: &str, want_detail: bool, poll_secs: 
         );
     }
 
-    let containers = if state.has_docker == Some(true) {
+    // When want_detail=true (frequent process polls), skip Docker to keep overhead low.
+    // Docker metrics are collected on the slow path (want_detail=false, every 30s).
+    let containers = if !want_detail && state.has_docker == Some(true) {
         Some(collect_docker_metrics(state, poll_secs)?)
     } else {
         None
@@ -660,24 +666,86 @@ fn collect_docker_metrics(state: &mut ActorState, poll_secs: f64) -> Result<Vec<
 }
 
 fn collect_processes(state: &mut ActorState) -> Result<Vec<ProcessInfo>, String> {
+    // Single exec: /proc/[pid]/stat for ticks+rss, /proc/stat for normalization,
+    // ps -eo pid,user for username mapping (no CPU calc — fast).
+    // Works on all Linux; no process spawning for CPU measurement.
     let raw = exec_cmd(
         &state.session,
-        "ps -eo pid,comm,user,%cpu,%mem --no-headers --sort=-%cpu 2>/dev/null | head -20",
+        "cat /proc/[0-9]*/stat 2>/dev/null; echo '===CPU==='; head -1 /proc/stat; echo '===USER==='; ps -eo pid=,user= --no-headers 2>/dev/null",
     )?;
 
-    Ok(raw.lines()
-        .filter_map(|line| {
-            let p: Vec<&str> = line.split_whitespace().collect();
-            if p.len() < 5 { return None; }
-            Some(ProcessInfo {
-                pid: p[0].parse().unwrap_or(0),
-                name: p[1].to_string(),
-                user: p[2].to_string(),
-                cpu_pct: p[3].parse().unwrap_or(0.0),
-                mem_kb: p[4].parse().unwrap_or(0),
-            })
-        })
-        .collect())
+    let (proc_raw, rest) = raw.split_once("===CPU===\n").unwrap_or((&raw, ""));
+    let (cpu_raw, user_raw) = rest.split_once("===USER===\n").unwrap_or((rest, ""));
+
+    // Aggregate CPU ticks for delta normalization
+    let total_ticks: u64 = cpu_raw.trim()
+        .split_whitespace().skip(1)
+        .filter_map(|v| v.parse::<u64>().ok())
+        .take(7).sum();
+
+    let d_total = total_ticks.saturating_sub(state.prev_total_ticks_for_proc);
+
+    // Build pid→user map (fast: ps just reads uid and maps /etc/passwd, no CPU sampling)
+    let mut user_map: HashMap<u32, String> = HashMap::new();
+    for line in user_raw.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(pid_s), Some(user)) = (parts.next(), parts.next()) {
+            if let Ok(pid) = pid_s.trim().parse::<u32>() {
+                user_map.insert(pid, user.to_string());
+            }
+        }
+    }
+
+    // Parse /proc/[pid]/stat lines
+    // Format: "pid (comm with spaces) state ppid ... utime(14) stime(15) ... rss(24) ..."
+    let mut next_ticks: HashMap<u32, u64> = HashMap::new();
+    let mut processes: Vec<ProcessInfo> = Vec::new();
+
+    for line in proc_raw.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+
+        let open  = match line.find('(')  { Some(i) => i, None => continue };
+        let close = match line.rfind(')') { Some(i) => i, None => continue };
+
+        let pid: u32 = match line[..open].trim().parse() { Ok(p) => p, Err(_) => continue };
+        let name = &line[open+1..close];
+
+        // fields after ')': state ppid pgrp session tty tpgid flags
+        //   minflt cminflt majflt cmajflt utime[11] stime[12] ... rss[21]
+        let fields: Vec<&str> = line[close+1..].split_whitespace().collect();
+        if fields.len() < 22 { continue; }
+
+        let utime: u64 = fields[11].parse().unwrap_or(0);
+        let stime: u64 = fields[12].parse().unwrap_or(0);
+        let cpu_ticks = utime + stime;
+        let rss_pages: u64 = fields[21].parse().unwrap_or(0);
+
+        next_ticks.insert(pid, cpu_ticks);
+
+        // CPU% = tick delta / total delta × 100 (real-time, not cumulative)
+        let cpu_pct = if d_total > 0 {
+            let prev = state.prev_proc_ticks.get(&pid).copied().unwrap_or(cpu_ticks);
+            (cpu_ticks.saturating_sub(prev) as f64 / d_total as f64 * 100.0) as f32
+        } else {
+            0.0 // first poll — no delta yet
+        };
+
+        processes.push(ProcessInfo {
+            pid,
+            name: name.to_string(),
+            user: user_map.get(&pid).cloned().unwrap_or_default(),
+            cpu_pct,
+            mem_kb: rss_pages * 4, // 4 KB pages (standard Linux page size)
+        });
+    }
+
+    state.prev_proc_ticks = next_ticks;
+    state.prev_total_ticks_for_proc = total_ticks;
+
+    processes.sort_by(|a, b| b.cpu_pct.partial_cmp(&a.cpu_pct).unwrap_or(std::cmp::Ordering::Equal));
+    processes.truncate(20);
+    Ok(processes)
 }
 
 // ─── DashboardManager ────────────────────────────────────────────────────────
