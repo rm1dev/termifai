@@ -1717,7 +1717,7 @@ function HostDashboardView({
                     <TableHead className="h-6 px-3 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Process</TableHead>
                     <TableHead className="h-6 w-16 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">User</TableHead>
                     <TableHead className="h-6 w-12 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">CPU%</TableHead>
-                    <TableHead className="h-6 w-14 px-3 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Mem</TableHead>
+                    <TableHead className="h-6 w-20 px-3 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Mem</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -1768,7 +1768,7 @@ function HostDashboardView({
                           >
                             {p.cpuPct.toFixed(1)}
                           </TableCell>
-                          <TableCell className="w-14 px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
+                          <TableCell className="w-20 px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
                         </TableRow>
                       );
                     });
