@@ -971,7 +971,7 @@ function DashboardView() {
   // Load hosts that have showStatusInDashboard enabled
   useEffect(() => {
     invoke<{ hosts: Host[] }>("list_hosts")
-      .then((v) => setHosts(v.hosts.filter((h) => h.showStatusInDashboard)))
+      .then((v) => setHosts(v.hosts.filter((h) => h.showStatusInDashboard !== false)))
       .catch(console.error);
   }, []);
 
