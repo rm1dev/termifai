@@ -125,6 +125,22 @@
 
 @custom-variant dark (&:is(.dark *));
 
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@utility animate-shimmer {
+  animation: shimmer 1.6s ease-in-out infinite;
+  background: linear-gradient(
+    90deg,
+    oklch(0.28 0.025 255 / 0.6) 25%,
+    oklch(0.36 0.025 255 / 0.9) 50%,
+    oklch(0.28 0.025 255 / 0.6) 75%
+  );
+  background-size: 200% 100%;
+}
+
 @theme inline {
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
