@@ -139,15 +139,27 @@ export function useHostDetail(hostId: string | null): {
     if (!hostId) return;
 
     setDetail(null);
-    refresh();
+    refresh(); // initial poll — fetches system metrics + process list
 
     const unlistenPromise = listen<HostPollResult>("dash:stat", ({ payload }) => {
       if (payload.hostId === hostId) {
-        setDetail(payload);
+        setDetail((prev) => {
+          // Background polls (wantDetail: false) return processes: null.
+          // Preserve the existing process list so the UI doesn't flicker blank.
+          if (payload.processes === null && prev?.processes != null) {
+            return { ...payload, processes: prev.processes };
+          }
+          return payload;
+        });
       }
     });
 
-    const interval = setInterval(refresh, POLL_INTERVAL_MS);
+    // Background interval only refreshes system/network metrics — no `ps` on remote.
+    // Manual refresh() still fetches processes.
+    const interval = setInterval(() => {
+      if (!hostId) return;
+      invoke("dashboard_poll", { wantDetail: false, hostId }).catch(console.error);
+    }, POLL_INTERVAL_MS);
 
     return () => {
       clearInterval(interval);
