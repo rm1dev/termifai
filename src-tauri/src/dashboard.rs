@@ -128,14 +128,12 @@ pub(crate) fn parse_proc_output(
                 _ => {}
             }
         }
-        // /proc/loadavg
-        if line.contains('.') && !line.contains(':') && !line.contains('/') {
+        // /proc/loadavg — exactly 5 tokens, 4th contains '/' (e.g. "0.45 0.32 0.28 2/456 12345")
+        {
             let p: Vec<&str> = line.split_whitespace().collect();
-            if p.len() >= 3 {
+            if p.len() == 5 && p[3].contains('/') {
                 if let (Ok(a), Ok(b), Ok(c)) = (p[0].parse::<f32>(), p[1].parse::<f32>(), p[2].parse::<f32>()) {
-                    if a < 100.0 && b < 100.0 && c < 100.0 {
-                        load_1m = a; load_5m = b; load_15m = c;
-                    }
+                    load_1m = a; load_5m = b; load_15m = c;
                 }
             }
         }
@@ -709,6 +707,9 @@ Inter-|   Receive   |  Transmit
         assert_eq!(metrics.cpu_pct, 0.0, "first poll should be zero");
         assert_eq!(snap.user, 100);
         assert_eq!(snap.idle, 800);
+        assert!((metrics.load_1m - 0.45).abs() < 0.001, "load1m should be 0.45, got {}", metrics.load_1m);
+        assert!((metrics.load_5m - 0.32).abs() < 0.001, "load5m should be 0.32, got {}", metrics.load_5m);
+        assert!((metrics.load_15m - 0.28).abs() < 0.001, "load15m should be 0.28, got {}", metrics.load_15m);
     }
 
     #[test]
