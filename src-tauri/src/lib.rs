@@ -236,6 +236,21 @@ fn vault_change_master_password(
 }
 
 #[tauri::command]
+fn get_vault_lock_policy(app: tauri::AppHandle) -> String {
+    let policy = vault::get_lock_policy(&app);
+    serde_json::to_string(&policy)
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_else(|_| "on_restart".to_string())
+}
+
+#[tauri::command]
+fn set_vault_lock_policy(app: tauri::AppHandle, policy: String) -> Result<(), String> {
+    let p: vault::LockPolicy = serde_json::from_str(&format!("\"{}\"", policy))
+        .map_err(|_| format!("Unknown lock policy: {policy}"))?;
+    vault::set_lock_policy(&app, p)
+}
+
+#[tauri::command]
 fn get_host_password(app: tauri::AppHandle, host_id: String) -> Result<Option<String>, String> {
     let vault = hosts::list_hosts(&app)?;
     let host = vault
@@ -880,6 +895,69 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// Polls for macOS screen-lock events every 5 seconds.
+/// When the screen locks and policy is OnScreenLock, the vault is locked.
+#[cfg(target_os = "macos")]
+fn start_screen_lock_monitor(app: tauri::AppHandle) {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    // Use CoreGraphics CGSessionCopyCurrentDictionary + CoreFoundation to
+    // detect screen lock without any extra crates.
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> *const c_void;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFDictionaryGetValueIfPresent(
+            dict: *const c_void,
+            key: *const c_void,
+            value: *mut *const c_void,
+        ) -> bool;
+        fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+        fn CFRelease(cf: *const c_void);
+        fn CFStringCreateWithCString(
+            alloc: *const c_void,
+            c_str: *const i8,
+            encoding: u32,
+        ) -> *const c_void;
+    }
+    const KCF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+    fn is_screen_locked() -> bool {
+        unsafe {
+            let dict = CGSessionCopyCurrentDictionary();
+            if dict.is_null() {
+                return false;
+            }
+            let key_bytes = b"CGSSessionScreenIsLocked\0";
+            let key = CFStringCreateWithCString(
+                ptr::null(),
+                key_bytes.as_ptr() as *const i8,
+                KCF_STRING_ENCODING_UTF8,
+            );
+            let mut value: *const c_void = ptr::null();
+            let found = CFDictionaryGetValueIfPresent(dict, key, &mut value);
+            CFRelease(key);
+            CFRelease(dict);
+            found && !value.is_null() && CFBooleanGetValue(value)
+        }
+    }
+
+    std::thread::spawn(move || {
+        let mut prev_locked = false;
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let locked = is_screen_locked();
+            if locked && !prev_locked {
+                vault::on_screen_lock(&app);
+            }
+            prev_locked = locked;
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -920,6 +998,8 @@ pub fn run() {
             vault_unlock,
             vault_lock,
             vault_change_master_password,
+            get_vault_lock_policy,
+            set_vault_lock_policy,
             get_host_password,
             test_host_connection,
             list_port_forwards,
@@ -1084,11 +1164,19 @@ pub fn run() {
             // Try to unlock the vault silently using the keychain-cached master password,
             // so a returning user on this device isn't prompted again.
             let _ = vault::op_try_cached_unlock(app.handle());
+
+            // Start background screen-lock monitor (macOS only).
+            #[cfg(target_os = "macos")]
+            start_screen_lock_monitor(app.handle().clone());
+
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                vault::on_app_exit(app_handle);
+            }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
                 if !has_visible_windows {
