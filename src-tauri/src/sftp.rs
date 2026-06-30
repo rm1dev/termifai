@@ -208,7 +208,7 @@ impl SftpManager {
                 let is_dir = stat.file_type().is_dir();
                 let is_symlink = stat.file_type().is_symlink();
                 let size = if is_dir { None } else { Some(stat.size.unwrap_or(0)) };
-                let modified = stat.mtime.map(|t| format_unix_timestamp(t as u64));
+                let modified = stat.mtime.map(format_unix_timestamp);
                 Some(RemoteFileEntry {
                     name,
                     path: pb.to_string_lossy().to_string(),
