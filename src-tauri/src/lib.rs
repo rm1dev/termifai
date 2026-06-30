@@ -5,6 +5,7 @@ mod sftp;
 mod snippets;
 mod ssh_keys;
 pub mod dashboard;
+use dashboard::DashboardManager;
 
 use hosts::{
     Host, HostGroup, HostsVault, SaveHostGroupRequest, SaveHostRequest, TestHostConnectionRequest,
@@ -52,6 +53,7 @@ struct AppState {
     sftp_manager: Mutex<SftpManager>,
     watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+    dashboard_manager: Mutex<DashboardManager>,
 }
 
 #[tauri::command]
@@ -753,6 +755,84 @@ fn sftp_get_users_groups(
 }
 
 #[tauri::command]
+async fn dashboard_connect(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    host_ids: Vec<String>,
+) -> Result<(), String> {
+    let vault = hosts::list_hosts(&app)?;
+
+    for host in vault.hosts.iter().filter(|h| host_ids.contains(&h.id)) {
+        let key_path = if let Some(key_id) = &host.ssh_key_id {
+            let keys = crate::ssh_keys::list_ssh_keys(&app).unwrap_or_default();
+            keys.into_iter()
+                .find(|k| &k.id == key_id)
+                .map(|k| std::path::PathBuf::from(k.private_key_path))
+        } else {
+            None
+        };
+
+        let actor = dashboard::spawn_host_actor(
+            host.id.clone(),
+            host.hostname.clone(),
+            host.port,
+            host.user.clone(),
+            host.password.clone(),
+            key_path,
+        );
+
+        let mut dm = state.dashboard_manager.lock().unwrap();
+        dm.connect(host.id.clone(), actor);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn dashboard_poll(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    want_detail: bool,
+    host_id: Option<String>,
+) -> Result<(), String> {
+    let senders = {
+        let dm = state.dashboard_manager.lock().unwrap();
+        match &host_id {
+            Some(id) => dm.sender(id).map(|s| vec![(id.clone(), s)]).unwrap_or_default(),
+            None => dm.senders(),
+        }
+    };
+
+    let handles: Vec<_> = senders.into_iter().map(|(id, tx)| {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let cmd = dashboard::ActorCmd::Poll { want_detail, reply: reply_tx };
+
+            if tx.try_send(cmd).is_err() { return; }
+
+            if let Ok(result) = reply_rx.await {
+                let _ = app.emit("dash:stat", result);
+            }
+        })
+    }).collect();
+
+    futures::future::join_all(handles).await;
+    Ok(())
+}
+
+#[tauri::command]
+fn dashboard_disconnect(
+    state: tauri::State<'_, AppState>,
+    host_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut dm = state.dashboard_manager.lock().unwrap();
+    for id in &host_ids {
+        dm.disconnect(id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
@@ -773,6 +853,7 @@ pub fn run() {
             sftp_manager: Mutex::new(SftpManager::new()),
             watch_handles: Mutex::new(std::collections::HashMap::new()),
             transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
+            dashboard_manager: Mutex::new(DashboardManager::new()),
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
@@ -826,6 +907,9 @@ pub fn run() {
             sftp_open_remote,
             sftp_watch_remote,
             sftp_stop_watch,
+            dashboard_connect,
+            dashboard_poll,
+            dashboard_disconnect,
             quit_app,
         ])
         .on_window_event(|window, event| {
