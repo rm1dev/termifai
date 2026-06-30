@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::io::Read as IoRead;
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
+use tauri::{AppHandle, Emitter};
 
 // ─── Public types emitted to frontend ────────────────────────────────────────
 
@@ -383,6 +384,7 @@ struct ActorState {
 }
 
 fn run_actor(
+    app: AppHandle,
     host_id: String,
     hostname: String,
     port: u16,
@@ -395,7 +397,16 @@ fn run_actor(
     let session = match ssh_connect(&hostname, port, &user, password.as_deref(), key_path.as_deref()) {
         Ok(s) => s,
         Err(e) => {
-            // Drain all pending commands with error
+            // Emit error so frontend clears the loading spinner
+            let _ = app.emit("dash:stat", HostPollResult {
+                host_id: host_id.clone(),
+                ok: false,
+                system: None,
+                containers: None,
+                processes: None,
+                error: Some(e.clone()),
+            });
+            // Also reply to any already-queued Poll commands
             while let Ok(cmd) = rx.try_recv() {
                 if let ActorCmd::Poll { reply, .. } = cmd {
                     let _ = reply.send(HostPollResult {
@@ -480,6 +491,15 @@ fn do_poll(state: &mut ActorState, host_id: &str, want_detail: bool, poll_secs: 
     state.prev_cpu = Some(new_cpu);
     state.prev_net = Some(new_net);
 
+    // Disk usage from df
+    if let Ok(df_raw) = exec_cmd(&state.session, "df -k / 2>/dev/null | tail -1") {
+        let parts: Vec<&str> = df_raw.split_whitespace().collect();
+        if parts.len() >= 3 {
+            system.disk_total_kb = parts[1].parse().unwrap_or(0);
+            system.disk_used_kb = parts[2].parse().unwrap_or(0);
+        }
+    }
+
     // IP from hostname -I
     if let Ok(ip_raw) = exec_cmd(&state.session, "hostname -I 2>/dev/null | awk '{print $1}'") {
         system.ip = ip_raw.trim().to_string();
@@ -531,6 +551,11 @@ fn collect_docker_metrics(state: &mut ActorState, poll_secs: f64) -> Result<Vec<
     let mut result = Vec::new();
 
     for (id, name, container_state) in &container_list {
+        // Container IDs must be hex-only before interpolating into shell
+        if !id.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+
         if container_state != "running" {
             result.push(ContainerMetric {
                 id: id.clone(), name: name.clone(), state: container_state.clone(),
@@ -637,6 +662,7 @@ impl DashboardManager {
 // ─── Public spawn function ────────────────────────────────────────────────────
 
 pub fn spawn_host_actor(
+    app: AppHandle,
     host_id: String,
     hostname: String,
     port: u16,
@@ -649,7 +675,7 @@ pub fn spawn_host_actor(
 
     std::thread::Builder::new()
         .name(format!("dashboard-{}", host_id))
-        .spawn(move || run_actor(host_id, hostname, port, user, password, key_path, rx))
+        .spawn(move || run_actor(app, host_id, hostname, port, user, password, key_path, rx))
         .expect("dashboard actor thread spawn");
 
     HostActor { tx }
