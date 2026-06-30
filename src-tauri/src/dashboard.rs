@@ -666,7 +666,7 @@ fn do_poll(state: &mut ActorState, host_id: &str, want_detail: bool, poll_secs: 
     };
 
     let processes = if want_detail {
-        Some(collect_processes(state)?)
+        Some(collect_processes(state, system.cores.max(1))?)
     } else {
         None
     };
@@ -749,7 +749,7 @@ fn collect_docker_metrics(state: &mut ActorState, poll_secs: f64) -> Result<Vec<
     Ok(result)
 }
 
-fn collect_processes(state: &mut ActorState) -> Result<Vec<ProcessInfo>, String> {
+fn collect_processes(state: &mut ActorState, num_cores: u32) -> Result<Vec<ProcessInfo>, String> {
     // Single exec: /proc/[pid]/stat for ticks+rss, /proc/stat for normalization,
     // ps -eo pid,user for username mapping (no CPU calc — fast).
     // Works on all Linux; no process spawning for CPU measurement.
@@ -807,10 +807,12 @@ fn collect_processes(state: &mut ActorState) -> Result<Vec<ProcessInfo>, String>
 
         next_ticks.insert(pid, cpu_ticks);
 
-        // CPU% = tick delta / total delta × 100 (real-time, not cumulative)
+        // CPU% = tick delta / total delta × num_cores × 100
+        // d_total is the aggregate across all cores; multiplying by num_cores
+        // gives percentage of one core (matching htop/top display convention).
         let cpu_pct = if d_total > 0 {
             let prev = state.prev_proc_ticks.get(&pid).copied().unwrap_or(cpu_ticks);
-            (cpu_ticks.saturating_sub(prev) as f64 / d_total as f64 * 100.0) as f32
+            (cpu_ticks.saturating_sub(prev) as f64 / d_total as f64 * num_cores as f64 * 100.0) as f32
         } else {
             0.0 // first poll — no delta yet
         };
