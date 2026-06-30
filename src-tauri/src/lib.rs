@@ -381,7 +381,7 @@ async fn sftp_connect_from_host(
         hostname: host.hostname.clone(),
         port: host.port,
         username: host.user.clone(),
-        password: host.password.clone(),
+        password: hosts::decrypt_host_password(&host),
         private_key_path,
         default_remote_path: host.default_sftp_path.clone(),
     };
@@ -809,7 +809,7 @@ async fn dashboard_connect(
             host.hostname.clone(),
             host.port,
             host.user.clone(),
-            host.password.clone(),
+            hosts::decrypt_host_password(host),
             key_path,
         );
 
