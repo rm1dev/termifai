@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, forwardRef } from "react";
+import { useState, useRef, useEffect, useCallback, forwardRef, useTransition } from "react";
 import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -1035,7 +1035,7 @@ function DashboardView() {
       )}
 
       {/* Server cards */}
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+      <div className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(340px,1fr))]">
         {hosts.map((host) => {
           const poll = stats[host.id];
           const isLoading = loading.has(host.id);
@@ -1074,45 +1074,48 @@ function DashboardView() {
                   </>
                 )}
                 {isLoading && !sys && (
-                  <span className="h-3 w-32 rounded bg-border/60 animate-pulse inline-block" />
+                  <span className="h-3 w-48 rounded animate-shimmer inline-block" />
                 )}
               </div>
 
               {/* Gauges */}
               {sys ? (
-                <div className="mt-4 flex items-start gap-6">
-                  <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} />
+                <div className="mt-4 flex items-start gap-4">
+                  <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
                   <RingGauge
                     value={sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
                     label="RAM"
                     gradientId={`g-dash-ram-${host.id}`}
+                    size={52}
                   />
-                  <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Network</div>
-                    <div className="flex items-center gap-3 text-[11px] text-foreground">
-                      <span className="flex items-center gap-1">
-                        <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground" />
-                        {fmtBytes(sys.netRxRate)}/s
-                      </span>
-                      <span className="flex items-center gap-1">
-                        <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground opacity-50" />
-                        {fmtBytes(sys.netTxRate)}/s
-                      </span>
-                    </div>
-                  </div>
-                  <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Disk</div>
-                    <div className="text-[11px] text-foreground">
-                      {sys.diskTotalKb > 0
-                        ? `${Math.round((sys.diskUsedKb / sys.diskTotalKb) * 100)}%`
-                        : "—"}
-                    </div>
-                  </div>
+                  <RingGauge
+                    value={sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
+                    label="Disk"
+                    gradientId={`g-dash-disk-${host.id}`}
+                    size={52}
+                  />
+                  <IoStat
+                    label="Network"
+                    rows={[
+                      { icon: ArrowDownToLine, value: fmtBytes(sys.netRxRate), unit: "/s" },
+                      { icon: ArrowUpFromLine, value: fmtBytes(sys.netTxRate), unit: "/s" },
+                    ]}
+                  />
                 </div>
               ) : (
-                <div className="mt-4 flex gap-6">
-                  <div className="h-14 w-14 rounded-full border-2 border-border/50 animate-pulse bg-border/20" />
-                  <div className="h-14 w-14 rounded-full border-2 border-border/50 animate-pulse bg-border/20" />
+                <div className="mt-4 flex items-start gap-4">
+                  {/* Gauge placeholders */}
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  {/* Network placeholder */}
+                  <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
+                    <div className="h-2.5 w-14 rounded animate-shimmer" />
+                    <div className="flex flex-col gap-1">
+                      <div className="h-2.5 w-16 rounded animate-shimmer" />
+                      <div className="h-2.5 w-16 rounded animate-shimmer" />
+                    </div>
+                  </div>
                 </div>
               )}
             </button>
@@ -1215,7 +1218,8 @@ function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetric
 
 function useColumnCount(blockWidth = 8, gap = 2) {
   const ref = useRef<HTMLDivElement>(null);
-  const [cols, setCols] = useState(60);
+  const [cols, setCols] = useState(0);
+
   useEffect(() => {
     if (!ref.current) return;
     const ro = new ResizeObserver(([entry]) => {
@@ -1226,14 +1230,13 @@ function useColumnCount(blockWidth = 8, gap = 2) {
     ro.observe(ref.current);
     return () => ro.disconnect();
   }, [blockWidth, gap]);
+
   return { ref, cols };
 }
 
-function CpuThreadRow({ thread }: { thread: CpuThread }) {
-  const { ref, cols } = useColumnCount(6, 1);
+function CpuThreadRow({ thread, cols }: { thread: CpuThread; cols: number }) {
   const total = thread.user + thread.system + thread.nice + thread.iowait + thread.steal;
   const filled = Math.round((total / 100) * cols);
-  // allocate per-category counts using largest-remainder so ordering stays User→System→Nice→IOWait→Steal
   const raw = CPU_CATEGORIES.map((c) => ({ key: c.key, color: c.color, exact: (thread[c.key] / 100) * cols }));
   const counts = raw.map((r) => ({ ...r, n: Math.floor(r.exact), rem: r.exact - Math.floor(r.exact) }));
   let assigned = counts.reduce((a, c) => a + c.n, 0);
@@ -1252,7 +1255,7 @@ function CpuThreadRow({ thread }: { thread: CpuThread }) {
 
   return (
     <div className="flex items-center gap-2">
-      <div ref={ref} className="flex flex-1 gap-[1px] overflow-hidden">
+      <div className="flex flex-1 gap-[1px] overflow-hidden">
         {Array.from({ length: cols }).map((_, i) => (
           <span
             key={i}
@@ -1273,6 +1276,7 @@ function CpuThreadRow({ thread }: { thread: CpuThread }) {
 
 function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number[]; cores: number; model: string; coreMetrics?: CoreMetrics[] }) {
   const [open, setOpen] = useState(false);
+  const [isPending, startTransition] = useTransition();
   const data = buildCpuData(samples, cores, coreMetrics);
   const { ref, cols } = useColumnCount(6, 1);
 
@@ -1280,7 +1284,7 @@ function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number
     <section className="overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-4">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => startTransition(() => setOpen((v) => !v))}
         className="flex w-full items-center gap-3 text-left"
         aria-expanded={open}
       >
@@ -1331,10 +1335,23 @@ function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number
       </div>
 
       {open && (
-        <div className="mt-3 space-y-1 border-t border-border pt-3">
-          {data.threads.map((t, i) => (
-            <CpuThreadRow key={i} thread={t} />
-          ))}
+        <div className="mt-3 border-t border-border pt-3">
+          {isPending ? (
+            <div className="space-y-1.5">
+              {Array.from({ length: cores }).map((_, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <div className="h-[10px] flex-1 rounded-[1px] animate-shimmer" />
+                  <span className="w-9" />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-1">
+              {data.threads.map((t, i) => (
+                <CpuThreadRow key={i} thread={t} cols={Math.max(10, cols - Math.round(44 / 7))} />
+              ))}
+            </div>
+          )}
         </div>
       )}
 
