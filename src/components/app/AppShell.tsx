@@ -1469,6 +1469,17 @@ function HostDashboardView({
   const pollProcesses = poll?.processes ?? [];
   const pollContainers = poll?.containers ?? null; // null = docker not installed
 
+  // Accumulate load average history for the chart (max 32 points)
+  const loadHistoryRef = useRef<{ t: number; m1: number; m5: number; m15: number }[]>([]);
+  const [loadHistory, setLoadHistory] = useState<{ t: number; m1: number; m5: number; m15: number }[]>([]);
+  useEffect(() => {
+    if (!sys) return;
+    const entry = { t: loadHistoryRef.current.length, m1: sys.load1m, m5: sys.load5m, m15: sys.load15m };
+    const next = [...loadHistoryRef.current.slice(-31), entry];
+    loadHistoryRef.current = next;
+    setLoadHistory(next);
+  }, [sys?.load1m, sys?.load5m, sys?.load15m]);
+
   // Memory calculations (in GB)
   const memTotalGb = sys ? sys.memTotalKb / 1_048_576 : 0;
   const memUsedGb = sys ? sys.memUsedKb / 1_048_576 : 0;
@@ -1613,7 +1624,7 @@ function HostDashboardView({
             />
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={loadSeries} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+                <AreaChart data={loadHistory.length > 0 ? loadHistory : loadSeries} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
                   <defs>
                     <linearGradient id="g1m" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="var(--color-brand-red)" stopOpacity={0.45} />
