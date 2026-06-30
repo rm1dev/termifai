@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback, forwardRef } from "react";
+import { useState, useRef, useEffect, useCallback, forwardRef, useTransition } from "react";
 import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -135,9 +135,10 @@ import { SftpRenameDialog } from "./SftpRenameDialog";
 import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
 import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
+import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
-  // { key: "dashboard", label: "Dashboard", icon: LayoutDashboard }, // temporarily hidden
+  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { key: "hosts", label: "Hosts", icon: Server },
   { key: "port-forwarding", label: "Port Forwarding", icon: Network },
   { key: "snippets", label: "Snippets", icon: Braces },
@@ -809,6 +810,18 @@ function CircularGauge({ value, label }: { value: number; label: string }) {
   );
 }
 
+function ringGaugeColor(pct: number): { from: string; to: string } {
+  // cyan(210°) → yellow(85°) → orange(42°) → red #ff5f57
+  const bands = [
+    { at: 45,  from: "oklch(0.78 0.14 210)", to: "oklch(0.58 0.14 210)" },
+    { at: 70,  from: "oklch(0.92 0.16 85)",  to: "oklch(0.72 0.16 85)"  },
+    { at: 85,  from: "oklch(0.64 0.18 42)",  to: "oklch(0.48 0.18 42)"  },
+    { at: 100, from: "#ff5f57",               to: "#c0120a"               },
+  ];
+  const band = bands.find((b) => pct <= b.at) ?? bands[bands.length - 1];
+  return { from: band.from, to: band.to };
+}
+
 function RingGauge({
   value,
   label,
@@ -821,8 +834,8 @@ function RingGauge({
   value: number;
   label: string;
   gradientId: string;
-  from: string;
-  to: string;
+  from?: string;
+  to?: string;
   size?: number;
   stroke?: number;
 }) {
@@ -830,6 +843,9 @@ function RingGauge({
   const c = 2 * Math.PI * r;
   const pct = Math.max(0, Math.min(100, value));
   const offset = c - (pct / 100) * c;
+  const colors = ringGaugeColor(pct);
+  const colorFrom = from ?? colors.from;
+  const colorTo = to ?? colors.to;
   return (
     <div className="flex flex-col items-center gap-1">
       <span className="text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
@@ -839,8 +855,8 @@ function RingGauge({
         <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="-rotate-90">
           <defs>
             <linearGradient id={gradientId} x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor={from} />
-              <stop offset="100%" stopColor={to} />
+              <stop offset="0%" stopColor={colorFrom} />
+              <stop offset="100%" stopColor={colorTo} />
             </linearGradient>
           </defs>
           <circle
@@ -938,7 +954,7 @@ const DASHBOARD_SERVERS: ServerStat[] = [
     netDown: "151", netDownUnit: "K/s", netUp: "11.1", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
   { id: "h2", name: "Ariyapanel Bot", status: "error", cores: 8, ram: "0 B", storage: "0 B", uptime: "0 Minutes", cpu: 0, ramUsed: 0, diskUsed: 0, os: "Debian 11", ip: "—", cpuSamples: [0, 0, 0, 0, 0, 0, 0, 0],
     netDown: "0", netDownUnit: "B/s", netUp: "0", netUpUnit: "B/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h3", name: "AriyaPanel Monitoring", status: "online", cores: 8, ram: "2.90 G", storage: "26.2 G", uptime: "134 Days", cpu: 68, ramUsed: 74, diskUsed: 60, os: "Debian 11", ip: "192.168.90.198/24", cpuSamples: [82, 47, 91, 55, 73, 38, 88, 70],
+  { id: "h3", name: "AriyaPanel Monitoring", status: "online", cores: 8, ram: "2.90 G", storage: "26.2 G", uptime: "134 Days", cpu: 68, ramUsed: 95, diskUsed: 60, os: "Debian 11", ip: "192.168.90.198/24", cpuSamples: [82, 47, 91, 55, 73, 38, 88, 70],
     netDown: "31.6", netDownUnit: "K/s", netUp: "9.99", netUpUnit: "K/s", diskRead: "1.30", diskReadUnit: "M/s", diskWrite: "0", diskWriteUnit: "B/s" },
   { id: "h4", name: "AriyaPanel DB", status: "online", cores: 8, ram: "19.6 G", storage: "299 G", uptime: "167 Days", cpu: 23, ramUsed: 82, diskUsed: 71, os: "Ubuntu 20.04", ip: "192.168.90.200/24", cpuSamples: [12, 34, 8, 41, 18, 27, 15, 29],
     netDown: "401", netDownUnit: "K/s", netUp: "165", netUpUnit: "K/s", diskRead: "188", diskReadUnit: "K/s", diskWrite: "380", diskWriteUnit: "K/s" },
@@ -950,16 +966,38 @@ const DASHBOARD_SERVERS: ServerStat[] = [
 
 function DashboardView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const selected = DASHBOARD_SERVERS.find((s) => s.id === selectedId) ?? null;
+  const [hosts, setHosts] = useState<Host[]>([]);
+  // Cache the last full detail result (including processes) per host.
+  // Stored in a ref so re-entering a host shows data instantly without re-fetching.
+  const detailCacheRef = useRef<Record<string, HostPollResult>>({});
 
-  if (selected) {
-    return <HostDashboardView host={selected} onBack={() => setSelectedId(null)} />;
+  // Load hosts that have showStatusInDashboard enabled
+  useEffect(() => {
+    invoke<{ hosts: Host[] }>("list_hosts")
+      .then((v) => setHosts(v.hosts.filter((h) => h.showStatusInDashboard !== false)))
+      .catch(console.error);
+  }, []);
+
+  const hostIds = hosts.map((h) => h.id);
+  const { stats, loading } = useDashboard(hostIds);
+
+  if (selectedId) {
+    const selectedHost = hosts.find((h) => h.id === selectedId);
+    if (selectedHost) {
+      return (
+        <HostDashboardView
+          host={selectedHost}
+          initialStats={detailCacheRef.current[selectedId] ?? stats[selectedId] ?? null}
+          onDetailUpdate={(result) => { detailCacheRef.current[selectedId] = result; }}
+          onBack={() => setSelectedId(null)}
+        />
+      );
+    }
   }
 
-  const servers = DASHBOARD_SERVERS;
-  const total = servers.length;
-  const online = servers.filter((s) => s.status === "online").length;
-  const offline = servers.filter((s) => s.status === "error").length;
+  const total = hosts.length;
+  const online = hosts.filter((h) => stats[h.id]?.ok).length;
+  const offline = hosts.filter((h) => stats[h.id] && !stats[h.id].ok).length;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-y-auto p-5">
@@ -988,67 +1026,101 @@ function DashboardView() {
         </div>
       </div>
 
+      {hosts.length === 0 && (
+        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+          No hosts configured for dashboard display.
+          <br />
+          Enable "Show in Dashboard" in host settings.
+        </div>
+      )}
+
       {/* Server cards */}
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        {servers.map((s) => (
-          <button
-            key={s.id}
-            type="button"
-            onClick={() => setSelectedId(s.id)}
-            className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
-          >
-            {/* Header */}
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold text-foreground">{s.name}</span>
-              <div className="flex items-center gap-1.5">
-                <span className={`h-2 w-2 rounded-full ${s.status === "online" ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
-                <span className="text-xs text-muted-foreground">{s.status === "online" ? "Online" : "Error"}</span>
-              </div>
-            </div>
+      <div className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(340px,1fr))]">
+        {hosts.map((host) => {
+          const poll = stats[host.id];
+          const isLoading = loading.has(host.id);
+          const sys = poll?.system;
 
-            {/* Specs */}
-            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-              <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {s.cores} Cores</span>
-              <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {s.ram}</span>
-              <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {s.storage}</span>
-              <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {s.uptime}</span>
-            </div>
-
-            {/* Gauges & Stats */}
-            <div className="mt-4 flex items-start gap-6">
-              <CircularGauge value={s.cpu} label="CPU" />
-              <CircularGauge value={s.ramUsed} label="RAM" />
-
-              <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Network</div>
-                <div className="flex items-center gap-3 text-[11px] text-foreground">
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground" />
-                    {s.netDown} {s.netDownUnit}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground opacity-50" />
-                    {s.netUp} {s.netUpUnit}
+          return (
+            <button
+              key={host.id}
+              type="button"
+              onClick={() => setSelectedId(host.id)}
+              className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-foreground">{host.name}</span>
+                <div className="flex items-center gap-1.5">
+                  {isLoading ? (
+                    <span className="h-2 w-2 rounded-full bg-muted-foreground/40 animate-pulse" />
+                  ) : (
+                    <span className={`h-2 w-2 rounded-full ${poll?.ok ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
+                  )}
+                  <span className="text-xs text-muted-foreground">
+                    {isLoading ? "Connecting…" : poll?.ok ? "Online" : poll?.error ? "Error" : "—"}
                   </span>
                 </div>
               </div>
 
-              <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Disk</div>
-                <div className="flex items-center gap-3 text-[11px] text-foreground">
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground" />
-                    {s.diskRead} {s.diskReadUnit}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground opacity-50" />
-                    {s.diskWrite} {s.diskWriteUnit}
-                  </span>
-                </div>
+              {/* Specs from real system data */}
+              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                {sys && (
+                  <>
+                    <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys.cores} Cores</span>
+                    <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes(sys.memTotalKb * 1024)}</span>
+                    <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes(sys.diskTotalKb * 1024)}</span>
+                    <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {fmtUptime(sys.uptimeSecs)}</span>
+                  </>
+                )}
+                {isLoading && !sys && (
+                  <span className="h-3 w-48 rounded animate-shimmer inline-block" />
+                )}
               </div>
-            </div>
-          </button>
-        ))}
+
+              {/* Gauges */}
+              {sys ? (
+                <div className="mt-4 flex items-start gap-4">
+                  <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
+                  <RingGauge
+                    value={sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
+                    label="RAM"
+                    gradientId={`g-dash-ram-${host.id}`}
+                    size={52}
+                  />
+                  <RingGauge
+                    value={sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
+                    label="Disk"
+                    gradientId={`g-dash-disk-${host.id}`}
+                    size={52}
+                  />
+                  <IoStat
+                    label="Network"
+                    rows={[
+                      { icon: ArrowDownToLine, value: fmtBytes(sys.netRxRate), unit: "/s" },
+                      { icon: ArrowUpFromLine, value: fmtBytes(sys.netTxRate), unit: "/s" },
+                    ]}
+                  />
+                </div>
+              ) : (
+                <div className="mt-4 flex items-start gap-4">
+                  {/* Gauge placeholders */}
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  {/* Network placeholder */}
+                  <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
+                    <div className="h-2.5 w-14 rounded animate-shimmer" />
+                    <div className="flex flex-col gap-1">
+                      <div className="h-2.5 w-16 rounded animate-shimmer" />
+                      <div className="h-2.5 w-16 rounded animate-shimmer" />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -1114,19 +1186,25 @@ const CPU_CATEGORIES: { key: CpuCategory; label: string; color: string }[] = [
   { key: "steal", label: "Steal", color: "var(--color-brand-orange)" },
 ];
 
-function buildCpuData(samples: number[], cores: number) {
-  const list = Array.from({ length: cores }, (_, i) => samples[i] ?? samples[i % Math.max(samples.length, 1)] ?? 0);
-  const threads: CpuThread[] = list.map((p, i) => {
-    const total = Math.max(0, Math.min(100, p));
-    // deterministic split — mostly user, a touch of system, sparse spikes
-    const system = total > 0 ? Math.min(total, Math.round(total * 0.05) + ((i * 7) % 11 === 0 ? 3 : 0)) : 0;
-    const iowait = total > 25 && (i * 5) % 17 === 0 ? 1 : 0;
-    const steal = 0;
-    const nice = 0;
-    const user = Math.max(0, total - system - iowait - steal - nice);
-    return { user, system, nice, iowait, steal };
-  });
-  const sum = (k: CpuCategory) => threads.reduce((a, t) => a + t[k], 0) / threads.length;
+function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetrics[]) {
+  // Use real per-core breakdown when available (second poll onwards)
+  const threads: CpuThread[] = (coreMetrics && coreMetrics.length > 0)
+    ? coreMetrics.map((c) => ({
+        user:   Math.max(0, c.user),
+        system: Math.max(0, c.system),
+        nice:   Math.max(0, c.nice),
+        iowait: Math.max(0, c.iowait),
+        steal:  Math.max(0, c.steal),
+      }))
+    : Array.from({ length: cores }, (_, i) => {
+        // Fallback: first poll has no per-core data yet — show aggregate evenly
+        const total = Math.max(0, Math.min(100, samples[0] ?? 0));
+        const system = total > 0 ? Math.min(total, Math.round(total * 0.05)) : 0;
+        const iowait = 0;
+        const user = Math.max(0, total - system);
+        return { user, system, nice: 0, iowait, steal: 0 };
+      });
+  const sum = (k: CpuCategory) => threads.reduce((a, t) => a + t[k], 0) / Math.max(threads.length, 1);
   const breakdown: Record<CpuCategory, number> = {
     user: sum("user"),
     system: sum("system"),
@@ -1140,7 +1218,8 @@ function buildCpuData(samples: number[], cores: number) {
 
 function useColumnCount(blockWidth = 8, gap = 2) {
   const ref = useRef<HTMLDivElement>(null);
-  const [cols, setCols] = useState(60);
+  const [cols, setCols] = useState(0);
+
   useEffect(() => {
     if (!ref.current) return;
     const ro = new ResizeObserver(([entry]) => {
@@ -1151,14 +1230,13 @@ function useColumnCount(blockWidth = 8, gap = 2) {
     ro.observe(ref.current);
     return () => ro.disconnect();
   }, [blockWidth, gap]);
+
   return { ref, cols };
 }
 
-function CpuThreadRow({ thread }: { thread: CpuThread }) {
-  const { ref, cols } = useColumnCount(6, 1);
+function CpuThreadRow({ thread, cols }: { thread: CpuThread; cols: number }) {
   const total = thread.user + thread.system + thread.nice + thread.iowait + thread.steal;
   const filled = Math.round((total / 100) * cols);
-  // allocate per-category counts using largest-remainder so ordering stays User→System→Nice→IOWait→Steal
   const raw = CPU_CATEGORIES.map((c) => ({ key: c.key, color: c.color, exact: (thread[c.key] / 100) * cols }));
   const counts = raw.map((r) => ({ ...r, n: Math.floor(r.exact), rem: r.exact - Math.floor(r.exact) }));
   let assigned = counts.reduce((a, c) => a + c.n, 0);
@@ -1177,7 +1255,7 @@ function CpuThreadRow({ thread }: { thread: CpuThread }) {
 
   return (
     <div className="flex items-center gap-2">
-      <div ref={ref} className="flex flex-1 gap-[1px] overflow-hidden">
+      <div className="flex flex-1 gap-[1px] overflow-hidden">
         {Array.from({ length: cols }).map((_, i) => (
           <span
             key={i}
@@ -1196,16 +1274,17 @@ function CpuThreadRow({ thread }: { thread: CpuThread }) {
   );
 }
 
-function CpuUsageChart({ samples, cores, model }: { samples: number[]; cores: number; model: string }) {
+function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number[]; cores: number; model: string; coreMetrics?: CoreMetrics[] }) {
   const [open, setOpen] = useState(false);
-  const data = buildCpuData(samples, cores);
+  const [isPending, startTransition] = useTransition();
+  const data = buildCpuData(samples, cores, coreMetrics);
   const { ref, cols } = useColumnCount(6, 1);
 
   return (
     <section className="overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-4">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => startTransition(() => setOpen((v) => !v))}
         className="flex w-full items-center gap-3 text-left"
         aria-expanded={open}
       >
@@ -1256,10 +1335,23 @@ function CpuUsageChart({ samples, cores, model }: { samples: number[]; cores: nu
       </div>
 
       {open && (
-        <div className="mt-3 space-y-1 border-t border-border pt-3">
-          {data.threads.map((t, i) => (
-            <CpuThreadRow key={i} thread={t} />
-          ))}
+        <div className="mt-3 border-t border-border pt-3">
+          {isPending ? (
+            <div className="space-y-1.5">
+              {Array.from({ length: cores }).map((_, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <div className="h-[10px] flex-1 rounded-[1px] animate-shimmer" />
+                  <span className="w-9" />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-1">
+              {data.threads.map((t, i) => (
+                <CpuThreadRow key={i} thread={t} cols={Math.max(10, cols - Math.round(44 / 7))} />
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -1389,38 +1481,60 @@ function SectionLabel({
   );
 }
 
-function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => void }) {
-  const processes = [
-    { pid: 516654, name: "java", user: "elastic", cpu: 327.0, mem: "498 M" },
-    { pid: 1747, name: "node", user: "elastic", cpu: 4.0, mem: "348 M" },
-    { pid: 760, name: "dockerd", user: "root", cpu: 1.2, mem: "83.2 M" },
-    { pid: 77, name: "kcompactd0", user: "root", cpu: 0.9, mem: "0 B" },
-    { pid: 364, name: "jbd2/sda1-8", user: "root", cpu: 0.9, mem: "0 B" },
-    { pid: 664, name: "containerd", user: "root", cpu: 0.8, mem: "32.9 M" },
-    { pid: 3151640, name: "sshd", user: "root", cpu: 0.3, mem: "8.43 M" },
-    { pid: 12, name: "rcu_sched", user: "root", cpu: 0.2, mem: "0 B" },
-    { pid: 1, name: "systemd", user: "root", cpu: 0.1, mem: "5.70 M" },
-    { pid: 592, name: "vmtoolsd", user: "root", cpu: 0.1, mem: "5.02 M" },
-    { pid: 1722, name: "java", user: "elastic", cpu: 0.1, mem: "16.1 M" },
-    { pid: 473386, name: "kworker/1:2-eve", user: "root", cpu: 0.1, mem: "0 B" },
-    { pid: 516634, name: "containerd-shim", user: "root", cpu: 0.1, mem: "9.23 M" },
-  ];
+function HostDashboardView({
+  host,
+  initialStats,
+  onDetailUpdate,
+  onBack,
+}: {
+  host: Host;
+  initialStats: HostPollResult | null;
+  onDetailUpdate?: (result: HostPollResult) => void;
+  onBack: () => void;
+}) {
+  const { detail } = useHostDetail(host.id);
+  const poll = detail ?? initialStats;
+  const sys = poll?.system ?? null;
+  const pollProcesses = poll?.processes ?? null;
+  const pollContainers = poll?.containers ?? null; // null = docker not installed
 
-  const containers = [
-    { name: "docker-elk-kibana-1", status: "up", uptime: "7 months", cpu: 0, ram: 2, netRx: "228", netRxUnit: "G", netTx: "408", netTxUnit: "G", ioRead: "885", ioReadUnit: "M", ioWrite: "79.5", ioWriteUnit: "M" },
-    { name: "docker-elk-logstash-1", status: "up", uptime: "1 second", cpu: 20, ram: 0, netRx: "12.4", netRxUnit: "M", netTx: "3.10", netTxUnit: "M", ioRead: "104", ioReadUnit: "M", ioWrite: "8.20", ioWriteUnit: "M" },
-    { name: "docker-elk-elasticsearch-1", status: "up", uptime: "7 months", cpu: 14, ram: 65, netRx: "1.20", netRxUnit: "T", netTx: "980", netTxUnit: "G", ioRead: "2.40", ioReadUnit: "G", ioWrite: "1.10", ioWriteUnit: "G" },
-    { name: "docker-elk-setup-1", status: "exited", uptime: "7 months ago", cpu: 0, ram: 0, netRx: "0", netRxUnit: "B", netTx: "0", netTxUnit: "B", ioRead: "0", ioReadUnit: "B", ioWrite: "0", ioWriteUnit: "B" },
-  ];
+  // Persist detail (with processes) to parent cache so re-entry is instant
+  useEffect(() => {
+    if (detail?.ok && detail.processes !== null) {
+      onDetailUpdate?.(detail);
+    }
+  }, [detail]);
 
-  const memUsed = 9.99;
-  const memCached = 4.87;
-  const memTotal = 15.6;
-  const memFree = Math.max(memTotal - memUsed - memCached, 0);
+  const [procSearch, setProcSearch] = useState("");
+
+  // Accumulate load average history for the chart (max 32 points)
+  const loadHistoryRef = useRef<{ t: number; m1: number; m5: number; m15: number }[]>([]);
+  const [loadHistory, setLoadHistory] = useState<{ t: number; m1: number; m5: number; m15: number }[]>([]);
+  useEffect(() => {
+    if (!sys) return;
+    const entry = { t: loadHistoryRef.current.length, m1: sys.load1m, m5: sys.load5m, m15: sys.load15m };
+    const next = [...loadHistoryRef.current.slice(-31), entry];
+    loadHistoryRef.current = next;
+    setLoadHistory(next);
+  }, [sys?.load1m, sys?.load5m, sys?.load15m]);
+
+  // Memory calculations (in GB)
+  const memTotalGb = sys ? sys.memTotalKb / 1_048_576 : 0;
+  const memUsedGb = sys ? sys.memUsedKb / 1_048_576 : 0;
+  const memCachedGb = sys ? sys.memCachedKb / 1_048_576 : 0;
+  const memFree = Math.max(memTotalGb - memUsedGb - memCachedGb, 0);
+  const memUsedPct = memTotalGb > 0 ? (memUsedGb / memTotalGb) * 100 : 0;
+  const swapUsedGb = sys ? sys.swapUsedKb / 1_048_576 : 0;
+  const swapTotalGb = sys ? sys.swapTotalKb / 1_048_576 : 0;
+  const swapPct = swapTotalGb > 0 ? (swapUsedGb / swapTotalGb) * 100 : 0;
+  const diskPct = sys && sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0;
+  const diskTotalGb = sys ? sys.diskTotalKb / 1_048_576 : 0;
+  const diskUsedGb = sys ? sys.diskUsedKb / 1_048_576 : 0;
+
   const memData = [
-    { name: "Used", value: memUsed, fill: "oklch(0.7 0.28 320)" },
-    { name: "Cached", value: memCached, fill: "oklch(0.55 0.18 320)" },
-    { name: "Free", value: memFree, fill: "var(--color-border)" },
+    { name: "Used", value: memUsedGb || 0.001, fill: "oklch(0.7 0.28 320)" },
+    { name: "Cached", value: memCachedGb || 0.001, fill: "oklch(0.55 0.18 320)" },
+    { name: "Free", value: memFree || 0.001, fill: "var(--color-border)" },
   ];
 
   return (
@@ -1476,41 +1590,44 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-                  <span className="font-mono tabular-nums text-foreground/80">{host.ip}</span>
+                  <span className="font-mono tabular-nums text-foreground/80">{sys?.ip ?? "—"}</span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">Uptime</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">14d 2h 12m</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys ? fmtUptime(sys.uptimeSecs) : "—"}</span>
                   </span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">Cores</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">{host.cores}</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys?.cores ?? "—"}</span>
                   </span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">RAM</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">{memTotal} GB</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys ? `${memTotalGb.toFixed(1)} GB` : "—"}</span>
                   </span>
                 </div>
               </div>
             </div>
 
-            <div className="flex items-center gap-5 rounded-xl border border-border bg-background/60 px-4 py-2.5">
-              <MiniGauge value={host.cpu} label="CPU" color="var(--color-brand-cyan)" />
-              <span className="h-9 w-px bg-border" />
-              <MiniGauge value={host.ramUsed} label="RAM" color="oklch(0.7 0.28 320)" />
-              <span className="h-9 w-px bg-border" />
-              <MiniGauge value={host.diskUsed} label="Disk" color="var(--color-brand-yellow)" />
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-5 rounded-xl border border-border bg-background/60 px-4 py-2.5">
+                <MiniGauge value={sys?.cpuPct ?? 0} label="CPU" color="var(--color-brand-cyan)" />
+                <span className="h-9 w-px bg-border" />
+                <MiniGauge value={memUsedPct} label="RAM" color="oklch(0.7 0.28 320)" />
+                <span className="h-9 w-px bg-border" />
+                <MiniGauge value={diskPct} label="Disk" color="var(--color-brand-yellow)" />
+              </div>
             </div>
           </div>
         </header>
 
         {/* ─── CPU USAGE ──────────────────────────────────────────── */}
         <CpuUsageChart
-          samples={host.cpuSamples ?? [host.cpu]}
-          cores={host.cores}
-          model="Intel(R) Xeon(R) CPU E5-2650 v3 @ 2.30GHz"
+          samples={sys ? [sys.cpuPct] : [0]}
+          cores={sys?.cores ?? 1}
+          model={sys ? `Load: ${sys.load1m.toFixed(2)} / ${sys.load5m.toFixed(2)} / ${sys.load15m.toFixed(2)}` : "—"}
+          coreMetrics={sys?.cpuCores}
         />
 
         {/* ─── CPU LOAD CHART + PROCESSES ─────────────────────────── */}
@@ -1525,24 +1642,24 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-red)]" />
                     <span className="text-muted-foreground">1m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.50</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load1m?.toFixed(2) ?? "—"}</span>
                   </span>
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-cyan)]" />
                     <span className="text-muted-foreground">5m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.71</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load5m?.toFixed(2) ?? "—"}</span>
                   </span>
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-yellow)]" />
                     <span className="text-muted-foreground">15m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.58</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load15m?.toFixed(2) ?? "—"}</span>
                   </span>
                 </div>
               }
             />
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={loadSeries} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+                <AreaChart data={loadHistory.length > 0 ? loadHistory : loadSeries} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
                   <defs>
                     <linearGradient id="g1m" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="var(--color-brand-red)" stopOpacity={0.45} />
@@ -1593,9 +1710,16 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                 icon={List}
                 title="Top Processes"
                 action={
-                  <button className="text-[11px] font-medium text-[var(--color-brand-cyan)] hover:underline">
-                    View all
-                  </button>
+                  <div className="relative">
+                    <Search className="absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
+                    <input
+                      type="text"
+                      value={procSearch}
+                      onChange={(e) => setProcSearch(e.target.value)}
+                      placeholder="filter…"
+                      className="h-6 w-28 rounded-md border border-border bg-transparent pl-6 pr-2 text-[10px] text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
+                    />
+                  </div>
                 }
               />
             </div>
@@ -1604,38 +1728,64 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                 <TableHeader className="sticky top-0 z-10 bg-[var(--color-surface)] backdrop-blur">
                   <TableRow className="border-border hover:bg-transparent">
                     <TableHead className="h-6 px-3 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Process</TableHead>
-                    <TableHead className="h-6 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">User</TableHead>
-                    <TableHead className="h-6 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">CPU%</TableHead>
-                    <TableHead className="h-6 px-3 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Mem</TableHead>
+                    <TableHead className="h-6 w-16 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">User</TableHead>
+                    <TableHead className="h-6 w-12 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">CPU%</TableHead>
+                    <TableHead className="h-6 w-20 px-3 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Mem</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {processes.map((p) => {
-                    const isHot = p.cpu >= 100;
-                    const isWarm = p.cpu >= 4 && p.cpu < 100;
-                    return (
-                      <TableRow key={p.pid} className="border-border/60 text-[10.5px]">
-                        <TableCell className="px-3 py-1">
-                          <div className="font-medium leading-tight text-foreground">{p.name}</div>
-                          <div className="font-mono text-[9px] leading-tight text-muted-foreground/60">{p.pid}</div>
-                        </TableCell>
-                        <TableCell className="py-1 font-mono text-muted-foreground">{p.user}</TableCell>
-                        <TableCell
-                          className="py-1 text-right font-mono font-bold tabular-nums"
-                          style={{
-                            color: isHot
-                              ? "var(--color-brand-red)"
-                              : isWarm
-                                ? "var(--color-brand-yellow)"
-                                : "var(--color-brand-cyan)",
-                          }}
-                        >
-                          {p.cpu.toFixed(1)}
-                        </TableCell>
-                        <TableCell className="px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{p.mem}</TableCell>
-                      </TableRow>
-                    );
-                  })}
+                  {pollProcesses === null && (
+                    <TableRow>
+                      <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">Loading processes…</TableCell>
+                    </TableRow>
+                  )}
+                  {(() => {
+                    if (pollProcesses === null) return null;
+                    const q = procSearch.trim().toLowerCase();
+                    const filtered = q
+                      ? pollProcesses.filter(
+                          (p) =>
+                            p.name.toLowerCase().includes(q) ||
+                            p.user.toLowerCase().includes(q) ||
+                            String(p.pid).includes(q),
+                        )
+                      : pollProcesses;
+                    if (filtered.length === 0) {
+                      return (
+                        <TableRow>
+                          <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">
+                            {q ? "No matching processes" : "No processes found"}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    }
+                    return filtered.map((p) => {
+                      const isHot = p.cpuPct >= 100;
+                      const isWarm = p.cpuPct >= 4 && p.cpuPct < 100;
+                      return (
+                        <TableRow key={p.pid} className="border-border/60 text-[10.5px]">
+                          <TableCell className="px-3 py-1">
+                            <div className="font-medium leading-tight text-foreground">{p.name}</div>
+                            <div className="font-mono text-[9px] leading-tight text-muted-foreground/60">{p.pid}</div>
+                          </TableCell>
+                          <TableCell className="w-16 max-w-[4rem] truncate py-1 font-mono text-muted-foreground">{p.user}</TableCell>
+                          <TableCell
+                            className="w-12 py-1 text-right font-mono font-bold tabular-nums"
+                            style={{
+                              color: isHot
+                                ? "var(--color-brand-red)"
+                                : isWarm
+                                  ? "var(--color-brand-yellow)"
+                                  : "var(--color-brand-cyan)",
+                            }}
+                          >
+                            {p.cpuPct.toFixed(1)}
+                          </TableCell>
+                          <TableCell className="w-20 px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
+                        </TableRow>
+                      );
+                    });
+                  })()}
                 </TableBody>
               </Table>
             </ScrollArea>
@@ -1659,13 +1809,13 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                 </ResponsiveContainer>
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
                   <span className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Used</span>
-                  <span className="text-lg font-bold tabular-nums text-foreground">64%</span>
+                  <span className="text-lg font-bold tabular-nums text-foreground">{Math.round(memUsedPct)}%</span>
                 </div>
               </div>
               <div className="flex-1 space-y-2.5 text-[11px]">
                 {[
-                  { c: "oklch(0.7 0.28 320)", v: `${memUsed} G`, l: "Used" },
-                  { c: "oklch(0.55 0.18 320)", v: `${memCached} G`, l: "Cached" },
+                  { c: "oklch(0.7 0.28 320)", v: `${memUsedGb.toFixed(2)} G`, l: "Used" },
+                  { c: "oklch(0.55 0.18 320)", v: `${memCachedGb.toFixed(2)} G`, l: "Cached" },
                   { c: "var(--color-border)", v: `${memFree.toFixed(2)} G`, l: "Free" },
                 ].map((row) => (
                   <div key={row.l} className="flex items-center justify-between gap-2">
@@ -1681,9 +1831,9 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             <div className="mt-4 border-t border-border pt-3">
               <div className="mb-1.5 flex justify-between text-[11px]">
                 <span className="font-medium text-foreground">Swap</span>
-                <span className="font-mono tabular-nums text-muted-foreground">949 M / 975 M</span>
+                <span className="font-mono tabular-nums text-muted-foreground">{(swapUsedGb * 1024).toFixed(0)} M / {(swapTotalGb * 1024).toFixed(0)} M</span>
               </div>
-              <Progress value={97} className="h-1.5 [&>div]:bg-[oklch(0.7_0.28_320)]" />
+              <Progress value={swapPct} className="h-1.5 [&>div]:bg-[oklch(0.7_0.28_320)]" />
             </div>
           </section>
 
@@ -1693,7 +1843,7 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
               color="var(--color-brand-orange)"
               icon={Network}
               title="Network I/O"
-              action={<span className="font-mono text-[10px] text-muted-foreground">ens192</span>}
+              action={<span className="font-mono text-[10px] text-muted-foreground">{sys?.netIface ?? "—"}</span>}
             />
             <div className="space-y-4">
               <div>
@@ -1705,13 +1855,12 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                     <span className="font-medium text-foreground">Inbound</span>
                   </span>
                   <span className="font-mono text-[12px] font-bold tabular-nums text-[var(--color-brand-green)]">
-                    570 K/s
+                    {fmtBytes(sys?.netRxRate ?? 0)}/s
                   </span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-border/60">
                   <div className="h-full rounded-full bg-[var(--color-brand-green)]" style={{ width: "40%" }} />
                 </div>
-                <div className="mt-1 text-right font-mono text-[10px] text-muted-foreground">Total ↓ 1.32 T</div>
               </div>
               <div>
                 <div className="mb-1.5 flex items-center justify-between">
@@ -1722,18 +1871,17 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                     <span className="font-medium text-foreground">Outbound</span>
                   </span>
                   <span className="font-mono text-[12px] font-bold tabular-nums text-[var(--color-brand-orange)]">
-                    122 K/s
+                    {fmtBytes(sys?.netTxRate ?? 0)}/s
                   </span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-border/60">
                   <div className="h-full rounded-full bg-[var(--color-brand-orange)]" style={{ width: "12%" }} />
                 </div>
-                <div className="mt-1 text-right font-mono text-[10px] text-muted-foreground">Total ↑ 644 G</div>
               </div>
             </div>
             <div className="mt-4 flex items-center justify-between border-t border-border pt-3 text-[11px]">
               <span className="text-muted-foreground">IP Address</span>
-              <span className="font-mono font-bold tabular-nums text-foreground">{host.ip}</span>
+              <span className="font-mono font-bold tabular-nums text-foreground">{sys?.ip ?? "—"}</span>
             </div>
           </section>
 
@@ -1746,25 +1894,25 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             />
             <div className="mt-2 flex items-center gap-3">
               <RingGauge
-                value={host.diskUsed}
+                value={diskPct}
                 label="DISK"
                 gradientId="g-disk"
-                from="oklch(0.78 0.16 150)"
-                to="oklch(0.62 0.18 145)"
                 size={52}
                 stroke={5}
               />
               <div className="flex-1 space-y-1.5">
-                <div className="font-mono text-[10px] text-muted-foreground">/dev/sda1 · ext4</div>
+                <div className="font-mono text-[10px] text-muted-foreground">
+                  {sys?.diskDev ? `/dev/${sys.diskDev}` : "—"}
+                </div>
                 <div className="flex items-baseline gap-1.5">
-                  <span className="text-xl font-bold tabular-nums text-foreground">{host.diskUsed}</span>
+                  <span className="text-xl font-bold tabular-nums text-foreground">{diskPct.toFixed(0)}</span>
                   <span className="text-[10px] text-muted-foreground">%</span>
                   <span className="ml-auto font-mono text-[10px] tabular-nums text-muted-foreground">
-                    79.5 G / 92.0 G
+                    {diskUsedGb.toFixed(1)} G / {diskTotalGb.toFixed(1)} G
                   </span>
                 </div>
                 <Progress
-                  value={host.diskUsed}
+                  value={diskPct}
                   className="h-1 [&>div]:bg-[var(--color-brand-green)]"
                 />
               </div>
@@ -1772,109 +1920,114 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 border-t border-border pt-2 text-[10px]">
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-orange)]/40 px-1 text-[9px] text-[var(--color-brand-orange)]">R</Badge>
-                <span className="font-mono font-bold tabular-nums text-foreground">40.0 K/s</span>
+                <span className="font-mono font-bold tabular-nums text-foreground">
+                  {sys?.diskDev ? fmtBytes(sys.diskReadRate) + "/s" : "—"}
+                </span>
               </div>
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-cyan)]/40 px-1 text-[9px] text-[var(--color-brand-cyan)]">W</Badge>
-                <span className="font-mono font-bold tabular-nums text-foreground">1.64 M/s</span>
+                <span className="font-mono font-bold tabular-nums text-foreground">
+                  {sys?.diskDev ? fmtBytes(sys.diskWriteRate) + "/s" : "—"}
+                </span>
               </div>
               <div className="text-muted-foreground">
-                Latency <span className="font-mono font-bold text-foreground">0.25 ms</span>
+                Latency{" "}
+                <span className="font-mono font-bold text-foreground">
+                  {sys?.diskDev
+                    ? (() => {
+                        const r = sys.diskReadLatencyMs;
+                        const w = sys.diskWriteLatencyMs;
+                        const avg = r > 0 && w > 0 ? (r + w) / 2 : r > 0 ? r : w;
+                        return avg > 0 ? `${avg.toFixed(1)} ms` : "0 ms";
+                      })()
+                    : "—"}
+                </span>
               </div>
               <div className="text-muted-foreground">
-                IOPS <span className="font-mono font-bold text-foreground">178</span>
+                IOPS{" "}
+                <span className="font-mono font-bold text-foreground">
+                  {sys?.diskDev ? Math.round(sys.diskIops).toLocaleString() : "—"}
+                </span>
               </div>
             </div>
           </section>
         </div>
 
         {/* ─── DOCKER CONTAINERS ──────────────────────────────────── */}
-        <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
-          <SectionLabel
-            color="oklch(0.65 0.22 270)"
-            icon={Container}
-            title="Docker Containers"
-            action={
-              <div className="flex items-center gap-2 text-[11px]">
-                <span className="flex items-center gap-1 text-muted-foreground">
-                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
-                  {containers.filter((c) => c.status === "up").length} running
-                </span>
-                <span className="h-1 w-1 rounded-full bg-border" />
-                <span className="flex items-center gap-1 text-muted-foreground">
-                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
-                  {containers.filter((c) => c.status !== "up").length} stopped
-                </span>
-              </div>
-            }
-          />
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
-            {containers.map((c) => {
-              const isUp = c.status === "up";
-              return (
-                <div
-                  key={c.name}
-                  className="group relative overflow-hidden rounded-xl border border-border bg-background/40 p-3.5 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))]"
-                >
-                  <div
-                    aria-hidden
-                    className="absolute inset-y-0 left-0 w-[3px]"
-                    style={{ background: isUp ? "var(--color-brand-green)" : "var(--color-border)" }}
-                  />
-                  <div className="flex items-center justify-between">
-                    <div className="min-w-0">
-                      <div className="truncate text-[12px] font-semibold text-foreground">{c.name}</div>
-                      <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
-                        <span
-                          className={`h-1.5 w-1.5 rounded-full ${
-                            isUp
-                              ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
-                              : "bg-muted-foreground/50"
-                          }`}
-                        />
-                        <span className="font-mono">{isUp ? `Up · ${c.uptime}` : c.uptime}</span>
+        {pollContainers !== null && (
+          <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
+            <SectionLabel
+              color="oklch(0.65 0.22 270)"
+              icon={Container}
+              title="Docker Containers"
+              action={
+                <div className="flex items-center gap-2 text-[11px]">
+                  <span className="flex items-center gap-1 text-muted-foreground">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
+                    {pollContainers.filter((c) => c.state === "running").length} running
+                  </span>
+                  <span className="h-1 w-1 rounded-full bg-border" />
+                  <span className="flex items-center gap-1 text-muted-foreground">
+                    <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
+                    {pollContainers.filter((c) => c.state !== "running").length} stopped
+                  </span>
+                </div>
+              }
+            />
+            {pollContainers.length === 0 ? (
+              <div className="py-8 text-center text-sm text-muted-foreground">No containers found.</div>
+            ) : (
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                {pollContainers.map((c) => {
+                  const isUp = c.state === "running";
+                  const memPct = c.memLimitBytes > 0 ? (c.memUsedBytes / c.memLimitBytes) * 100 : 0;
+                  return (
+                    <div
+                      key={c.id}
+                      className="group relative overflow-hidden rounded-xl border border-border bg-background/40 p-3.5 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))]"
+                    >
+                      <div
+                        aria-hidden
+                        className="absolute inset-y-0 left-0 w-[3px]"
+                        style={{ background: isUp ? "var(--color-brand-green)" : "var(--color-border)" }}
+                      />
+                      <div className="flex items-center justify-between">
+                        <div className="min-w-0">
+                          <div className="truncate text-[12px] font-semibold text-foreground">{c.name}</div>
+                          <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                            <span
+                              className={`h-1.5 w-1.5 rounded-full ${
+                                isUp
+                                  ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
+                                  : "bg-muted-foreground/50"
+                              }`}
+                            />
+                            <span className="font-mono">{c.state}</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <RingGauge value={c.cpuPct} label="CPU" gradientId={`g-cpu-${c.id}`} />
+                          <RingGauge value={memPct} label="RAM" gradientId={`g-ram-${c.id}`} />
+                        </div>
+                        <div className="flex flex-1 items-stretch gap-3 text-[10px]">
+                          <IoStat
+                            label="Network"
+                            rows={[
+                              { icon: ArrowDownToLine, value: fmtBytes(c.netRxRate), unit: "/s" },
+                              { icon: ArrowUpFromLine, value: fmtBytes(c.netTxRate), unit: "/s" },
+                            ]}
+                          />
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-3">
-                      <RingGauge
-                        value={c.cpu}
-                        label="CPU"
-                        gradientId={`g-cpu-${c.name}`}
-                        from="oklch(0.78 0.16 200)"
-                        to="oklch(0.62 0.18 240)"
-                      />
-                      <RingGauge
-                        value={c.ram}
-                        label="RAM"
-                        gradientId={`g-ram-${c.name}`}
-                        from="oklch(0.88 0.18 95)"
-                        to="oklch(0.72 0.20 55)"
-                      />
-                    </div>
-                    <div className="flex flex-1 items-stretch gap-3 text-[10px]">
-                      <IoStat
-                        label="Network"
-                        rows={[
-                          { icon: ArrowDownToLine, value: c.netRx, unit: c.netRxUnit },
-                          { icon: ArrowUpFromLine, value: c.netTx, unit: c.netTxUnit },
-                        ]}
-                      />
-                      <IoStat
-                        label="Block IO"
-                        rows={[
-                          { icon: ArrowDownToLine, value: c.ioRead, unit: c.ioReadUnit, letter: "R" },
-                          { icon: ArrowUpFromLine, value: c.ioWrite, unit: c.ioWriteUnit, letter: "W" },
-                        ]}
-                      />
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
       </div>
     </ScrollArea>
   );
