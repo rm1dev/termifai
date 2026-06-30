@@ -1,5 +1,6 @@
 mod crypto;
 mod hosts;
+mod vault;
 mod port_forwarding;
 mod pty_manager;
 mod sftp;
