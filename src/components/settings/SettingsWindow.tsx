@@ -1,4 +1,4 @@
-import { X, Palette, Keyboard, Minus, Plus, Check } from "lucide-react";
+import { X, Palette, Keyboard, Minus, Plus, Check, Shield } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useState } from "react";
 import { platform } from "@/lib/platform";
@@ -26,6 +26,9 @@ import {
   terminalFonts,
   type TerminalFont,
 } from "@/lib/terminal-appearance";
+import { toast } from "sonner";
+import { vaultStatus, vaultLock, vaultChangeMasterPassword } from "@/lib/api/vault";
+import type { VaultStatus } from "@/lib/api/vault";
 import {
   appThemes,
   loadAppTheme,
@@ -50,6 +53,43 @@ export function SettingsWindow() {
   const [selectedThemeId, setSelectedThemeId] = useState(loadAppTheme().id);
   const [shortcuts, setShortcuts] = useState(loadShortcuts);
   const [editingShortcutId, setEditingShortcutId] = useState<ShortcutActionId | null>(null);
+  const [vaultSt, setVaultSt] = useState<VaultStatus | null>(null);
+  const [oldPw, setOldPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [pwError, setPwError] = useState<string | null>(null);
+  const [pwLoading, setPwLoading] = useState(false);
+
+  useEffect(() => {
+    vaultStatus().then(setVaultSt).catch(console.error);
+  }, []);
+
+  const handleLock = async () => {
+    try {
+      await vaultLock();
+      setVaultSt((s) => (s ? { ...s, unlocked: false } : s));
+      toast.success("Vault locked");
+    } catch (e: unknown) {
+      toast.error(String(e));
+    }
+  };
+
+  const handleChangePw = async () => {
+    if (newPw.length < 8) { setPwError("New password must be at least 8 characters."); return; }
+    if (newPw !== confirmPw) { setPwError("Passwords do not match."); return; }
+    setPwError(null);
+    setPwLoading(true);
+    try {
+      await vaultChangeMasterPassword(oldPw, newPw);
+      setOldPw(""); setNewPw(""); setConfirmPw("");
+      toast.success("Master password changed");
+    } catch (e: unknown) {
+      setPwError(String(e));
+    } finally {
+      setPwLoading(false);
+    }
+  };
+
   useEffect(() => {
     const previousBackground = document.body.style.backgroundColor;
     document.body.style.backgroundColor = "transparent";
@@ -177,7 +217,7 @@ export function SettingsWindow() {
 
       <main className="min-h-0 flex-1 overflow-auto p-5">
         <Tabs defaultValue="theme" className="mx-auto max-w-3xl">
-          <TabsList className="grid w-full grid-cols-2">
+          <TabsList className="grid w-full grid-cols-3">
             <TabsTrigger value="theme" className="gap-2">
               <Palette className="h-4 w-4" />
               Theme
@@ -185,6 +225,10 @@ export function SettingsWindow() {
             <TabsTrigger value="shortcuts" className="gap-2">
               <Keyboard className="h-4 w-4" />
               Shortcuts
+            </TabsTrigger>
+            <TabsTrigger value="security" className="gap-2">
+              <Shield className="h-4 w-4" />
+              Security
             </TabsTrigger>
           </TabsList>
 
@@ -389,6 +433,79 @@ export function SettingsWindow() {
                 </div>
               </CardContent>
             </Card>
+          </TabsContent>
+
+          <TabsContent value="security" className="mt-4 space-y-4 pb-10">
+            {vaultSt && !vaultSt.initialized && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Password Vault</CardTitle>
+                  <CardDescription className="text-xs">
+                    No vault created yet. Open the main window to set up a master password.
+                  </CardDescription>
+                </CardHeader>
+              </Card>
+            )}
+
+            {vaultSt?.initialized && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Vault Status</CardTitle>
+                  <CardDescription className="text-xs">
+                    {vaultSt.unlocked ? "Vault is unlocked." : "Vault is locked."}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={!vaultSt.unlocked}
+                    onClick={() => void handleLock()}
+                  >
+                    Lock Vault
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
+
+            {vaultSt?.initialized && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Change Master Password</CardTitle>
+                  <CardDescription className="text-xs">
+                    Re-encrypts the vault key. All host passwords remain intact.
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  <input
+                    type="password"
+                    placeholder="Current password"
+                    className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[var(--color-brand-cyan)] focus:ring-1 focus:ring-[var(--color-brand-cyan)]"
+                    value={oldPw}
+                    onChange={(e) => setOldPw(e.target.value)}
+                  />
+                  <input
+                    type="password"
+                    placeholder="New password"
+                    className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[var(--color-brand-cyan)] focus:ring-1 focus:ring-[var(--color-brand-cyan)]"
+                    value={newPw}
+                    onChange={(e) => setNewPw(e.target.value)}
+                  />
+                  <input
+                    type="password"
+                    placeholder="Confirm new password"
+                    className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[var(--color-brand-cyan)] focus:ring-1 focus:ring-[var(--color-brand-cyan)]"
+                    value={confirmPw}
+                    onChange={(e) => setConfirmPw(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") void handleChangePw(); }}
+                  />
+                  {pwError && <p className="text-xs text-red-400">{pwError}</p>}
+                  <Button size="sm" onClick={() => void handleChangePw()} disabled={pwLoading}>
+                    {pwLoading ? "Saving…" : "Change Password"}
+                  </Button>
+                </CardContent>
+              </Card>
+            )}
           </TabsContent>
         </Tabs>
       </main>
