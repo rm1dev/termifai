@@ -135,7 +135,7 @@ import { SftpRenameDialog } from "./SftpRenameDialog";
 import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
 import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
-import { useDashboard, fmtBytes, fmtUptime } from "@/lib/dashboard";
+import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult } from "@/lib/dashboard";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
   { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -979,29 +979,15 @@ function DashboardView() {
   const { stats, loading } = useDashboard(hostIds);
 
   if (selectedId) {
-    const host = hosts.find((h) => h.id === selectedId);
-    if (host) {
-      const sys = stats[selectedId]?.system;
-      // Build a ServerStat stub for HostDashboardView (Task 6 will change this signature)
-      const stub: ServerStat = {
-        id: host.id,
-        name: host.name,
-        status: stats[selectedId]?.ok ? "online" : "error",
-        cores: sys?.cores ?? 0,
-        ram: "—",
-        storage: "—",
-        uptime: "—",
-        cpu: sys?.cpuPct ?? 0,
-        ramUsed: sys && sys.memTotalKb > 0 ? Math.round((sys.memUsedKb / sys.memTotalKb) * 100) : 0,
-        diskUsed: sys && sys.diskTotalKb > 0 ? Math.round((sys.diskUsedKb / sys.diskTotalKb) * 100) : 0,
-        os: "—",
-        ip: sys?.ip ?? "—",
-        netDown: "—", netDownUnit: "",
-        netUp: "—", netUpUnit: "",
-        diskRead: "—", diskReadUnit: "",
-        diskWrite: "—", diskWriteUnit: "",
-      };
-      return <HostDashboardView host={stub} onBack={() => setSelectedId(null)} />;
+    const selectedHost = hosts.find((h) => h.id === selectedId);
+    if (selectedHost) {
+      return (
+        <HostDashboardView
+          host={selectedHost}
+          initialStats={stats[selectedId] ?? null}
+          onBack={() => setSelectedId(null)}
+        />
+      );
     }
   }
 
@@ -1468,38 +1454,38 @@ function SectionLabel({
   );
 }
 
-function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => void }) {
-  const processes = [
-    { pid: 516654, name: "java", user: "elastic", cpu: 327.0, mem: "498 M" },
-    { pid: 1747, name: "node", user: "elastic", cpu: 4.0, mem: "348 M" },
-    { pid: 760, name: "dockerd", user: "root", cpu: 1.2, mem: "83.2 M" },
-    { pid: 77, name: "kcompactd0", user: "root", cpu: 0.9, mem: "0 B" },
-    { pid: 364, name: "jbd2/sda1-8", user: "root", cpu: 0.9, mem: "0 B" },
-    { pid: 664, name: "containerd", user: "root", cpu: 0.8, mem: "32.9 M" },
-    { pid: 3151640, name: "sshd", user: "root", cpu: 0.3, mem: "8.43 M" },
-    { pid: 12, name: "rcu_sched", user: "root", cpu: 0.2, mem: "0 B" },
-    { pid: 1, name: "systemd", user: "root", cpu: 0.1, mem: "5.70 M" },
-    { pid: 592, name: "vmtoolsd", user: "root", cpu: 0.1, mem: "5.02 M" },
-    { pid: 1722, name: "java", user: "elastic", cpu: 0.1, mem: "16.1 M" },
-    { pid: 473386, name: "kworker/1:2-eve", user: "root", cpu: 0.1, mem: "0 B" },
-    { pid: 516634, name: "containerd-shim", user: "root", cpu: 0.1, mem: "9.23 M" },
-  ];
+function HostDashboardView({
+  host,
+  initialStats,
+  onBack,
+}: {
+  host: Host;
+  initialStats: HostPollResult | null;
+  onBack: () => void;
+}) {
+  const { detail, refresh } = useHostDetail(host.id);
+  const poll = detail ?? initialStats;
+  const sys = poll?.system ?? null;
+  const pollProcesses = poll?.processes ?? [];
+  const pollContainers = poll?.containers ?? null; // null = docker not installed
 
-  const containers = [
-    { name: "docker-elk-kibana-1", status: "up", uptime: "7 months", cpu: 0, ram: 2, netRx: "228", netRxUnit: "G", netTx: "408", netTxUnit: "G", ioRead: "885", ioReadUnit: "M", ioWrite: "79.5", ioWriteUnit: "M" },
-    { name: "docker-elk-logstash-1", status: "up", uptime: "1 second", cpu: 20, ram: 0, netRx: "12.4", netRxUnit: "M", netTx: "3.10", netTxUnit: "M", ioRead: "104", ioReadUnit: "M", ioWrite: "8.20", ioWriteUnit: "M" },
-    { name: "docker-elk-elasticsearch-1", status: "up", uptime: "7 months", cpu: 14, ram: 65, netRx: "1.20", netRxUnit: "T", netTx: "980", netTxUnit: "G", ioRead: "2.40", ioReadUnit: "G", ioWrite: "1.10", ioWriteUnit: "G" },
-    { name: "docker-elk-setup-1", status: "exited", uptime: "7 months ago", cpu: 0, ram: 0, netRx: "0", netRxUnit: "B", netTx: "0", netTxUnit: "B", ioRead: "0", ioReadUnit: "B", ioWrite: "0", ioWriteUnit: "B" },
-  ];
+  // Memory calculations (in GB)
+  const memTotalGb = sys ? sys.memTotalKb / 1_048_576 : 0;
+  const memUsedGb = sys ? sys.memUsedKb / 1_048_576 : 0;
+  const memCachedGb = sys ? sys.memCachedKb / 1_048_576 : 0;
+  const memFree = Math.max(memTotalGb - memUsedGb - memCachedGb, 0);
+  const memUsedPct = memTotalGb > 0 ? (memUsedGb / memTotalGb) * 100 : 0;
+  const swapUsedGb = sys ? sys.swapUsedKb / 1_048_576 : 0;
+  const swapTotalGb = sys ? sys.swapTotalKb / 1_048_576 : 0;
+  const swapPct = swapTotalGb > 0 ? (swapUsedGb / swapTotalGb) * 100 : 0;
+  const diskPct = sys && sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0;
+  const diskTotalGb = sys ? sys.diskTotalKb / 1_048_576 : 0;
+  const diskUsedGb = sys ? sys.diskUsedKb / 1_048_576 : 0;
 
-  const memUsed = 9.99;
-  const memCached = 4.87;
-  const memTotal = 15.6;
-  const memFree = Math.max(memTotal - memUsed - memCached, 0);
   const memData = [
-    { name: "Used", value: memUsed, fill: "oklch(0.7 0.28 320)" },
-    { name: "Cached", value: memCached, fill: "oklch(0.55 0.18 320)" },
-    { name: "Free", value: memFree, fill: "var(--color-border)" },
+    { name: "Used", value: memUsedGb || 0.001, fill: "oklch(0.7 0.28 320)" },
+    { name: "Cached", value: memCachedGb || 0.001, fill: "oklch(0.55 0.18 320)" },
+    { name: "Free", value: memFree || 0.001, fill: "var(--color-border)" },
   ];
 
   return (
@@ -1555,41 +1541,47 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-                  <span className="font-mono tabular-nums text-foreground/80">{host.ip}</span>
+                  <span className="font-mono tabular-nums text-foreground/80">{sys?.ip ?? "—"}</span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">Uptime</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">14d 2h 12m</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys ? fmtUptime(sys.uptimeSecs) : "—"}</span>
                   </span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">Cores</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">{host.cores}</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys?.cores ?? "—"}</span>
                   </span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">RAM</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">{memTotal} GB</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys ? `${memTotalGb.toFixed(1)} GB` : "—"}</span>
                   </span>
                 </div>
               </div>
             </div>
 
-            <div className="flex items-center gap-5 rounded-xl border border-border bg-background/60 px-4 py-2.5">
-              <MiniGauge value={host.cpu} label="CPU" color="var(--color-brand-cyan)" />
-              <span className="h-9 w-px bg-border" />
-              <MiniGauge value={host.ramUsed} label="RAM" color="oklch(0.7 0.28 320)" />
-              <span className="h-9 w-px bg-border" />
-              <MiniGauge value={host.diskUsed} label="Disk" color="var(--color-brand-yellow)" />
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-5 rounded-xl border border-border bg-background/60 px-4 py-2.5">
+                <MiniGauge value={sys?.cpuPct ?? 0} label="CPU" color="var(--color-brand-cyan)" />
+                <span className="h-9 w-px bg-border" />
+                <MiniGauge value={memUsedPct} label="RAM" color="oklch(0.7 0.28 320)" />
+                <span className="h-9 w-px bg-border" />
+                <MiniGauge value={diskPct} label="Disk" color="var(--color-brand-yellow)" />
+              </div>
+              <Button variant="outline" size="sm" onClick={refresh} className="h-8 gap-1.5 text-xs">
+                <Activity className="h-3.5 w-3.5" />
+                Refresh
+              </Button>
             </div>
           </div>
         </header>
 
         {/* ─── CPU USAGE ──────────────────────────────────────────── */}
         <CpuUsageChart
-          samples={host.cpuSamples ?? [host.cpu]}
-          cores={host.cores}
-          model="Intel(R) Xeon(R) CPU E5-2650 v3 @ 2.30GHz"
+          samples={sys ? [sys.cpuPct] : [0]}
+          cores={sys?.cores ?? 1}
+          model={sys ? `Load: ${sys.load1m.toFixed(2)} / ${sys.load5m.toFixed(2)} / ${sys.load15m.toFixed(2)}` : "—"}
         />
 
         {/* ─── CPU LOAD CHART + PROCESSES ─────────────────────────── */}
@@ -1604,17 +1596,17 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-red)]" />
                     <span className="text-muted-foreground">1m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.50</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load1m?.toFixed(2) ?? "—"}</span>
                   </span>
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-cyan)]" />
                     <span className="text-muted-foreground">5m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.71</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load5m?.toFixed(2) ?? "—"}</span>
                   </span>
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-yellow)]" />
                     <span className="text-muted-foreground">15m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.58</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load15m?.toFixed(2) ?? "—"}</span>
                   </span>
                 </div>
               }
@@ -1689,9 +1681,14 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {processes.map((p) => {
-                    const isHot = p.cpu >= 100;
-                    const isWarm = p.cpu >= 4 && p.cpu < 100;
+                  {pollProcesses.length === 0 && (
+                    <TableRow>
+                      <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">Loading processes…</TableCell>
+                    </TableRow>
+                  )}
+                  {pollProcesses.map((p) => {
+                    const isHot = p.cpuPct >= 100;
+                    const isWarm = p.cpuPct >= 4 && p.cpuPct < 100;
                     return (
                       <TableRow key={p.pid} className="border-border/60 text-[10.5px]">
                         <TableCell className="px-3 py-1">
@@ -1709,9 +1706,9 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                                 : "var(--color-brand-cyan)",
                           }}
                         >
-                          {p.cpu.toFixed(1)}
+                          {p.cpuPct.toFixed(1)}
                         </TableCell>
-                        <TableCell className="px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{p.mem}</TableCell>
+                        <TableCell className="px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
                       </TableRow>
                     );
                   })}
@@ -1738,13 +1735,13 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                 </ResponsiveContainer>
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
                   <span className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Used</span>
-                  <span className="text-lg font-bold tabular-nums text-foreground">64%</span>
+                  <span className="text-lg font-bold tabular-nums text-foreground">{Math.round(memUsedPct)}%</span>
                 </div>
               </div>
               <div className="flex-1 space-y-2.5 text-[11px]">
                 {[
-                  { c: "oklch(0.7 0.28 320)", v: `${memUsed} G`, l: "Used" },
-                  { c: "oklch(0.55 0.18 320)", v: `${memCached} G`, l: "Cached" },
+                  { c: "oklch(0.7 0.28 320)", v: `${memUsedGb.toFixed(2)} G`, l: "Used" },
+                  { c: "oklch(0.55 0.18 320)", v: `${memCachedGb.toFixed(2)} G`, l: "Cached" },
                   { c: "var(--color-border)", v: `${memFree.toFixed(2)} G`, l: "Free" },
                 ].map((row) => (
                   <div key={row.l} className="flex items-center justify-between gap-2">
@@ -1760,9 +1757,9 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             <div className="mt-4 border-t border-border pt-3">
               <div className="mb-1.5 flex justify-between text-[11px]">
                 <span className="font-medium text-foreground">Swap</span>
-                <span className="font-mono tabular-nums text-muted-foreground">949 M / 975 M</span>
+                <span className="font-mono tabular-nums text-muted-foreground">{(swapUsedGb * 1024).toFixed(0)} M / {(swapTotalGb * 1024).toFixed(0)} M</span>
               </div>
-              <Progress value={97} className="h-1.5 [&>div]:bg-[oklch(0.7_0.28_320)]" />
+              <Progress value={swapPct} className="h-1.5 [&>div]:bg-[oklch(0.7_0.28_320)]" />
             </div>
           </section>
 
@@ -1772,7 +1769,7 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
               color="var(--color-brand-orange)"
               icon={Network}
               title="Network I/O"
-              action={<span className="font-mono text-[10px] text-muted-foreground">ens192</span>}
+              action={<span className="font-mono text-[10px] text-muted-foreground">{sys?.netIface ?? "—"}</span>}
             />
             <div className="space-y-4">
               <div>
@@ -1784,13 +1781,12 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                     <span className="font-medium text-foreground">Inbound</span>
                   </span>
                   <span className="font-mono text-[12px] font-bold tabular-nums text-[var(--color-brand-green)]">
-                    570 K/s
+                    {fmtBytes(sys?.netRxRate ?? 0)}/s
                   </span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-border/60">
                   <div className="h-full rounded-full bg-[var(--color-brand-green)]" style={{ width: "40%" }} />
                 </div>
-                <div className="mt-1 text-right font-mono text-[10px] text-muted-foreground">Total ↓ 1.32 T</div>
               </div>
               <div>
                 <div className="mb-1.5 flex items-center justify-between">
@@ -1801,18 +1797,17 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                     <span className="font-medium text-foreground">Outbound</span>
                   </span>
                   <span className="font-mono text-[12px] font-bold tabular-nums text-[var(--color-brand-orange)]">
-                    122 K/s
+                    {fmtBytes(sys?.netTxRate ?? 0)}/s
                   </span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-border/60">
                   <div className="h-full rounded-full bg-[var(--color-brand-orange)]" style={{ width: "12%" }} />
                 </div>
-                <div className="mt-1 text-right font-mono text-[10px] text-muted-foreground">Total ↑ 644 G</div>
               </div>
             </div>
             <div className="mt-4 flex items-center justify-between border-t border-border pt-3 text-[11px]">
               <span className="text-muted-foreground">IP Address</span>
-              <span className="font-mono font-bold tabular-nums text-foreground">{host.ip}</span>
+              <span className="font-mono font-bold tabular-nums text-foreground">{sys?.ip ?? "—"}</span>
             </div>
           </section>
 
@@ -1825,7 +1820,7 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             />
             <div className="mt-2 flex items-center gap-3">
               <RingGauge
-                value={host.diskUsed}
+                value={diskPct}
                 label="DISK"
                 gradientId="g-disk"
                 size={52}
@@ -1834,14 +1829,14 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
               <div className="flex-1 space-y-1.5">
                 <div className="font-mono text-[10px] text-muted-foreground">/dev/sda1 · ext4</div>
                 <div className="flex items-baseline gap-1.5">
-                  <span className="text-xl font-bold tabular-nums text-foreground">{host.diskUsed}</span>
+                  <span className="text-xl font-bold tabular-nums text-foreground">{diskPct.toFixed(0)}</span>
                   <span className="text-[10px] text-muted-foreground">%</span>
                   <span className="ml-auto font-mono text-[10px] tabular-nums text-muted-foreground">
-                    79.5 G / 92.0 G
+                    {diskUsedGb.toFixed(1)} G / {diskTotalGb.toFixed(1)} G
                   </span>
                 </div>
                 <Progress
-                  value={host.diskUsed}
+                  value={diskPct}
                   className="h-1 [&>div]:bg-[var(--color-brand-green)]"
                 />
               </div>
@@ -1849,97 +1844,97 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 border-t border-border pt-2 text-[10px]">
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-orange)]/40 px-1 text-[9px] text-[var(--color-brand-orange)]">R</Badge>
-                <span className="font-mono font-bold tabular-nums text-foreground">40.0 K/s</span>
+                <span className="font-mono font-bold tabular-nums text-foreground">—</span>
               </div>
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-cyan)]/40 px-1 text-[9px] text-[var(--color-brand-cyan)]">W</Badge>
-                <span className="font-mono font-bold tabular-nums text-foreground">1.64 M/s</span>
+                <span className="font-mono font-bold tabular-nums text-foreground">—</span>
               </div>
               <div className="text-muted-foreground">
-                Latency <span className="font-mono font-bold text-foreground">0.25 ms</span>
+                Latency <span className="font-mono font-bold text-foreground">—</span>
               </div>
               <div className="text-muted-foreground">
-                IOPS <span className="font-mono font-bold text-foreground">178</span>
+                IOPS <span className="font-mono font-bold text-foreground">—</span>
               </div>
             </div>
           </section>
         </div>
 
         {/* ─── DOCKER CONTAINERS ──────────────────────────────────── */}
-        <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
-          <SectionLabel
-            color="oklch(0.65 0.22 270)"
-            icon={Container}
-            title="Docker Containers"
-            action={
-              <div className="flex items-center gap-2 text-[11px]">
-                <span className="flex items-center gap-1 text-muted-foreground">
-                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
-                  {containers.filter((c) => c.status === "up").length} running
-                </span>
-                <span className="h-1 w-1 rounded-full bg-border" />
-                <span className="flex items-center gap-1 text-muted-foreground">
-                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
-                  {containers.filter((c) => c.status !== "up").length} stopped
-                </span>
-              </div>
-            }
-          />
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
-            {containers.map((c) => {
-              const isUp = c.status === "up";
-              return (
-                <div
-                  key={c.name}
-                  className="group relative overflow-hidden rounded-xl border border-border bg-background/40 p-3.5 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))]"
-                >
-                  <div
-                    aria-hidden
-                    className="absolute inset-y-0 left-0 w-[3px]"
-                    style={{ background: isUp ? "var(--color-brand-green)" : "var(--color-border)" }}
-                  />
-                  <div className="flex items-center justify-between">
-                    <div className="min-w-0">
-                      <div className="truncate text-[12px] font-semibold text-foreground">{c.name}</div>
-                      <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
-                        <span
-                          className={`h-1.5 w-1.5 rounded-full ${
-                            isUp
-                              ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
-                              : "bg-muted-foreground/50"
-                          }`}
-                        />
-                        <span className="font-mono">{isUp ? `Up · ${c.uptime}` : c.uptime}</span>
+        {pollContainers !== null && (
+          <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
+            <SectionLabel
+              color="oklch(0.65 0.22 270)"
+              icon={Container}
+              title="Docker Containers"
+              action={
+                <div className="flex items-center gap-2 text-[11px]">
+                  <span className="flex items-center gap-1 text-muted-foreground">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
+                    {pollContainers.filter((c) => c.state === "running").length} running
+                  </span>
+                  <span className="h-1 w-1 rounded-full bg-border" />
+                  <span className="flex items-center gap-1 text-muted-foreground">
+                    <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
+                    {pollContainers.filter((c) => c.state !== "running").length} stopped
+                  </span>
+                </div>
+              }
+            />
+            {pollContainers.length === 0 ? (
+              <div className="py-8 text-center text-sm text-muted-foreground">No containers found.</div>
+            ) : (
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                {pollContainers.map((c) => {
+                  const isUp = c.state === "running";
+                  const memPct = c.memLimitBytes > 0 ? (c.memUsedBytes / c.memLimitBytes) * 100 : 0;
+                  return (
+                    <div
+                      key={c.id}
+                      className="group relative overflow-hidden rounded-xl border border-border bg-background/40 p-3.5 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))]"
+                    >
+                      <div
+                        aria-hidden
+                        className="absolute inset-y-0 left-0 w-[3px]"
+                        style={{ background: isUp ? "var(--color-brand-green)" : "var(--color-border)" }}
+                      />
+                      <div className="flex items-center justify-between">
+                        <div className="min-w-0">
+                          <div className="truncate text-[12px] font-semibold text-foreground">{c.name}</div>
+                          <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                            <span
+                              className={`h-1.5 w-1.5 rounded-full ${
+                                isUp
+                                  ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
+                                  : "bg-muted-foreground/50"
+                              }`}
+                            />
+                            <span className="font-mono">{c.state}</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <RingGauge value={c.cpuPct} label="CPU" gradientId={`g-cpu-${c.id}`} />
+                          <RingGauge value={memPct} label="RAM" gradientId={`g-ram-${c.id}`} />
+                        </div>
+                        <div className="flex flex-1 items-stretch gap-3 text-[10px]">
+                          <IoStat
+                            label="Network"
+                            rows={[
+                              { icon: ArrowDownToLine, value: fmtBytes(c.netRxRate), unit: "/s" },
+                              { icon: ArrowUpFromLine, value: fmtBytes(c.netTxRate), unit: "/s" },
+                            ]}
+                          />
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-3">
-                      <RingGauge value={c.cpu} label="CPU" gradientId={`g-cpu-${c.name}`} />
-                      <RingGauge value={c.ram} label="RAM" gradientId={`g-ram-${c.name}`} />
-                    </div>
-                    <div className="flex flex-1 items-stretch gap-3 text-[10px]">
-                      <IoStat
-                        label="Network"
-                        rows={[
-                          { icon: ArrowDownToLine, value: c.netRx, unit: c.netRxUnit },
-                          { icon: ArrowUpFromLine, value: c.netTx, unit: c.netTxUnit },
-                        ]}
-                      />
-                      <IoStat
-                        label="Block IO"
-                        rows={[
-                          { icon: ArrowDownToLine, value: c.ioRead, unit: c.ioReadUnit, letter: "R" },
-                          { icon: ArrowUpFromLine, value: c.ioWrite, unit: c.ioWriteUnit, letter: "W" },
-                        ]}
-                      />
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
       </div>
     </ScrollArea>
   );
