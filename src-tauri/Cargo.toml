@@ -36,9 +36,16 @@ keyring = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri = { version = "2", features = ["macos-private-api"] }
+# keyring v3 ships only a non-persistent mock store unless a platform backend
+# is enabled; apple-native gives us the real macOS Keychain.
+keyring = { version = "3", features = ["apple-native"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [patch.crates-io]
 portable-pty = { path = "../vendor/portable-pty" }
