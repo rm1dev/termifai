@@ -773,6 +773,7 @@ async fn dashboard_connect(
         };
 
         let actor = dashboard::spawn_host_actor(
+            app.clone(),
             host.id.clone(),
             host.hostname.clone(),
             host.port,
