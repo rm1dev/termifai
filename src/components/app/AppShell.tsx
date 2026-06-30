@@ -135,7 +135,7 @@ import { SftpRenameDialog } from "./SftpRenameDialog";
 import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
 import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
-import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult } from "@/lib/dashboard";
+import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
   { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -1183,19 +1183,25 @@ const CPU_CATEGORIES: { key: CpuCategory; label: string; color: string }[] = [
   { key: "steal", label: "Steal", color: "var(--color-brand-orange)" },
 ];
 
-function buildCpuData(samples: number[], cores: number) {
-  const list = Array.from({ length: cores }, (_, i) => samples[i] ?? samples[i % Math.max(samples.length, 1)] ?? 0);
-  const threads: CpuThread[] = list.map((p, i) => {
-    const total = Math.max(0, Math.min(100, p));
-    // deterministic split — mostly user, a touch of system, sparse spikes
-    const system = total > 0 ? Math.min(total, Math.round(total * 0.05) + ((i * 7) % 11 === 0 ? 3 : 0)) : 0;
-    const iowait = total > 25 && (i * 5) % 17 === 0 ? 1 : 0;
-    const steal = 0;
-    const nice = 0;
-    const user = Math.max(0, total - system - iowait - steal - nice);
-    return { user, system, nice, iowait, steal };
-  });
-  const sum = (k: CpuCategory) => threads.reduce((a, t) => a + t[k], 0) / threads.length;
+function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetrics[]) {
+  // Use real per-core breakdown when available (second poll onwards)
+  const threads: CpuThread[] = (coreMetrics && coreMetrics.length > 0)
+    ? coreMetrics.map((c) => ({
+        user:   Math.max(0, c.user),
+        system: Math.max(0, c.system),
+        nice:   Math.max(0, c.nice),
+        iowait: Math.max(0, c.iowait),
+        steal:  Math.max(0, c.steal),
+      }))
+    : Array.from({ length: cores }, (_, i) => {
+        // Fallback: first poll has no per-core data yet — show aggregate evenly
+        const total = Math.max(0, Math.min(100, samples[0] ?? 0));
+        const system = total > 0 ? Math.min(total, Math.round(total * 0.05)) : 0;
+        const iowait = 0;
+        const user = Math.max(0, total - system);
+        return { user, system, nice: 0, iowait, steal: 0 };
+      });
+  const sum = (k: CpuCategory) => threads.reduce((a, t) => a + t[k], 0) / Math.max(threads.length, 1);
   const breakdown: Record<CpuCategory, number> = {
     user: sum("user"),
     system: sum("system"),
@@ -1265,9 +1271,9 @@ function CpuThreadRow({ thread }: { thread: CpuThread }) {
   );
 }
 
-function CpuUsageChart({ samples, cores, model }: { samples: number[]; cores: number; model: string }) {
+function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number[]; cores: number; model: string; coreMetrics?: CoreMetrics[] }) {
   const [open, setOpen] = useState(false);
-  const data = buildCpuData(samples, cores);
+  const data = buildCpuData(samples, cores, coreMetrics);
   const { ref, cols } = useColumnCount(6, 1);
 
   return (
@@ -1606,6 +1612,7 @@ function HostDashboardView({
           samples={sys ? [sys.cpuPct] : [0]}
           cores={sys?.cores ?? 1}
           model={sys ? `Load: ${sys.load1m.toFixed(2)} / ${sys.load5m.toFixed(2)} / ${sys.load15m.toFixed(2)}` : "—"}
+          coreMetrics={sys?.cpuCores}
         />
 
         {/* ─── CPU LOAD CHART + PROCESSES ─────────────────────────── */}
