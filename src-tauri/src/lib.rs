@@ -1,3 +1,4 @@
+mod crypto;
 mod hosts;
 mod port_forwarding;
 mod pty_manager;
