@@ -1488,6 +1488,8 @@ function HostDashboardView({
     }
   }, [detail]);
 
+  const [procSearch, setProcSearch] = useState("");
+
   // Accumulate load average history for the chart (max 32 points)
   const loadHistoryRef = useRef<{ t: number; m1: number; m5: number; m15: number }[]>([]);
   const [loadHistory, setLoadHistory] = useState<{ t: number; m1: number; m5: number; m15: number }[]>([]);
@@ -1695,9 +1697,16 @@ function HostDashboardView({
                 icon={List}
                 title="Top Processes"
                 action={
-                  <button className="text-[11px] font-medium text-[var(--color-brand-cyan)] hover:underline">
-                    View all
-                  </button>
+                  <div className="relative">
+                    <Search className="absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
+                    <input
+                      type="text"
+                      value={procSearch}
+                      onChange={(e) => setProcSearch(e.target.value)}
+                      placeholder="filter…"
+                      className="h-6 w-28 rounded-md border border-border bg-transparent pl-6 pr-2 text-[10px] text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
+                    />
+                  </div>
                 }
               />
             </div>
@@ -1717,37 +1726,53 @@ function HostDashboardView({
                       <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">Loading processes…</TableCell>
                     </TableRow>
                   )}
-                  {pollProcesses !== null && pollProcesses.length === 0 && (
-                    <TableRow>
-                      <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">No processes found</TableCell>
-                    </TableRow>
-                  )}
-                  {(pollProcesses ?? []).map((p) => {
-                    const isHot = p.cpuPct >= 100;
-                    const isWarm = p.cpuPct >= 4 && p.cpuPct < 100;
-                    return (
-                      <TableRow key={p.pid} className="border-border/60 text-[10.5px]">
-                        <TableCell className="px-3 py-1">
-                          <div className="font-medium leading-tight text-foreground">{p.name}</div>
-                          <div className="font-mono text-[9px] leading-tight text-muted-foreground/60">{p.pid}</div>
-                        </TableCell>
-                        <TableCell className="py-1 font-mono text-muted-foreground">{p.user}</TableCell>
-                        <TableCell
-                          className="py-1 text-right font-mono font-bold tabular-nums"
-                          style={{
-                            color: isHot
-                              ? "var(--color-brand-red)"
-                              : isWarm
-                                ? "var(--color-brand-yellow)"
-                                : "var(--color-brand-cyan)",
-                          }}
-                        >
-                          {p.cpuPct.toFixed(1)}
-                        </TableCell>
-                        <TableCell className="px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
-                      </TableRow>
-                    );
-                  })}
+                  {(() => {
+                    if (pollProcesses === null) return null;
+                    const q = procSearch.trim().toLowerCase();
+                    const filtered = q
+                      ? pollProcesses.filter(
+                          (p) =>
+                            p.name.toLowerCase().includes(q) ||
+                            p.user.toLowerCase().includes(q) ||
+                            String(p.pid).includes(q),
+                        )
+                      : pollProcesses;
+                    if (filtered.length === 0) {
+                      return (
+                        <TableRow>
+                          <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">
+                            {q ? "No matching processes" : "No processes found"}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    }
+                    return filtered.map((p) => {
+                      const isHot = p.cpuPct >= 100;
+                      const isWarm = p.cpuPct >= 4 && p.cpuPct < 100;
+                      return (
+                        <TableRow key={p.pid} className="border-border/60 text-[10.5px]">
+                          <TableCell className="px-3 py-1">
+                            <div className="font-medium leading-tight text-foreground">{p.name}</div>
+                            <div className="font-mono text-[9px] leading-tight text-muted-foreground/60">{p.pid}</div>
+                          </TableCell>
+                          <TableCell className="py-1 font-mono text-muted-foreground">{p.user}</TableCell>
+                          <TableCell
+                            className="py-1 text-right font-mono font-bold tabular-nums"
+                            style={{
+                              color: isHot
+                                ? "var(--color-brand-red)"
+                                : isWarm
+                                  ? "var(--color-brand-yellow)"
+                                  : "var(--color-brand-cyan)",
+                            }}
+                          >
+                            {p.cpuPct.toFixed(1)}
+                          </TableCell>
+                          <TableCell className="px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
+                        </TableRow>
+                      );
+                    });
+                  })()}
                 </TableBody>
               </Table>
             </ScrollArea>
