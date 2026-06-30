@@ -79,6 +79,7 @@ export function fmtUptime(secs: number): string {
 }
 
 const POLL_INTERVAL_MS = 30_000;
+const PROCESS_INTERVAL_MS = 5_000;
 
 export function useDashboard(hostIds: string[]): {
   stats: Record<string, HostPollResult>;
@@ -154,22 +155,24 @@ export function useHostDetail(hostId: string | null): {
     const unlistenPromise = listen<HostPollResult>("dash:stat", ({ payload }) => {
       if (payload.hostId === hostId) {
         setDetail((prev) => {
-          // Background polls (wantDetail: false) return processes: null.
-          // Preserve the existing process list so the UI doesn't flicker blank.
-          if (payload.processes === null && prev?.processes != null) {
-            return { ...payload, processes: prev.processes };
-          }
-          return payload;
+          // want_detail=true polls: return processes + sys metrics, containers=null (Docker skipped).
+          // want_detail=false polls: return containers + sys metrics, processes=null.
+          // In both cases, preserve whichever field is missing from prev state.
+          return {
+            ...payload,
+            processes:  payload.processes  ?? prev?.processes  ?? null,
+            containers: payload.containers ?? prev?.containers ?? null,
+          };
         });
       }
     });
 
-    // Background interval only refreshes system/network metrics — no `ps` on remote.
-    // Manual refresh() still fetches processes.
+    // Poll processes every 5s — lightweight: reads /proc/*/stat, no ps CPU sorting.
+    // Docker metrics are handled by useDashboard's 30s interval separately.
     const interval = setInterval(() => {
       if (!hostId) return;
-      invoke("dashboard_poll", { wantDetail: false, hostId }).catch(console.error);
-    }, POLL_INTERVAL_MS);
+      invoke("dashboard_poll", { wantDetail: true, hostId }).catch(console.error);
+    }, PROCESS_INTERVAL_MS);
 
     return () => {
       clearInterval(interval);
