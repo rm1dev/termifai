@@ -34,6 +34,21 @@ pub struct Host {
     pub working_directory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_sftp_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMeta {
+    /// Key-derivation function id; currently always "argon2id".
+    pub kdf: String,
+    /// base64(no-pad) per-vault Argon2 salt.
+    pub salt: String,
+    /// Envelope-wrapped DEK as a "v1:nonce:ciphertext" token.
+    pub wrapped_key: String,
+    /// Verifier token used to detect a wrong master password.
+    pub verifier: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -68,6 +83,8 @@ pub struct HostGroup {
 pub struct HostsVault {
     pub hosts: Vec<Host>,
     pub groups: Vec<HostGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crypto: Option<CryptoMeta>,
 }
 
 #[derive(Deserialize)]
@@ -130,6 +147,7 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("h-{}", uuid::Uuid::new_v4()));
     let now = now_iso();
+    // `now` is reused for both last_used and updated_at below.
     let existing_last_used = vault
         .hosts
         .iter()
@@ -148,7 +166,7 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
             .map(|tag| tag.trim().to_string())
             .filter(|tag| !tag.is_empty())
             .collect(),
-        last_used: existing_last_used.or(Some(now)),
+        last_used: existing_last_used.or(Some(now.clone())),
         group_id: request.group_id.filter(|value| !value.trim().is_empty()),
         auth_method: request.auth_method,
         password: request.password.filter(|value| !value.is_empty()),
@@ -160,6 +178,7 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
         default_sftp_path: request
             .default_sftp_path
             .filter(|value| !value.trim().is_empty()),
+        updated_at: Some(now),
     };
 
     upsert_by_id(&mut vault.hosts, host.clone(), |item| &item.id);
@@ -472,4 +491,30 @@ fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crypto_meta_round_trips_through_json() {
+        let meta = CryptoMeta {
+            kdf: "argon2id".to_string(),
+            salt: "c2FsdA".to_string(),
+            wrapped_key: "v1:n:c".to_string(),
+            verifier: "v1:n:c".to_string(),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"wrappedKey\""));
+        let back: CryptoMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.kdf, "argon2id");
+    }
+
+    #[test]
+    fn empty_vault_serializes_without_crypto_field() {
+        let vault = HostsVault::default();
+        let json = serde_json::to_string(&vault).unwrap();
+        assert!(!json.contains("crypto"), "crypto must be omitted when None");
+    }
 }
