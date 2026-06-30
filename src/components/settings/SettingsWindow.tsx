@@ -27,8 +27,8 @@ import {
   type TerminalFont,
 } from "@/lib/terminal-appearance";
 import { toast } from "sonner";
-import { vaultStatus, vaultLock, vaultChangeMasterPassword } from "@/lib/api/vault";
-import type { VaultStatus } from "@/lib/api/vault";
+import { vaultStatus, vaultLock, vaultChangeMasterPassword, getLockPolicy, setLockPolicy } from "@/lib/api/vault";
+import type { VaultStatus, LockPolicy } from "@/lib/api/vault";
 import {
   appThemes,
   loadAppTheme,
@@ -54,6 +54,7 @@ export function SettingsWindow() {
   const [shortcuts, setShortcuts] = useState(loadShortcuts);
   const [editingShortcutId, setEditingShortcutId] = useState<ShortcutActionId | null>(null);
   const [vaultSt, setVaultSt] = useState<VaultStatus | null>(null);
+  const [lockPolicy, setLockPolicyState] = useState<LockPolicy>("on_restart");
   const [oldPw, setOldPw] = useState("");
   const [newPw, setNewPw] = useState("");
   const [confirmPw, setConfirmPw] = useState("");
@@ -61,8 +62,22 @@ export function SettingsWindow() {
   const [pwLoading, setPwLoading] = useState(false);
 
   useEffect(() => {
-    vaultStatus().then(setVaultSt).catch(console.error);
+    vaultStatus().then((s) => {
+      setVaultSt(s);
+      setLockPolicyState(s.lockPolicy);
+    }).catch(console.error);
+    getLockPolicy().then(setLockPolicyState).catch(console.error);
   }, []);
+
+  const handleSetLockPolicy = async (policy: LockPolicy) => {
+    try {
+      await setLockPolicy(policy);
+      setLockPolicyState(policy);
+      toast.success("Lock policy updated");
+    } catch (e: unknown) {
+      toast.error(String(e));
+    }
+  };
 
   const handleLock = async () => {
     try {
@@ -436,6 +451,52 @@ export function SettingsWindow() {
           </TabsContent>
 
           <TabsContent value="security" className="mt-4 space-y-4 pb-10">
+            {/* Lock Policy */}
+            {vaultSt?.initialized && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Ask for Master Password</CardTitle>
+                  <CardDescription className="text-xs">
+                    When should the app ask for your master password?
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  {(
+                    [
+                      { value: "on_restart", label: "After system restart", desc: "Stay unlocked between app launches; ask again after logout or restart" },
+                      { value: "on_screen_lock", label: "After screen lock", desc: "Lock the vault whenever the screen is locked" },
+                      { value: "on_app_close", label: "After closing the app", desc: "Always ask when reopening the app" },
+                      { value: "never", label: "Never", desc: "Stay unlocked indefinitely — only lock manually" },
+                    ] as { value: LockPolicy; label: string; desc: string }[]
+                  ).map(({ value, label, desc }) => (
+                    <button
+                      key={value}
+                      onClick={() => void handleSetLockPolicy(value)}
+                      className={`flex w-full items-start gap-3 rounded-lg border px-4 py-3 text-left transition-colors ${
+                        lockPolicy === value
+                          ? "border-[var(--color-brand-cyan)] bg-[var(--color-brand-cyan)]/10"
+                          : "border-border hover:border-muted-foreground/40"
+                      }`}
+                    >
+                      <span className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2 ${
+                        lockPolicy === value
+                          ? "border-[var(--color-brand-cyan)]"
+                          : "border-muted-foreground/40"
+                      }`}>
+                        {lockPolicy === value && (
+                          <span className="h-2 w-2 rounded-full bg-[var(--color-brand-cyan)]" />
+                        )}
+                      </span>
+                      <div>
+                        <p className="text-sm font-medium text-foreground">{label}</p>
+                        <p className="text-xs text-muted-foreground">{desc}</p>
+                      </div>
+                    </button>
+                  ))}
+                </CardContent>
+              </Card>
+            )}
+
             {vaultSt && !vaultSt.initialized && (
               <Card>
                 <CardHeader>
