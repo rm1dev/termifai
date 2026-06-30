@@ -236,6 +236,17 @@ fn vault_change_master_password(
 }
 
 #[tauri::command]
+fn get_host_password(app: tauri::AppHandle, host_id: String) -> Result<Option<String>, String> {
+    let vault = hosts::list_hosts(&app)?;
+    let host = vault
+        .hosts
+        .iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| "Host not found".to_string())?;
+    Ok(hosts::decrypt_host_password(host))
+}
+
+#[tauri::command]
 async fn test_host_connection(
     app: tauri::AppHandle,
     request: TestHostConnectionRequest,
@@ -909,6 +920,7 @@ pub fn run() {
             vault_unlock,
             vault_lock,
             vault_change_master_password,
+            get_host_password,
             test_host_connection,
             list_port_forwards,
             save_port_forward,
