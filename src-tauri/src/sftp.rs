@@ -531,16 +531,22 @@ mod tests {
 
     #[test]
     fn test_download_no_session_returns_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         let manager = SftpManager::new();
-        let result = manager.download_file("nonexistent", "/remote/file.txt", "/tmp/out.txt", |_| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = manager.download_file("nonexistent", "/remote/file.txt", "/tmp/out.txt", cancel, |_| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
 
     #[test]
     fn test_upload_no_session_returns_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         let manager = SftpManager::new();
-        let result = manager.upload_file("nonexistent", "/tmp/local.txt", "/remote/file.txt", |_| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = manager.upload_file("nonexistent", "/tmp/local.txt", "/remote/file.txt", cancel, |_| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
