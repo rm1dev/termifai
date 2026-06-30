@@ -1475,7 +1475,7 @@ function HostDashboardView({
   onDetailUpdate?: (result: HostPollResult) => void;
   onBack: () => void;
 }) {
-  const { detail, refresh } = useHostDetail(host.id);
+  const { detail } = useHostDetail(host.id);
   const poll = detail ?? initialStats;
   const sys = poll?.system ?? null;
   const pollProcesses = poll?.processes ?? null;
@@ -1601,10 +1601,6 @@ function HostDashboardView({
                 <span className="h-9 w-px bg-border" />
                 <MiniGauge value={diskPct} label="Disk" color="var(--color-brand-yellow)" />
               </div>
-              <Button variant="outline" size="sm" onClick={refresh} className="h-8 gap-1.5 text-xs">
-                <Activity className="h-3.5 w-3.5" />
-                Refresh
-              </Button>
             </div>
           </div>
         </header>
@@ -1908,27 +1904,32 @@ function HostDashboardView({
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-orange)]/40 px-1 text-[9px] text-[var(--color-brand-orange)]">R</Badge>
                 <span className="font-mono font-bold tabular-nums text-foreground">
-                  {sys && sys.diskReadRate > 0 ? fmtBytes(sys.diskReadRate) + "/s" : "—"}
+                  {sys?.diskDev ? fmtBytes(sys.diskReadRate) + "/s" : "—"}
                 </span>
               </div>
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-cyan)]/40 px-1 text-[9px] text-[var(--color-brand-cyan)]">W</Badge>
                 <span className="font-mono font-bold tabular-nums text-foreground">
-                  {sys && sys.diskWriteRate > 0 ? fmtBytes(sys.diskWriteRate) + "/s" : "—"}
+                  {sys?.diskDev ? fmtBytes(sys.diskWriteRate) + "/s" : "—"}
                 </span>
               </div>
               <div className="text-muted-foreground">
                 Latency{" "}
                 <span className="font-mono font-bold text-foreground">
-                  {sys && (sys.diskReadLatencyMs > 0 || sys.diskWriteLatencyMs > 0)
-                    ? `${((sys.diskReadLatencyMs + sys.diskWriteLatencyMs) / (sys.diskReadLatencyMs > 0 && sys.diskWriteLatencyMs > 0 ? 2 : 1)).toFixed(1)} ms`
+                  {sys?.diskDev
+                    ? (() => {
+                        const r = sys.diskReadLatencyMs;
+                        const w = sys.diskWriteLatencyMs;
+                        const avg = r > 0 && w > 0 ? (r + w) / 2 : r > 0 ? r : w;
+                        return avg > 0 ? `${avg.toFixed(1)} ms` : "0 ms";
+                      })()
                     : "—"}
                 </span>
               </div>
               <div className="text-muted-foreground">
                 IOPS{" "}
                 <span className="font-mono font-bold text-foreground">
-                  {sys && sys.diskIops > 0 ? Math.round(sys.diskIops).toLocaleString() : "—"}
+                  {sys?.diskDev ? Math.round(sys.diskIops).toLocaleString() : "—"}
                 </span>
               </div>
             </div>
