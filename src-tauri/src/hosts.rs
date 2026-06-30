@@ -137,6 +137,56 @@ pub fn list_hosts(app: &AppHandle) -> Result<HostsVault, String> {
     read_vault(app)
 }
 
+/// Returns the plaintext password for a host:
+/// - legacy plaintext (no "v1:" prefix) is returned as-is;
+/// - "v1:" tokens are decrypted with the unlocked vault key;
+/// - returns None if there is no password, or the vault is locked, or decryption fails.
+pub fn decrypt_host_password(host: &Host) -> Option<String> {
+    let stored = host.password.as_ref().filter(|p| !p.is_empty())?;
+    if !stored.starts_with("v1:") {
+        return Some(stored.clone());
+    }
+    let guard = crate::vault::current_key();
+    let key = guard.as_ref()?;
+    crate::crypto::decrypt_field(key, stored).ok()
+}
+
+pub fn read_crypto_meta(app: &AppHandle) -> Result<Option<CryptoMeta>, String> {
+    Ok(read_vault(app)?.crypto)
+}
+
+pub fn write_crypto_meta(app: &AppHandle, meta: CryptoMeta) -> Result<(), String> {
+    let mut vault = read_vault(app)?;
+    vault.crypto = Some(meta);
+    write_vault(app, &vault)
+}
+
+/// Re-encrypt any legacy plaintext password fields using the unlocked vault key.
+/// Returns how many hosts were migrated. No-op if the vault is locked.
+pub fn migrate_plaintext_passwords(app: &AppHandle) -> Result<usize, String> {
+    let guard = crate::vault::current_key();
+    let key = match guard.as_ref() {
+        Some(k) => k,
+        None => return Ok(0),
+    };
+    let mut vault = read_vault(app)?;
+    let mut migrated = 0usize;
+    for host in vault.hosts.iter_mut() {
+        if let Some(pw) = host.password.as_ref() {
+            if !pw.is_empty() && !pw.starts_with("v1:") {
+                let token = crate::crypto::encrypt_field(key, pw)
+                    .map_err(|_| "Failed to encrypt during migration".to_string())?;
+                host.password = Some(token);
+                migrated += 1;
+            }
+        }
+    }
+    if migrated > 0 {
+        write_vault(app, &vault)?;
+    }
+    Ok(migrated)
+}
+
 pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, String> {
     validate_host(&request)?;
     let mut vault = read_vault(app)?;
@@ -169,7 +219,7 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
         last_used: existing_last_used.or(Some(now.clone())),
         group_id: request.group_id.filter(|value| !value.trim().is_empty()),
         auth_method: request.auth_method,
-        password: request.password.filter(|value| !value.is_empty()),
+        password: encrypt_password_for_save(request.password),
         ssh_key_id: request.ssh_key_id.filter(|value| !value.trim().is_empty()),
         show_status_in_dashboard: request.show_status_in_dashboard,
         working_directory: request
@@ -479,6 +529,18 @@ fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
     descendants
 }
 
+/// Encrypt a to-be-saved password with the unlocked vault key. If the value is
+/// empty it becomes None. If the vault is locked, the value is stored as-is
+/// (legacy plaintext) — the UI must require an unlock before saving secrets.
+fn encrypt_password_for_save(password: Option<String>) -> Option<String> {
+    let pw = password.filter(|value| !value.is_empty())?;
+    let guard = crate::vault::current_key();
+    match guard.as_ref() {
+        Some(key) => crate::crypto::encrypt_field(key, &pw).ok().or(Some(pw)),
+        None => Some(pw),
+    }
+}
+
 fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app
         .path()
@@ -516,5 +578,29 @@ mod tests {
         let vault = HostsVault::default();
         let json = serde_json::to_string(&vault).unwrap();
         assert!(!json.contains("crypto"), "crypto must be omitted when None");
+    }
+
+    #[test]
+    fn decrypt_host_password_passes_through_legacy_plaintext() {
+        let host = Host {
+            id: "h1".into(), name: "n".into(), user: "u".into(), hostname: "h".into(),
+            port: 22, os: OsKind::Other, tags: vec![], last_used: None, group_id: None,
+            auth_method: None, password: Some("plainpw".into()), ssh_key_id: None,
+            show_status_in_dashboard: None, working_directory: None,
+            default_sftp_path: None, updated_at: None,
+        };
+        assert_eq!(decrypt_host_password(&host), Some("plainpw".to_string()));
+    }
+
+    #[test]
+    fn decrypt_host_password_none_when_no_password() {
+        let host = Host {
+            id: "h1".into(), name: "n".into(), user: "u".into(), hostname: "h".into(),
+            port: 22, os: OsKind::Other, tags: vec![], last_used: None, group_id: None,
+            auth_method: None, password: None, ssh_key_id: None,
+            show_status_in_dashboard: None, working_directory: None,
+            default_sftp_path: None, updated_at: None,
+        };
+        assert_eq!(decrypt_host_password(&host), None);
     }
 }
