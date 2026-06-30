@@ -207,6 +207,35 @@ fn remove_host_group(app: tauri::AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn vault_status(app: tauri::AppHandle) -> Result<vault::VaultStatus, String> {
+    vault::op_status(&app)
+}
+
+#[tauri::command]
+fn vault_init(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
+    vault::op_init(&app, &master_password)
+}
+
+#[tauri::command]
+fn vault_unlock(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
+    vault::op_unlock(&app, &master_password)
+}
+
+#[tauri::command]
+fn vault_lock() {
+    vault::op_lock();
+}
+
+#[tauri::command]
+fn vault_change_master_password(
+    app: tauri::AppHandle,
+    old_password: String,
+    new_password: String,
+) -> Result<(), String> {
+    vault::op_change_master_password(&app, &old_password, &new_password)
+}
+
+#[tauri::command]
 async fn test_host_connection(
     app: tauri::AppHandle,
     request: TestHostConnectionRequest,
@@ -875,6 +904,11 @@ pub fn run() {
             remove_hosts,
             save_host_group,
             remove_host_group,
+            vault_status,
+            vault_init,
+            vault_unlock,
+            vault_lock,
+            vault_change_master_password,
             test_host_connection,
             list_port_forwards,
             save_port_forward,
@@ -1035,6 +1069,9 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // Try to unlock the vault silently using the keychain-cached master password,
+            // so a returning user on this device isn't prompted again.
+            let _ = vault::op_try_cached_unlock(&app.handle());
             Ok(())
         })
         .build(tauri::generate_context!())
