@@ -82,6 +82,9 @@ export function useDashboard(hostIds: string[]): {
     hostIdsRef.current = hostIds;
   }, [hostIds]);
 
+  // Stable key so the effect re-runs when host list changes (e.g. after async load)
+  const hostIdsKey = hostIds.join(",");
+
   useEffect(() => {
     if (hostIds.length === 0) return;
 
@@ -115,7 +118,7 @@ export function useDashboard(hostIds: string[]): {
       unlistenPromise.then((fn) => fn());
       invoke("dashboard_disconnect", { hostIds: hostIdsRef.current }).catch(console.error);
     };
-  }, []); // Mount once — hostIds read from ref
+  }, [hostIdsKey]); // Re-run when host list changes (hosts load async)
 
   return { stats, loading };
 }
