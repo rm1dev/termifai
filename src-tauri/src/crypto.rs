@@ -4,7 +4,7 @@ use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rand::RngCore;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const ARGON2_MEM_KIB: u32 = 19456;
 pub const ARGON2_ITERS: u32 = 2;
@@ -20,7 +20,7 @@ pub enum CryptoError {
 
 /// Derive the 32-byte Key Encryption Key (KEK) from the master password and
 /// the per-vault salt using Argon2id with fixed, cross-platform parameters.
-pub fn derive_kek(master_password: &str, salt: &[u8]) -> Result<[u8; 32], CryptoError> {
+pub fn derive_kek(master_password: &str, salt: &[u8]) -> Result<VaultKey, CryptoError> {
     let params = Params::new(ARGON2_MEM_KIB, ARGON2_ITERS, ARGON2_PARALLELISM, Some(32))
         .map_err(|_| CryptoError::Argon2)?;
     let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
@@ -28,7 +28,7 @@ pub fn derive_kek(master_password: &str, salt: &[u8]) -> Result<[u8; 32], Crypto
     argon
         .hash_password_into(master_password.as_bytes(), salt, &mut kek)
         .map_err(|_| CryptoError::Argon2)?;
-    Ok(kek)
+    Ok(VaultKey::from_bytes(kek))
 }
 
 /// The symmetric Data Encryption Key (DEK) that protects host passwords.
@@ -98,7 +98,7 @@ pub struct NewVault {
 fn seal(dek_bytes: [u8; 32], master_password: &str) -> Result<NewVault, CryptoError> {
     let mut salt = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut salt);
-    let kek = VaultKey::from_bytes(derive_kek(master_password, &salt)?);
+    let kek = derive_kek(master_password, &salt)?;
     let wrapped_key = encrypt_field(&kek, &B64.encode(dek_bytes))?;
     let verifier = encrypt_field(&kek, VERIFIER_PLAINTEXT)?;
     Ok(NewVault {
@@ -125,20 +125,20 @@ pub fn unlock_vault(
     verifier: &str,
 ) -> Result<VaultKey, CryptoError> {
     let salt = B64.decode(salt_b64).map_err(|_| CryptoError::BadToken)?;
-    let kek = VaultKey::from_bytes(derive_kek(master_password, &salt)?);
+    let kek = derive_kek(master_password, &salt)?;
     // Verifier must decrypt to the known constant, else the password is wrong.
     match decrypt_field(&kek, verifier) {
         Ok(text) if text == VERIFIER_PLAINTEXT => {}
         _ => return Err(CryptoError::WrongPassword),
     }
-    let dek_b64 = decrypt_field(&kek, wrapped_key).map_err(|_| CryptoError::WrongPassword)?;
-    let dek_bytes = B64.decode(&dek_b64).map_err(|_| CryptoError::BadToken)?;
+    let dek_b64: Zeroizing<String> = Zeroizing::new(decrypt_field(&kek, wrapped_key).map_err(|_| CryptoError::WrongPassword)?);
+    let dek_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(B64.decode(&*dek_b64).map_err(|_| CryptoError::BadToken)?);
     if dek_bytes.len() != 32 {
         return Err(CryptoError::BadToken);
     }
-    let mut arr = [0u8; 32];
+    let mut arr = Zeroizing::new([0u8; 32]);
     arr.copy_from_slice(&dek_bytes);
-    Ok(VaultKey::from_bytes(arr))
+    Ok(VaultKey::from_bytes(*arr))
 }
 
 /// Re-wrap the existing DEK under a new master password (fresh salt).
@@ -163,7 +163,7 @@ mod tests {
         let salt = [7u8; 32];
         let a = derive_kek("hunter2", &salt).unwrap();
         let b = derive_kek("hunter2", &salt).unwrap();
-        assert_eq!(a, b);
+        assert_eq!(a.as_bytes(), b.as_bytes());
     }
 
     #[test]
@@ -171,8 +171,8 @@ mod tests {
         let salt = [7u8; 32];
         let other_salt = [9u8; 32];
         let base = derive_kek("hunter2", &salt).unwrap();
-        assert_ne!(base, derive_kek("hunter3", &salt).unwrap());
-        assert_ne!(base, derive_kek("hunter2", &other_salt).unwrap());
+        assert_ne!(base.as_bytes(), derive_kek("hunter3", &salt).unwrap().as_bytes());
+        assert_ne!(base.as_bytes(), derive_kek("hunter2", &other_salt).unwrap().as_bytes());
     }
 
     #[test]
