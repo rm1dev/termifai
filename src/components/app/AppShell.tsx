@@ -135,6 +135,10 @@ import { SftpRenameDialog } from "./SftpRenameDialog";
 import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
 import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
+import { VaultSetupDialog } from "./VaultSetupDialog";
+import { VaultUnlockDialog } from "./VaultUnlockDialog";
+import { vaultStatus, getHostPassword } from "@/lib/api/vault";
+import type { VaultStatus } from "@/lib/api/vault";
 import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
@@ -153,6 +157,7 @@ export function AppShell() {
   ]);
   const [activeTab, setActiveTab] = useState("t-term");
   const [activeSidebar, setActiveSidebar] = useState<SidebarKey>("hosts");
+  const [vaultDialogState, setVaultDialogState] = useState<"none" | "setup" | "unlock">("none");
   const shortcutsRef = useRef<ShortcutMap>(loadShortcuts());
   const newTabRef = useRef<(kind: TabKind) => void>(null!);
 
@@ -184,6 +189,7 @@ export function AppShell() {
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
+    const resolvedPassword = await getHostPassword(host.id).catch(() => null);
     setTabs((currentTabs) => {
       const existingCount = currentTabs.filter((t) => t.hostId === host.id).length;
       const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
@@ -195,7 +201,7 @@ export function AppShell() {
           title,
           closable: true,
           initialCommand: command,
-          initialPassword: host.password,
+          initialPassword: resolvedPassword ?? undefined,
           readyMarker,
           connectionLabel: `${host.user}@${host.hostname}:${host.port}`,
           connectionTitle: host.name || host.hostname,
@@ -264,6 +270,18 @@ export function AppShell() {
       )
     );
   };
+
+  useEffect(() => {
+    vaultStatus()
+      .then((status: VaultStatus) => {
+        if (!status.initialized) {
+          setVaultDialogState("setup");
+        } else if (!status.unlocked) {
+          setVaultDialogState("unlock");
+        }
+      })
+      .catch(console.error);
+  }, []);
 
   useEffect(() => {
     newTabRef.current = newTab;
@@ -422,6 +440,16 @@ export function AppShell() {
           ) : null
         )}
       </div>
+
+      {/* Vault dialogs — shown on startup if vault needs setup or unlock */}
+      <VaultSetupDialog
+        open={vaultDialogState === "setup"}
+        onSuccess={() => setVaultDialogState("none")}
+      />
+      <VaultUnlockDialog
+        open={vaultDialogState === "unlock"}
+        onSuccess={() => setVaultDialogState("none")}
+      />
     </div>
   );
 }
