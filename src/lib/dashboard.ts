@@ -21,6 +21,12 @@ export interface SystemMetrics {
   swapUsedKb: number;
   diskTotalKb: number;
   diskUsedKb: number;
+  diskReadRate: number;       // bytes/sec
+  diskWriteRate: number;      // bytes/sec
+  diskIops: number;           // ops/sec
+  diskReadLatencyMs: number;  // avg ms per read op
+  diskWriteLatencyMs: number; // avg ms per write op
+  diskDev: string;
   load1m: number;
   load5m: number;
   load15m: number;

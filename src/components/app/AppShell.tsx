@@ -1888,7 +1888,9 @@ function HostDashboardView({
                 stroke={5}
               />
               <div className="flex-1 space-y-1.5">
-                <div className="font-mono text-[10px] text-muted-foreground">/dev/sda1 · ext4</div>
+                <div className="font-mono text-[10px] text-muted-foreground">
+                  {sys?.diskDev ? `/dev/${sys.diskDev}` : "—"}
+                </div>
                 <div className="flex items-baseline gap-1.5">
                   <span className="text-xl font-bold tabular-nums text-foreground">{diskPct.toFixed(0)}</span>
                   <span className="text-[10px] text-muted-foreground">%</span>
@@ -1905,17 +1907,29 @@ function HostDashboardView({
             <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 border-t border-border pt-2 text-[10px]">
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-orange)]/40 px-1 text-[9px] text-[var(--color-brand-orange)]">R</Badge>
-                <span className="font-mono font-bold tabular-nums text-foreground">—</span>
+                <span className="font-mono font-bold tabular-nums text-foreground">
+                  {sys && sys.diskReadRate > 0 ? fmtBytes(sys.diskReadRate) + "/s" : "—"}
+                </span>
               </div>
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-cyan)]/40 px-1 text-[9px] text-[var(--color-brand-cyan)]">W</Badge>
-                <span className="font-mono font-bold tabular-nums text-foreground">—</span>
+                <span className="font-mono font-bold tabular-nums text-foreground">
+                  {sys && sys.diskWriteRate > 0 ? fmtBytes(sys.diskWriteRate) + "/s" : "—"}
+                </span>
               </div>
               <div className="text-muted-foreground">
-                Latency <span className="font-mono font-bold text-foreground">—</span>
+                Latency{" "}
+                <span className="font-mono font-bold text-foreground">
+                  {sys && (sys.diskReadLatencyMs > 0 || sys.diskWriteLatencyMs > 0)
+                    ? `${((sys.diskReadLatencyMs + sys.diskWriteLatencyMs) / (sys.diskReadLatencyMs > 0 && sys.diskWriteLatencyMs > 0 ? 2 : 1)).toFixed(1)} ms`
+                    : "—"}
+                </span>
               </div>
               <div className="text-muted-foreground">
-                IOPS <span className="font-mono font-bold text-foreground">—</span>
+                IOPS{" "}
+                <span className="font-mono font-bold text-foreground">
+                  {sys && sys.diskIops > 0 ? Math.round(sys.diskIops).toLocaleString() : "—"}
+                </span>
               </div>
             </div>
           </section>

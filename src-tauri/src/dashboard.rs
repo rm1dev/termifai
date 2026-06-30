@@ -31,6 +31,12 @@ pub struct SystemMetrics {
     pub swap_used_kb: u64,
     pub disk_total_kb: u64,
     pub disk_used_kb: u64,
+    pub disk_read_rate: f64,    // bytes/sec
+    pub disk_write_rate: f64,   // bytes/sec
+    pub disk_iops: f64,         // ops/sec
+    pub disk_read_latency_ms: f32,  // avg ms per read op
+    pub disk_write_latency_ms: f32, // avg ms per write op
+    pub disk_dev: String,
     pub load_1m: f32,
     pub load_5m: f32,
     pub load_15m: f32,
@@ -79,6 +85,17 @@ pub struct HostPollResult {
 // ─── Internal delta state ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+pub(crate) struct DiskSnapshot {
+    pub dev: String,
+    pub reads_completed: u64,
+    pub sectors_read: u64,
+    pub ms_reading: u64,
+    pub writes_completed: u64,
+    pub sectors_written: u64,
+    pub ms_writing: u64,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CpuSnapshot {
     pub user: u64, pub nice: u64, pub system: u64, pub idle: u64,
     pub iowait: u64, pub irq: u64, pub softirq: u64,
@@ -94,17 +111,15 @@ impl CpuSnapshot {
 
 /// raw = output of: cat /proc/stat /proc/meminfo /proc/loadavg /proc/uptime /proc/net/dev
 /// prev_cpu: snapshot from previous poll for delta CPU
-/// prev_net: (rx_bytes, tx_bytes) from previous poll for rate
-/// poll_secs: interval between polls for rate calculation
-/// prev_cpu_cores: per-core snapshots from previous poll for per-core delta
-/// Returns (metrics, aggregate_snap, net, per_core_snaps)
+/// Returns (metrics, aggregate_snap, net, per_core_snaps, disk_snap)
 pub(crate) fn parse_proc_output(
     raw: &str,
     prev_cpu: Option<&CpuSnapshot>,
     prev_net: Option<(u64, u64)>,
     poll_secs: f64,
     prev_cpu_cores: &[CpuSnapshot],
-) -> (SystemMetrics, CpuSnapshot, (u64, u64), Vec<CpuSnapshot>) {
+    prev_disk: Option<&DiskSnapshot>,
+) -> (SystemMetrics, CpuSnapshot, (u64, u64), Vec<CpuSnapshot>, Option<DiskSnapshot>) {
     let mut cpu_snap = CpuSnapshot { user:0, nice:0, system:0, idle:0, iowait:0, irq:0, softirq:0 };
     let mut cpu_core_snaps: Vec<CpuSnapshot> = Vec::new();
     let mut mem: HashMap<&str, u64> = HashMap::new();
@@ -115,6 +130,8 @@ pub(crate) fn parse_proc_output(
     let mut disk_total_kb = 0u64; let mut disk_used_kb = 0u64;
     let mut cores = 0u32;
     let mut ip = String::new();
+    // Collect all real disk devices from /proc/diskstats; pick highest-traffic one
+    let mut disk_snaps: Vec<DiskSnapshot> = Vec::new();
 
     for line in raw.lines() {
         // /proc/stat — cpu aggregate line
@@ -186,6 +203,26 @@ pub(crate) fn parse_proc_output(
                 }
             }
         }
+        // /proc/diskstats — "  8   0 sda reads_completed reads_merged sectors_read ms_reading writes ..."
+        // Fields: major minor devname [14 numeric fields]
+        {
+            let f: Vec<&str> = trimmed.split_whitespace().collect();
+            if f.len() >= 14 && f[0].parse::<u32>().is_ok() && f[1].parse::<u32>().is_ok() {
+                let dev = f[2];
+                if is_whole_disk(dev) {
+                    let n = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                    disk_snaps.push(DiskSnapshot {
+                        dev: dev.to_string(),
+                        reads_completed:  n(3),
+                        sectors_read:     n(5),
+                        ms_reading:       n(6),
+                        writes_completed: n(7),
+                        sectors_written:  n(9),
+                        ms_writing:       n(10),
+                    });
+                }
+            }
+        }
     }
 
     // Aggregate CPU% delta
@@ -243,6 +280,35 @@ pub(crate) fn parse_proc_output(
     let mem_cached = *mem.get("Cached").unwrap_or(&0);
     let mem_used = mem_total.saturating_sub(mem_avail);
 
+    // Pick the disk with highest total I/O among whole-disk devices
+    let cur_disk = disk_snaps.into_iter()
+        .max_by_key(|d| d.reads_completed + d.writes_completed);
+
+    let (disk_read_rate, disk_write_rate, disk_iops, disk_read_latency_ms, disk_write_latency_ms, disk_dev, new_disk) =
+        match (&cur_disk, prev_disk) {
+            (Some(cur), Some(prev)) if cur.dev == prev.dev && poll_secs > 0.0 => {
+                let d_reads  = cur.reads_completed.saturating_sub(prev.reads_completed) as f64;
+                let d_writes = cur.writes_completed.saturating_sub(prev.writes_completed) as f64;
+                let d_sr     = cur.sectors_read.saturating_sub(prev.sectors_read) as f64;
+                let d_sw     = cur.sectors_written.saturating_sub(prev.sectors_written) as f64;
+                let d_ms_r   = cur.ms_reading.saturating_sub(prev.ms_reading) as f64;
+                let d_ms_w   = cur.ms_writing.saturating_sub(prev.ms_writing) as f64;
+                let read_lat  = if d_reads  > 0.0 { (d_ms_r / d_reads)  as f32 } else { 0.0 };
+                let write_lat = if d_writes > 0.0 { (d_ms_w / d_writes) as f32 } else { 0.0 };
+                (
+                    d_sr * 512.0 / poll_secs,   // bytes/sec
+                    d_sw * 512.0 / poll_secs,
+                    (d_reads + d_writes) / poll_secs,
+                    read_lat,
+                    write_lat,
+                    cur.dev.clone(),
+                    cur_disk,
+                )
+            }
+            (Some(cur), _) => (0.0, 0.0, 0.0, 0.0, 0.0, cur.dev.clone(), cur_disk),
+            _ => (0.0, 0.0, 0.0, 0.0, 0.0, String::new(), None),
+        };
+
     let metrics = SystemMetrics {
         cpu_pct,
         cpu_cores,
@@ -253,6 +319,9 @@ pub(crate) fn parse_proc_output(
         swap_used_kb: mem.get("SwapTotal").unwrap_or(&0)
             .saturating_sub(*mem.get("SwapFree").unwrap_or(&0)),
         disk_total_kb, disk_used_kb,
+        disk_read_rate, disk_write_rate, disk_iops,
+        disk_read_latency_ms, disk_write_latency_ms,
+        disk_dev,
         load_1m, load_5m, load_15m,
         uptime_secs,
         net_rx_rate: rx_rate,
@@ -262,7 +331,19 @@ pub(crate) fn parse_proc_output(
         ip,
     };
 
-    (metrics, cpu_snap, (net_rx, net_tx), cpu_core_snaps)
+    (metrics, cpu_snap, (net_rx, net_tx), cpu_core_snaps, new_disk)
+}
+
+fn is_whole_disk(dev: &str) -> bool {
+    if dev.starts_with("loop") || dev.starts_with("dm-") || dev.starts_with("ram") || dev.starts_with("sr") {
+        return false;
+    }
+    // nvme: nvme0n1 is whole disk, nvme0n1p1 is a partition
+    if dev.starts_with("nvme") {
+        return !dev.contains('p');
+    }
+    // sda, vda, xvda, hda — whole disk has no trailing digit
+    !dev.ends_with(|c: char| c.is_ascii_digit())
 }
 
 /// raw = output of docker ps --no-trunc --format '{"id":"{{.ID}}","name":"{{.Names}}","state":"{{.State}}"}'
@@ -430,6 +511,7 @@ struct ActorState {
     prev_cpu: Option<CpuSnapshot>,
     prev_cpu_cores: Vec<CpuSnapshot>,
     prev_net: Option<(u64, u64)>,
+    prev_disk: Option<DiskSnapshot>,
     prev_container_cpu: HashMap<String, u64>,  // container_id → cpu_ns
     prev_container_net: HashMap<String, (u64, u64)>,
     has_docker: Option<bool>,
@@ -480,6 +562,7 @@ fn run_actor(
         prev_cpu: None,
         prev_cpu_cores: vec![],
         prev_net: None,
+        prev_disk: None,
         prev_container_cpu: HashMap::new(),
         prev_container_net: HashMap::new(),
         has_docker: None,
@@ -541,14 +624,15 @@ fn do_poll(state: &mut ActorState, host_id: &str, want_detail: bool, poll_secs: 
     // System metrics — single channel, single cat
     let sys_raw = exec_cmd(
         &state.session,
-        "cat /proc/stat /proc/meminfo /proc/loadavg /proc/uptime /proc/net/dev",
+        "cat /proc/stat /proc/meminfo /proc/loadavg /proc/uptime /proc/net/dev /proc/diskstats",
     )?;
 
-    let (mut system, new_cpu, new_net, new_cpu_cores) =
-        parse_proc_output(&sys_raw, state.prev_cpu.as_ref(), state.prev_net, poll_secs, &state.prev_cpu_cores);
+    let (mut system, new_cpu, new_net, new_cpu_cores, new_disk) =
+        parse_proc_output(&sys_raw, state.prev_cpu.as_ref(), state.prev_net, poll_secs, &state.prev_cpu_cores, state.prev_disk.as_ref());
     state.prev_cpu = Some(new_cpu);
     state.prev_net = Some(new_net);
     state.prev_cpu_cores = new_cpu_cores;
+    if new_disk.is_some() { state.prev_disk = new_disk; }
 
     // Disk usage from df
     if let Ok(df_raw) = exec_cmd(&state.session, "df -k / 2>/dev/null | tail -1") {
@@ -828,7 +912,7 @@ Inter-|   Receive   |  Transmit
 
     #[test]
     fn test_parse_cpu_first_poll_returns_zero() {
-        let (metrics, snap, _, core_snaps) = parse_proc_output(SAMPLE_PROC, None, None, 30.0, &[]);
+        let (metrics, snap, _, core_snaps, _) = parse_proc_output(SAMPLE_PROC, None, None, 30.0, &[], None);
         assert_eq!(metrics.cpu_pct, 0.0, "first poll should be zero");
         assert!(metrics.cpu_cores.is_empty(), "first poll: no prev cores → empty cpu_cores");
         assert_eq!(snap.user, 100);
@@ -862,7 +946,7 @@ SwapFree: 0 kB
 lo: 0 0 0 0 0 0 0 0 0 0
 eth0: 5100000 0 0 0 0 0 0 0 2100000 0
 ";
-        let (metrics, _, _, _) = parse_proc_output(raw2, Some(&prev), Some((5000000, 2000000)), 30.0, &prev_cores);
+        let (metrics, _, _, _, _) = parse_proc_output(raw2, Some(&prev), Some((5000000, 2000000)), 30.0, &prev_cores, None);
         // delta: total=250 idle=200 → cpu=(250-200)/250*100 = 20%
         assert!((metrics.cpu_pct - 20.0).abs() < 1.0, "CPU should be ~20%, was: {}", metrics.cpu_pct);
         assert_eq!(metrics.cpu_cores.len(), 2, "should compute 2 per-core metrics");
