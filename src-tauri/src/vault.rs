@@ -3,7 +3,7 @@ use crate::hosts::{self, CryptoMeta};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 fn cell() -> &'static Mutex<Option<VaultKey>> {
     static VAULT: OnceLock<Mutex<Option<VaultKey>>> = OnceLock::new();
@@ -260,6 +260,8 @@ pub fn on_app_exit(app: &AppHandle) {
 pub fn on_screen_lock(app: &AppHandle) {
     if get_lock_policy(app) == LockPolicy::OnScreenLock {
         op_lock();
+        // Notify the frontend so it can re-gate the Hosts view immediately.
+        let _ = app.emit("vault-locked", ());
     }
 }
 

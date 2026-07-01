@@ -273,11 +273,29 @@ export function AppShell() {
   };
 
   useEffect(() => {
-    vaultStatus()
-      .then((status: VaultStatus) => {
-        setVaultInfo({ initialized: status.initialized, unlocked: status.unlocked });
-      })
-      .catch(console.error);
+    const refreshVault = () =>
+      vaultStatus()
+        .then((status: VaultStatus) => {
+          setVaultInfo({ initialized: status.initialized, unlocked: status.unlocked });
+        })
+        .catch(console.error);
+
+    void refreshVault();
+
+    // Backend locks the vault on screen lock (per policy); re-gate immediately.
+    const unlistenPromise = listen("vault-locked", () => {
+      setVaultInfo((prev) => ({ initialized: prev?.initialized ?? true, unlocked: false }));
+    });
+
+    // Fallback: re-check status whenever the window regains focus, so returning
+    // from a locked screen re-gates even if the event was missed.
+    const onFocus = () => void refreshVault();
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      void unlistenPromise.then((un) => un());
+      window.removeEventListener("focus", onFocus);
+    };
   }, []);
 
 
