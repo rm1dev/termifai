@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { vaultInit, vaultUnlock } from "@/lib/api/vault";
 import { LockKeyhole, ShieldCheck } from "lucide-react";
@@ -6,6 +6,8 @@ import { LockKeyhole, ShieldCheck } from "lucide-react";
 interface VaultGateProps {
   /** Whether a vault already exists (unlock) or must be created (setup). */
   initialized: boolean;
+  /** Whether the gate's tab is currently visible (drives autofocus). */
+  active: boolean;
   /** Called after a successful unlock or vault creation. */
   onUnlocked: () => void;
 }
@@ -15,11 +17,19 @@ interface VaultGateProps {
  * Unlike a modal, the protected content is never rendered behind it — a
  * wrong password simply keeps the gate in place with an inline error.
  */
-export function VaultGate({ initialized, onUnlocked }: VaultGateProps) {
+export function VaultGate({ initialized, active, onUnlocked }: VaultGateProps) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const passwordRef = useRef<HTMLInputElement>(null);
+
+  // The vaults tab stays mounted (display toggled), so the autoFocus attribute
+  // can't fire when the gate mounts while hidden. Focus explicitly whenever the
+  // tab becomes visible.
+  useEffect(() => {
+    if (active) passwordRef.current?.focus();
+  }, [active]);
 
   const submit = async () => {
     setError(null);
@@ -77,6 +87,7 @@ export function VaultGate({ initialized, onUnlocked }: VaultGateProps) {
         </p>
         <div className="space-y-3">
           <input
+            ref={passwordRef}
             type="password"
             autoFocus
             placeholder="Master password"

@@ -440,6 +440,7 @@ export function AppShell() {
               vaultInfo && !vaultInfo.unlocked ? (
                 <VaultGate
                   initialized={vaultInfo.initialized}
+                  active={t.id === activeTab}
                   onUnlocked={() => setVaultInfo({ initialized: true, unlocked: true })}
                 />
               ) : (
