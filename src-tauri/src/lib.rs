@@ -222,8 +222,9 @@ fn vault_unlock(app: tauri::AppHandle, master_password: String) -> Result<(), St
 }
 
 #[tauri::command]
-fn vault_lock() {
+fn vault_lock(app: tauri::AppHandle) {
     vault::op_lock();
+    let _ = app.emit("vault-locked", ());
 }
 
 #[tauri::command]
@@ -1123,10 +1124,15 @@ pub fn run() {
                 let settings = MenuItemBuilder::with_id("open-settings", "Settings...")
                     .accelerator("CmdOrCtrl+,")
                     .build(app)?;
+                let lock_vault = MenuItemBuilder::with_id("lock-vault", "Lock Vault")
+                    .accelerator("CmdOrCtrl+Shift+L")
+                    .build(app)?;
 
                 let file_menu = SubmenuBuilder::new(app, "File")
                     .item(&new_terminal)
                     .item(&settings)
+                    .separator()
+                    .item(&lock_vault)
                     .separator()
                     .item(&PredefinedMenuItem::close_window(app, None)?)
                     .separator()
@@ -1165,6 +1171,10 @@ pub fn run() {
                     }
                     "open-settings" => {
                         let _ = open_settings_window_inner(&handle);
+                    }
+                    "lock-vault" => {
+                        vault::op_lock();
+                        let _ = handle.emit("vault-locked", ());
                     }
                     _ => {}
                 });

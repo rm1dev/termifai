@@ -136,7 +136,7 @@ import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
 import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
 import { VaultGate } from "./VaultGate";
-import { vaultStatus, getHostPassword } from "@/lib/api/vault";
+import { vaultStatus, vaultLock, getHostPassword } from "@/lib/api/vault";
 import type { VaultStatus } from "@/lib/api/vault";
 import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
 
@@ -356,6 +356,9 @@ export function AppShell() {
         invoke("open_settings_window").catch((err) =>
           console.error("open_settings_window failed:", err)
         );
+      } else if (isShortcutMatch(event, shortcuts["lock-vault"])) {
+        event.preventDefault();
+        vaultLock().catch((err) => console.error("vault_lock failed:", err));
       }
     };
 
@@ -596,6 +599,11 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
         <DropdownMenuItem onSelect={() => void invoke("open_settings_window")}>
           Settings
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => void vaultLock()}>
+          Lock Vault
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+Shift+L</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => void win.setFullscreen(!isFullscreen)}>
