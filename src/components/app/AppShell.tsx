@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, forwardRef } from "react";
+import { useState, useRef, useEffect, useCallback, forwardRef, useTransition } from "react";
 import { flushSync } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   KeyRound,
   Clipboard,
+  File,
   FileUp,
   FileText,
   Eye,
@@ -47,13 +48,14 @@ import {
   ArrowDownToLine,
   ArrowUpFromLine,
   Container,
-  
+
   Gauge,
   GripVertical,
   Minus,
   Square,
   Menu,
   Maximize2,
+  MoreVertical,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -99,7 +101,7 @@ import {
   PolarAngleAxis,
 } from "recharts";
 import { OsBadge } from "./icons";
-import type { AppTab, Host, HostGroup, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind } from "./types";
+import type { AppTab, Host, HostGroup, LocalFileEntry, RemoteFileEntry, SidebarKey, Snippet, SnippetKind, SnippetVariable, SshKey, TabKind, TransferProgress } from "./types";
 import { XTerminal } from "./XTerminal";
 import {
   isShortcutMatch,
@@ -127,10 +129,19 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { toast } from "sonner";
-
+import * as AlertDialog from "@radix-ui/react-alert-dialog";
+import { SftpContextMenu } from "./SftpContextMenu";
+import { SftpRenameDialog } from "./SftpRenameDialog";
+import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
+import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
+import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
+import { VaultGate } from "./VaultGate";
+import { vaultStatus, vaultLock, getHostPassword } from "@/lib/api/vault";
+import type { VaultStatus } from "@/lib/api/vault";
+import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
-  // { key: "dashboard", label: "Dashboard", icon: LayoutDashboard }, // temporarily hidden
+  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { key: "hosts", label: "Hosts", icon: Server },
   { key: "port-forwarding", label: "Port Forwarding", icon: Network },
   { key: "snippets", label: "Snippets", icon: Braces },
@@ -145,6 +156,9 @@ export function AppShell() {
   ]);
   const [activeTab, setActiveTab] = useState("t-term");
   const [activeSidebar, setActiveSidebar] = useState<SidebarKey>("hosts");
+  // Cached vault status; the Hosts view is gated by VaultGate until the vault
+  // is unlocked, rather than prompting with a modal on app startup.
+  const [vaultInfo, setVaultInfo] = useState<{ initialized: boolean; unlocked: boolean } | null>(null);
   const shortcutsRef = useRef<ShortcutMap>(loadShortcuts());
   const newTabRef = useRef<(kind: TabKind) => void>(null!);
 
@@ -176,6 +190,7 @@ export function AppShell() {
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
+    const resolvedPassword = await getHostPassword(host.id).catch(() => null);
     setTabs((currentTabs) => {
       const existingCount = currentTabs.filter((t) => t.hostId === host.id).length;
       const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
@@ -187,11 +202,31 @@ export function AppShell() {
           title,
           closable: true,
           initialCommand: command,
-          initialPassword: host.password,
+          initialPassword: resolvedPassword ?? undefined,
           readyMarker,
           connectionLabel: `${host.user}@${host.hostname}:${host.port}`,
           connectionTitle: host.name || host.hostname,
           hostId: host.id,
+        },
+      ];
+    });
+    setActiveTab(id);
+  };
+
+  const openSftpSession = (host?: Host) => {
+    const id = host ? `t-sftp-${host.id}-${Date.now()}` : `t-sftp-${Date.now()}`;
+    const baseTitle = host ? (host.name || host.hostname) : "SFTP";
+    setTabs((currentTabs) => {
+      const existingCount = host ? currentTabs.filter((t) => t.sftpHostId === host.id).length : 0;
+      const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
+      return [
+        ...currentTabs,
+        {
+          id,
+          kind: "sftp" as const,
+          title,
+          closable: true,
+          sftpHostId: host?.id,
         },
       ];
     });
@@ -236,6 +271,33 @@ export function AppShell() {
       )
     );
   };
+
+  useEffect(() => {
+    const refreshVault = () =>
+      vaultStatus()
+        .then((status: VaultStatus) => {
+          setVaultInfo({ initialized: status.initialized, unlocked: status.unlocked });
+        })
+        .catch(console.error);
+
+    void refreshVault();
+
+    // Backend locks the vault on screen lock (per policy); re-gate immediately.
+    const unlistenPromise = listen("vault-locked", () => {
+      setVaultInfo((prev) => ({ initialized: prev?.initialized ?? true, unlocked: false }));
+    });
+
+    // Fallback: re-check status whenever the window regains focus, so returning
+    // from a locked screen re-gates even if the event was missed.
+    const onFocus = () => void refreshVault();
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      void unlistenPromise.then((un) => un());
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+
 
   useEffect(() => {
     newTabRef.current = newTab;
@@ -294,6 +356,9 @@ export function AppShell() {
         invoke("open_settings_window").catch((err) =>
           console.error("open_settings_window failed:", err)
         );
+      } else if (isShortcutMatch(event, shortcuts["lock-vault"])) {
+        event.preventDefault();
+        vaultLock().catch((err) => console.error("vault_lock failed:", err));
       }
     };
 
@@ -375,25 +440,34 @@ export function AppShell() {
               className="min-w-0 flex-1"
             >
             {t.kind === "vaults" && (
-              <>
-                <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
-                <main className="flex min-w-0 flex-1 flex-col">
-                  {activeSidebar === "dashboard" && <DashboardView />}
-                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={() => newTab("sftp")} onConnectHost={(host) => void openSshTerminal(host)} />}
-                  {activeSidebar === "port-forwarding" && <PortForwardingView />}
-                  {activeSidebar === "snippets" && <SnippetsView />}
-                  {activeSidebar === "ssh-keys" && <SshKeysView />}
-                  {activeSidebar === "logs" && (
-                    <EmptyState icon={ClipboardList} title="Connection logs" subtitle="Audit of recent sessions, transfers and tunnels." />
-                  )}
-                </main>
-              </>
+              vaultInfo && !vaultInfo.unlocked ? (
+                <VaultGate
+                  initialized={vaultInfo.initialized}
+                  active={t.id === activeTab}
+                  onUnlocked={() => setVaultInfo({ initialized: true, unlocked: true })}
+                />
+              ) : (
+                <>
+                  <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
+                  <main className="flex min-w-0 flex-1 flex-col">
+                    {activeSidebar === "dashboard" && <DashboardView />}
+                    {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
+                    {activeSidebar === "port-forwarding" && <PortForwardingView />}
+                    {activeSidebar === "snippets" && <SnippetsView />}
+                    {activeSidebar === "ssh-keys" && <SshKeysView />}
+                    {activeSidebar === "logs" && (
+                      <EmptyState icon={ClipboardList} title="Connection logs" subtitle="Audit of recent sessions, transfers and tunnels." />
+                    )}
+                  </main>
+                </>
+              )
             )}
-            {t.kind === "sftp" && <SftpView />}
+            {t.kind === "sftp" && <SftpView tab={t} />}
           </div>
           ) : null
         )}
       </div>
+
     </div>
   );
 }
@@ -525,6 +599,11 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
         <DropdownMenuItem onSelect={() => void invoke("open_settings_window")}>
           Settings
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => void vaultLock()}>
+          Lock Vault
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+Shift+L</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => void win.setFullscreen(!isFullscreen)}>
@@ -782,6 +861,18 @@ function CircularGauge({ value, label }: { value: number; label: string }) {
   );
 }
 
+function ringGaugeColor(pct: number): { from: string; to: string } {
+  // cyan(210°) → yellow(85°) → orange(42°) → red #ff5f57
+  const bands = [
+    { at: 45,  from: "oklch(0.78 0.14 210)", to: "oklch(0.58 0.14 210)" },
+    { at: 70,  from: "oklch(0.92 0.16 85)",  to: "oklch(0.72 0.16 85)"  },
+    { at: 85,  from: "oklch(0.64 0.18 42)",  to: "oklch(0.48 0.18 42)"  },
+    { at: 100, from: "#ff5f57",               to: "#c0120a"               },
+  ];
+  const band = bands.find((b) => pct <= b.at) ?? bands[bands.length - 1];
+  return { from: band.from, to: band.to };
+}
+
 function RingGauge({
   value,
   label,
@@ -794,8 +885,8 @@ function RingGauge({
   value: number;
   label: string;
   gradientId: string;
-  from: string;
-  to: string;
+  from?: string;
+  to?: string;
   size?: number;
   stroke?: number;
 }) {
@@ -803,6 +894,9 @@ function RingGauge({
   const c = 2 * Math.PI * r;
   const pct = Math.max(0, Math.min(100, value));
   const offset = c - (pct / 100) * c;
+  const colors = ringGaugeColor(pct);
+  const colorFrom = from ?? colors.from;
+  const colorTo = to ?? colors.to;
   return (
     <div className="flex flex-col items-center gap-1">
       <span className="text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
@@ -812,8 +906,8 @@ function RingGauge({
         <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="-rotate-90">
           <defs>
             <linearGradient id={gradientId} x1="0%" y1="0%" x2="100%" y2="100%">
-              <stop offset="0%" stopColor={from} />
-              <stop offset="100%" stopColor={to} />
+              <stop offset="0%" stopColor={colorFrom} />
+              <stop offset="100%" stopColor={colorTo} />
             </linearGradient>
           </defs>
           <circle
@@ -911,7 +1005,7 @@ const DASHBOARD_SERVERS: ServerStat[] = [
     netDown: "151", netDownUnit: "K/s", netUp: "11.1", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
   { id: "h2", name: "Ariyapanel Bot", status: "error", cores: 8, ram: "0 B", storage: "0 B", uptime: "0 Minutes", cpu: 0, ramUsed: 0, diskUsed: 0, os: "Debian 11", ip: "—", cpuSamples: [0, 0, 0, 0, 0, 0, 0, 0],
     netDown: "0", netDownUnit: "B/s", netUp: "0", netUpUnit: "B/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h3", name: "AriyaPanel Monitoring", status: "online", cores: 8, ram: "2.90 G", storage: "26.2 G", uptime: "134 Days", cpu: 68, ramUsed: 74, diskUsed: 60, os: "Debian 11", ip: "192.168.90.198/24", cpuSamples: [82, 47, 91, 55, 73, 38, 88, 70],
+  { id: "h3", name: "AriyaPanel Monitoring", status: "online", cores: 8, ram: "2.90 G", storage: "26.2 G", uptime: "134 Days", cpu: 68, ramUsed: 95, diskUsed: 60, os: "Debian 11", ip: "192.168.90.198/24", cpuSamples: [82, 47, 91, 55, 73, 38, 88, 70],
     netDown: "31.6", netDownUnit: "K/s", netUp: "9.99", netUpUnit: "K/s", diskRead: "1.30", diskReadUnit: "M/s", diskWrite: "0", diskWriteUnit: "B/s" },
   { id: "h4", name: "AriyaPanel DB", status: "online", cores: 8, ram: "19.6 G", storage: "299 G", uptime: "167 Days", cpu: 23, ramUsed: 82, diskUsed: 71, os: "Ubuntu 20.04", ip: "192.168.90.200/24", cpuSamples: [12, 34, 8, 41, 18, 27, 15, 29],
     netDown: "401", netDownUnit: "K/s", netUp: "165", netUpUnit: "K/s", diskRead: "188", diskReadUnit: "K/s", diskWrite: "380", diskWriteUnit: "K/s" },
@@ -923,16 +1017,38 @@ const DASHBOARD_SERVERS: ServerStat[] = [
 
 function DashboardView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const selected = DASHBOARD_SERVERS.find((s) => s.id === selectedId) ?? null;
+  const [hosts, setHosts] = useState<Host[]>([]);
+  // Cache the last full detail result (including processes) per host.
+  // Stored in a ref so re-entering a host shows data instantly without re-fetching.
+  const detailCacheRef = useRef<Record<string, HostPollResult>>({});
 
-  if (selected) {
-    return <HostDashboardView host={selected} onBack={() => setSelectedId(null)} />;
+  // Load hosts that have showStatusInDashboard enabled
+  useEffect(() => {
+    invoke<{ hosts: Host[] }>("list_hosts")
+      .then((v) => setHosts(v.hosts.filter((h) => h.showStatusInDashboard !== false)))
+      .catch(console.error);
+  }, []);
+
+  const hostIds = hosts.map((h) => h.id);
+  const { stats, loading } = useDashboard(hostIds);
+
+  if (selectedId) {
+    const selectedHost = hosts.find((h) => h.id === selectedId);
+    if (selectedHost) {
+      return (
+        <HostDashboardView
+          host={selectedHost}
+          initialStats={detailCacheRef.current[selectedId] ?? stats[selectedId] ?? null}
+          onDetailUpdate={(result) => { detailCacheRef.current[selectedId] = result; }}
+          onBack={() => setSelectedId(null)}
+        />
+      );
+    }
   }
 
-  const servers = DASHBOARD_SERVERS;
-  const total = servers.length;
-  const online = servers.filter((s) => s.status === "online").length;
-  const offline = servers.filter((s) => s.status === "error").length;
+  const total = hosts.length;
+  const online = hosts.filter((h) => stats[h.id]?.ok).length;
+  const offline = hosts.filter((h) => stats[h.id] && !stats[h.id].ok).length;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-y-auto p-5">
@@ -961,67 +1077,101 @@ function DashboardView() {
         </div>
       </div>
 
+      {hosts.length === 0 && (
+        <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+          No hosts configured for dashboard display.
+          <br />
+          Enable "Show in Dashboard" in host settings.
+        </div>
+      )}
+
       {/* Server cards */}
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
-        {servers.map((s) => (
-          <button
-            key={s.id}
-            type="button"
-            onClick={() => setSelectedId(s.id)}
-            className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
-          >
-            {/* Header */}
-            <div className="flex items-center justify-between">
-              <span className="text-sm font-semibold text-foreground">{s.name}</span>
-              <div className="flex items-center gap-1.5">
-                <span className={`h-2 w-2 rounded-full ${s.status === "online" ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
-                <span className="text-xs text-muted-foreground">{s.status === "online" ? "Online" : "Error"}</span>
-              </div>
-            </div>
+      <div className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(340px,1fr))]">
+        {hosts.map((host) => {
+          const poll = stats[host.id];
+          const isLoading = loading.has(host.id);
+          const sys = poll?.system;
 
-            {/* Specs */}
-            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-              <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {s.cores} Cores</span>
-              <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {s.ram}</span>
-              <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {s.storage}</span>
-              <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {s.uptime}</span>
-            </div>
-
-            {/* Gauges & Stats */}
-            <div className="mt-4 flex items-start gap-6">
-              <CircularGauge value={s.cpu} label="CPU" />
-              <CircularGauge value={s.ramUsed} label="RAM" />
-
-              <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Network</div>
-                <div className="flex items-center gap-3 text-[11px] text-foreground">
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground" />
-                    {s.netDown} {s.netDownUnit}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground opacity-50" />
-                    {s.netUp} {s.netUpUnit}
+          return (
+            <button
+              key={host.id}
+              type="button"
+              onClick={() => setSelectedId(host.id)}
+              className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
+            >
+              {/* Header */}
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold text-foreground">{host.name}</span>
+                <div className="flex items-center gap-1.5">
+                  {isLoading ? (
+                    <span className="h-2 w-2 rounded-full bg-muted-foreground/40 animate-pulse" />
+                  ) : (
+                    <span className={`h-2 w-2 rounded-full ${poll?.ok ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
+                  )}
+                  <span className="text-xs text-muted-foreground">
+                    {isLoading ? "Connecting…" : poll?.ok ? "Online" : poll?.error ? "Error" : "—"}
                   </span>
                 </div>
               </div>
 
-              <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Disk</div>
-                <div className="flex items-center gap-3 text-[11px] text-foreground">
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground" />
-                    {s.diskRead} {s.diskReadUnit}
-                  </span>
-                  <span className="flex items-center gap-1">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full border border-muted-foreground opacity-50" />
-                    {s.diskWrite} {s.diskWriteUnit}
-                  </span>
-                </div>
+              {/* Specs from real system data */}
+              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                {sys && (
+                  <>
+                    <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys.cores} Cores</span>
+                    <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes(sys.memTotalKb * 1024)}</span>
+                    <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes(sys.diskTotalKb * 1024)}</span>
+                    <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {fmtUptime(sys.uptimeSecs)}</span>
+                  </>
+                )}
+                {isLoading && !sys && (
+                  <span className="h-3 w-48 rounded animate-shimmer inline-block" />
+                )}
               </div>
-            </div>
-          </button>
-        ))}
+
+              {/* Gauges */}
+              {sys ? (
+                <div className="mt-4 flex items-start gap-4">
+                  <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
+                  <RingGauge
+                    value={sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
+                    label="RAM"
+                    gradientId={`g-dash-ram-${host.id}`}
+                    size={52}
+                  />
+                  <RingGauge
+                    value={sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
+                    label="Disk"
+                    gradientId={`g-dash-disk-${host.id}`}
+                    size={52}
+                  />
+                  <IoStat
+                    label="Network"
+                    rows={[
+                      { icon: ArrowDownToLine, value: fmtBytes(sys.netRxRate), unit: "/s" },
+                      { icon: ArrowUpFromLine, value: fmtBytes(sys.netTxRate), unit: "/s" },
+                    ]}
+                  />
+                </div>
+              ) : (
+                <div className="mt-4 flex items-start gap-4">
+                  {/* Gauge placeholders */}
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+                  {/* Network placeholder */}
+                  <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
+                    <div className="h-2.5 w-14 rounded animate-shimmer" />
+                    <div className="flex flex-col gap-1">
+                      <div className="h-2.5 w-16 rounded animate-shimmer" />
+                      <div className="h-2.5 w-16 rounded animate-shimmer" />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -1087,19 +1237,25 @@ const CPU_CATEGORIES: { key: CpuCategory; label: string; color: string }[] = [
   { key: "steal", label: "Steal", color: "var(--color-brand-orange)" },
 ];
 
-function buildCpuData(samples: number[], cores: number) {
-  const list = Array.from({ length: cores }, (_, i) => samples[i] ?? samples[i % Math.max(samples.length, 1)] ?? 0);
-  const threads: CpuThread[] = list.map((p, i) => {
-    const total = Math.max(0, Math.min(100, p));
-    // deterministic split — mostly user, a touch of system, sparse spikes
-    const system = total > 0 ? Math.min(total, Math.round(total * 0.05) + ((i * 7) % 11 === 0 ? 3 : 0)) : 0;
-    const iowait = total > 25 && (i * 5) % 17 === 0 ? 1 : 0;
-    const steal = 0;
-    const nice = 0;
-    const user = Math.max(0, total - system - iowait - steal - nice);
-    return { user, system, nice, iowait, steal };
-  });
-  const sum = (k: CpuCategory) => threads.reduce((a, t) => a + t[k], 0) / threads.length;
+function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetrics[]) {
+  // Use real per-core breakdown when available (second poll onwards)
+  const threads: CpuThread[] = (coreMetrics && coreMetrics.length > 0)
+    ? coreMetrics.map((c) => ({
+        user:   Math.max(0, c.user),
+        system: Math.max(0, c.system),
+        nice:   Math.max(0, c.nice),
+        iowait: Math.max(0, c.iowait),
+        steal:  Math.max(0, c.steal),
+      }))
+    : Array.from({ length: cores }, (_, i) => {
+        // Fallback: first poll has no per-core data yet — show aggregate evenly
+        const total = Math.max(0, Math.min(100, samples[0] ?? 0));
+        const system = total > 0 ? Math.min(total, Math.round(total * 0.05)) : 0;
+        const iowait = 0;
+        const user = Math.max(0, total - system);
+        return { user, system, nice: 0, iowait, steal: 0 };
+      });
+  const sum = (k: CpuCategory) => threads.reduce((a, t) => a + t[k], 0) / Math.max(threads.length, 1);
   const breakdown: Record<CpuCategory, number> = {
     user: sum("user"),
     system: sum("system"),
@@ -1113,7 +1269,8 @@ function buildCpuData(samples: number[], cores: number) {
 
 function useColumnCount(blockWidth = 8, gap = 2) {
   const ref = useRef<HTMLDivElement>(null);
-  const [cols, setCols] = useState(60);
+  const [cols, setCols] = useState(0);
+
   useEffect(() => {
     if (!ref.current) return;
     const ro = new ResizeObserver(([entry]) => {
@@ -1124,14 +1281,13 @@ function useColumnCount(blockWidth = 8, gap = 2) {
     ro.observe(ref.current);
     return () => ro.disconnect();
   }, [blockWidth, gap]);
+
   return { ref, cols };
 }
 
-function CpuThreadRow({ thread }: { thread: CpuThread }) {
-  const { ref, cols } = useColumnCount(6, 1);
+function CpuThreadRow({ thread, cols }: { thread: CpuThread; cols: number }) {
   const total = thread.user + thread.system + thread.nice + thread.iowait + thread.steal;
   const filled = Math.round((total / 100) * cols);
-  // allocate per-category counts using largest-remainder so ordering stays User→System→Nice→IOWait→Steal
   const raw = CPU_CATEGORIES.map((c) => ({ key: c.key, color: c.color, exact: (thread[c.key] / 100) * cols }));
   const counts = raw.map((r) => ({ ...r, n: Math.floor(r.exact), rem: r.exact - Math.floor(r.exact) }));
   let assigned = counts.reduce((a, c) => a + c.n, 0);
@@ -1150,7 +1306,7 @@ function CpuThreadRow({ thread }: { thread: CpuThread }) {
 
   return (
     <div className="flex items-center gap-2">
-      <div ref={ref} className="flex flex-1 gap-[1px] overflow-hidden">
+      <div className="flex flex-1 gap-[1px] overflow-hidden">
         {Array.from({ length: cols }).map((_, i) => (
           <span
             key={i}
@@ -1169,16 +1325,17 @@ function CpuThreadRow({ thread }: { thread: CpuThread }) {
   );
 }
 
-function CpuUsageChart({ samples, cores, model }: { samples: number[]; cores: number; model: string }) {
+function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number[]; cores: number; model: string; coreMetrics?: CoreMetrics[] }) {
   const [open, setOpen] = useState(false);
-  const data = buildCpuData(samples, cores);
+  const [isPending, startTransition] = useTransition();
+  const data = buildCpuData(samples, cores, coreMetrics);
   const { ref, cols } = useColumnCount(6, 1);
 
   return (
     <section className="overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-4">
       <button
         type="button"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => startTransition(() => setOpen((v) => !v))}
         className="flex w-full items-center gap-3 text-left"
         aria-expanded={open}
       >
@@ -1229,10 +1386,23 @@ function CpuUsageChart({ samples, cores, model }: { samples: number[]; cores: nu
       </div>
 
       {open && (
-        <div className="mt-3 space-y-1 border-t border-border pt-3">
-          {data.threads.map((t, i) => (
-            <CpuThreadRow key={i} thread={t} />
-          ))}
+        <div className="mt-3 border-t border-border pt-3">
+          {isPending ? (
+            <div className="space-y-1.5">
+              {Array.from({ length: cores }).map((_, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <div className="h-[10px] flex-1 rounded-[1px] animate-shimmer" />
+                  <span className="w-9" />
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="space-y-1">
+              {data.threads.map((t, i) => (
+                <CpuThreadRow key={i} thread={t} cols={Math.max(10, cols - Math.round(44 / 7))} />
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -1362,38 +1532,60 @@ function SectionLabel({
   );
 }
 
-function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => void }) {
-  const processes = [
-    { pid: 516654, name: "java", user: "elastic", cpu: 327.0, mem: "498 M" },
-    { pid: 1747, name: "node", user: "elastic", cpu: 4.0, mem: "348 M" },
-    { pid: 760, name: "dockerd", user: "root", cpu: 1.2, mem: "83.2 M" },
-    { pid: 77, name: "kcompactd0", user: "root", cpu: 0.9, mem: "0 B" },
-    { pid: 364, name: "jbd2/sda1-8", user: "root", cpu: 0.9, mem: "0 B" },
-    { pid: 664, name: "containerd", user: "root", cpu: 0.8, mem: "32.9 M" },
-    { pid: 3151640, name: "sshd", user: "root", cpu: 0.3, mem: "8.43 M" },
-    { pid: 12, name: "rcu_sched", user: "root", cpu: 0.2, mem: "0 B" },
-    { pid: 1, name: "systemd", user: "root", cpu: 0.1, mem: "5.70 M" },
-    { pid: 592, name: "vmtoolsd", user: "root", cpu: 0.1, mem: "5.02 M" },
-    { pid: 1722, name: "java", user: "elastic", cpu: 0.1, mem: "16.1 M" },
-    { pid: 473386, name: "kworker/1:2-eve", user: "root", cpu: 0.1, mem: "0 B" },
-    { pid: 516634, name: "containerd-shim", user: "root", cpu: 0.1, mem: "9.23 M" },
-  ];
+function HostDashboardView({
+  host,
+  initialStats,
+  onDetailUpdate,
+  onBack,
+}: {
+  host: Host;
+  initialStats: HostPollResult | null;
+  onDetailUpdate?: (result: HostPollResult) => void;
+  onBack: () => void;
+}) {
+  const { detail } = useHostDetail(host.id);
+  const poll = detail ?? initialStats;
+  const sys = poll?.system ?? null;
+  const pollProcesses = poll?.processes ?? null;
+  const pollContainers = poll?.containers ?? null; // null = docker not installed
 
-  const containers = [
-    { name: "docker-elk-kibana-1", status: "up", uptime: "7 months", cpu: 0, ram: 2, netRx: "228", netRxUnit: "G", netTx: "408", netTxUnit: "G", ioRead: "885", ioReadUnit: "M", ioWrite: "79.5", ioWriteUnit: "M" },
-    { name: "docker-elk-logstash-1", status: "up", uptime: "1 second", cpu: 20, ram: 0, netRx: "12.4", netRxUnit: "M", netTx: "3.10", netTxUnit: "M", ioRead: "104", ioReadUnit: "M", ioWrite: "8.20", ioWriteUnit: "M" },
-    { name: "docker-elk-elasticsearch-1", status: "up", uptime: "7 months", cpu: 14, ram: 65, netRx: "1.20", netRxUnit: "T", netTx: "980", netTxUnit: "G", ioRead: "2.40", ioReadUnit: "G", ioWrite: "1.10", ioWriteUnit: "G" },
-    { name: "docker-elk-setup-1", status: "exited", uptime: "7 months ago", cpu: 0, ram: 0, netRx: "0", netRxUnit: "B", netTx: "0", netTxUnit: "B", ioRead: "0", ioReadUnit: "B", ioWrite: "0", ioWriteUnit: "B" },
-  ];
+  // Persist detail (with processes) to parent cache so re-entry is instant
+  useEffect(() => {
+    if (detail?.ok && detail.processes !== null) {
+      onDetailUpdate?.(detail);
+    }
+  }, [detail]);
 
-  const memUsed = 9.99;
-  const memCached = 4.87;
-  const memTotal = 15.6;
-  const memFree = Math.max(memTotal - memUsed - memCached, 0);
+  const [procSearch, setProcSearch] = useState("");
+
+  // Accumulate load average history for the chart (max 32 points)
+  const loadHistoryRef = useRef<{ t: number; m1: number; m5: number; m15: number }[]>([]);
+  const [loadHistory, setLoadHistory] = useState<{ t: number; m1: number; m5: number; m15: number }[]>([]);
+  useEffect(() => {
+    if (!sys) return;
+    const entry = { t: loadHistoryRef.current.length, m1: sys.load1m, m5: sys.load5m, m15: sys.load15m };
+    const next = [...loadHistoryRef.current.slice(-31), entry];
+    loadHistoryRef.current = next;
+    setLoadHistory(next);
+  }, [sys?.load1m, sys?.load5m, sys?.load15m]);
+
+  // Memory calculations (in GB)
+  const memTotalGb = sys ? sys.memTotalKb / 1_048_576 : 0;
+  const memUsedGb = sys ? sys.memUsedKb / 1_048_576 : 0;
+  const memCachedGb = sys ? sys.memCachedKb / 1_048_576 : 0;
+  const memFree = Math.max(memTotalGb - memUsedGb - memCachedGb, 0);
+  const memUsedPct = memTotalGb > 0 ? (memUsedGb / memTotalGb) * 100 : 0;
+  const swapUsedGb = sys ? sys.swapUsedKb / 1_048_576 : 0;
+  const swapTotalGb = sys ? sys.swapTotalKb / 1_048_576 : 0;
+  const swapPct = swapTotalGb > 0 ? (swapUsedGb / swapTotalGb) * 100 : 0;
+  const diskPct = sys && sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0;
+  const diskTotalGb = sys ? sys.diskTotalKb / 1_048_576 : 0;
+  const diskUsedGb = sys ? sys.diskUsedKb / 1_048_576 : 0;
+
   const memData = [
-    { name: "Used", value: memUsed, fill: "oklch(0.7 0.28 320)" },
-    { name: "Cached", value: memCached, fill: "oklch(0.55 0.18 320)" },
-    { name: "Free", value: memFree, fill: "var(--color-border)" },
+    { name: "Used", value: memUsedGb || 0.001, fill: "oklch(0.7 0.28 320)" },
+    { name: "Cached", value: memCachedGb || 0.001, fill: "oklch(0.55 0.18 320)" },
+    { name: "Free", value: memFree || 0.001, fill: "var(--color-border)" },
   ];
 
   return (
@@ -1449,41 +1641,44 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-                  <span className="font-mono tabular-nums text-foreground/80">{host.ip}</span>
+                  <span className="font-mono tabular-nums text-foreground/80">{sys?.ip ?? "—"}</span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">Uptime</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">14d 2h 12m</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys ? fmtUptime(sys.uptimeSecs) : "—"}</span>
                   </span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">Cores</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">{host.cores}</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys?.cores ?? "—"}</span>
                   </span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span>
                     <span className="text-muted-foreground/70">RAM</span>{" "}
-                    <span className="font-mono tabular-nums text-foreground/80">{memTotal} GB</span>
+                    <span className="font-mono tabular-nums text-foreground/80">{sys ? `${memTotalGb.toFixed(1)} GB` : "—"}</span>
                   </span>
                 </div>
               </div>
             </div>
 
-            <div className="flex items-center gap-5 rounded-xl border border-border bg-background/60 px-4 py-2.5">
-              <MiniGauge value={host.cpu} label="CPU" color="var(--color-brand-cyan)" />
-              <span className="h-9 w-px bg-border" />
-              <MiniGauge value={host.ramUsed} label="RAM" color="oklch(0.7 0.28 320)" />
-              <span className="h-9 w-px bg-border" />
-              <MiniGauge value={host.diskUsed} label="Disk" color="var(--color-brand-yellow)" />
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-5 rounded-xl border border-border bg-background/60 px-4 py-2.5">
+                <MiniGauge value={sys?.cpuPct ?? 0} label="CPU" color="var(--color-brand-cyan)" />
+                <span className="h-9 w-px bg-border" />
+                <MiniGauge value={memUsedPct} label="RAM" color="oklch(0.7 0.28 320)" />
+                <span className="h-9 w-px bg-border" />
+                <MiniGauge value={diskPct} label="Disk" color="var(--color-brand-yellow)" />
+              </div>
             </div>
           </div>
         </header>
 
         {/* ─── CPU USAGE ──────────────────────────────────────────── */}
         <CpuUsageChart
-          samples={host.cpuSamples ?? [host.cpu]}
-          cores={host.cores}
-          model="Intel(R) Xeon(R) CPU E5-2650 v3 @ 2.30GHz"
+          samples={sys ? [sys.cpuPct] : [0]}
+          cores={sys?.cores ?? 1}
+          model={sys ? `Load: ${sys.load1m.toFixed(2)} / ${sys.load5m.toFixed(2)} / ${sys.load15m.toFixed(2)}` : "—"}
+          coreMetrics={sys?.cpuCores}
         />
 
         {/* ─── CPU LOAD CHART + PROCESSES ─────────────────────────── */}
@@ -1498,24 +1693,24 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-red)]" />
                     <span className="text-muted-foreground">1m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.50</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load1m?.toFixed(2) ?? "—"}</span>
                   </span>
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-cyan)]" />
                     <span className="text-muted-foreground">5m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.71</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load5m?.toFixed(2) ?? "—"}</span>
                   </span>
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-yellow)]" />
                     <span className="text-muted-foreground">15m</span>
-                    <span className="font-mono font-bold tabular-nums text-foreground">5.58</span>
+                    <span className="font-mono font-bold tabular-nums text-foreground">{sys?.load15m?.toFixed(2) ?? "—"}</span>
                   </span>
                 </div>
               }
             />
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={loadSeries} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+                <AreaChart data={loadHistory.length > 0 ? loadHistory : loadSeries} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
                   <defs>
                     <linearGradient id="g1m" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="var(--color-brand-red)" stopOpacity={0.45} />
@@ -1566,9 +1761,16 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                 icon={List}
                 title="Top Processes"
                 action={
-                  <button className="text-[11px] font-medium text-[var(--color-brand-cyan)] hover:underline">
-                    View all
-                  </button>
+                  <div className="relative">
+                    <Search className="absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
+                    <input
+                      type="text"
+                      value={procSearch}
+                      onChange={(e) => setProcSearch(e.target.value)}
+                      placeholder="filter…"
+                      className="h-6 w-28 rounded-md border border-border bg-transparent pl-6 pr-2 text-[10px] text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-border"
+                    />
+                  </div>
                 }
               />
             </div>
@@ -1577,38 +1779,64 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                 <TableHeader className="sticky top-0 z-10 bg-[var(--color-surface)] backdrop-blur">
                   <TableRow className="border-border hover:bg-transparent">
                     <TableHead className="h-6 px-3 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Process</TableHead>
-                    <TableHead className="h-6 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">User</TableHead>
-                    <TableHead className="h-6 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">CPU%</TableHead>
-                    <TableHead className="h-6 px-3 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Mem</TableHead>
+                    <TableHead className="h-6 w-16 text-[9px] font-bold uppercase tracking-wider text-muted-foreground">User</TableHead>
+                    <TableHead className="h-6 w-12 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">CPU%</TableHead>
+                    <TableHead className="h-6 w-20 px-3 text-right text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Mem</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {processes.map((p) => {
-                    const isHot = p.cpu >= 100;
-                    const isWarm = p.cpu >= 4 && p.cpu < 100;
-                    return (
-                      <TableRow key={p.pid} className="border-border/60 text-[10.5px]">
-                        <TableCell className="px-3 py-1">
-                          <div className="font-medium leading-tight text-foreground">{p.name}</div>
-                          <div className="font-mono text-[9px] leading-tight text-muted-foreground/60">{p.pid}</div>
-                        </TableCell>
-                        <TableCell className="py-1 font-mono text-muted-foreground">{p.user}</TableCell>
-                        <TableCell
-                          className="py-1 text-right font-mono font-bold tabular-nums"
-                          style={{
-                            color: isHot
-                              ? "var(--color-brand-red)"
-                              : isWarm
-                                ? "var(--color-brand-yellow)"
-                                : "var(--color-brand-cyan)",
-                          }}
-                        >
-                          {p.cpu.toFixed(1)}
-                        </TableCell>
-                        <TableCell className="px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{p.mem}</TableCell>
-                      </TableRow>
-                    );
-                  })}
+                  {pollProcesses === null && (
+                    <TableRow>
+                      <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">Loading processes…</TableCell>
+                    </TableRow>
+                  )}
+                  {(() => {
+                    if (pollProcesses === null) return null;
+                    const q = procSearch.trim().toLowerCase();
+                    const filtered = q
+                      ? pollProcesses.filter(
+                          (p) =>
+                            p.name.toLowerCase().includes(q) ||
+                            p.user.toLowerCase().includes(q) ||
+                            String(p.pid).includes(q),
+                        )
+                      : pollProcesses;
+                    if (filtered.length === 0) {
+                      return (
+                        <TableRow>
+                          <TableCell colSpan={4} className="text-center text-xs text-muted-foreground py-4">
+                            {q ? "No matching processes" : "No processes found"}
+                          </TableCell>
+                        </TableRow>
+                      );
+                    }
+                    return filtered.map((p) => {
+                      const isHot = p.cpuPct >= 100;
+                      const isWarm = p.cpuPct >= 4 && p.cpuPct < 100;
+                      return (
+                        <TableRow key={p.pid} className="border-border/60 text-[10.5px]">
+                          <TableCell className="px-3 py-1">
+                            <div className="font-medium leading-tight text-foreground">{p.name}</div>
+                            <div className="font-mono text-[9px] leading-tight text-muted-foreground/60">{p.pid}</div>
+                          </TableCell>
+                          <TableCell className="w-16 max-w-[4rem] truncate py-1 font-mono text-muted-foreground">{p.user}</TableCell>
+                          <TableCell
+                            className="w-12 py-1 text-right font-mono font-bold tabular-nums"
+                            style={{
+                              color: isHot
+                                ? "var(--color-brand-red)"
+                                : isWarm
+                                  ? "var(--color-brand-yellow)"
+                                  : "var(--color-brand-cyan)",
+                            }}
+                          >
+                            {p.cpuPct.toFixed(1)}
+                          </TableCell>
+                          <TableCell className="w-20 px-3 py-1 text-right font-mono tabular-nums text-foreground/80">{fmtBytes(p.memKb * 1024)}</TableCell>
+                        </TableRow>
+                      );
+                    });
+                  })()}
                 </TableBody>
               </Table>
             </ScrollArea>
@@ -1632,13 +1860,13 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                 </ResponsiveContainer>
                 <div className="absolute inset-0 flex flex-col items-center justify-center">
                   <span className="text-[9px] font-bold uppercase tracking-wider text-muted-foreground">Used</span>
-                  <span className="text-lg font-bold tabular-nums text-foreground">64%</span>
+                  <span className="text-lg font-bold tabular-nums text-foreground">{Math.round(memUsedPct)}%</span>
                 </div>
               </div>
               <div className="flex-1 space-y-2.5 text-[11px]">
                 {[
-                  { c: "oklch(0.7 0.28 320)", v: `${memUsed} G`, l: "Used" },
-                  { c: "oklch(0.55 0.18 320)", v: `${memCached} G`, l: "Cached" },
+                  { c: "oklch(0.7 0.28 320)", v: `${memUsedGb.toFixed(2)} G`, l: "Used" },
+                  { c: "oklch(0.55 0.18 320)", v: `${memCachedGb.toFixed(2)} G`, l: "Cached" },
                   { c: "var(--color-border)", v: `${memFree.toFixed(2)} G`, l: "Free" },
                 ].map((row) => (
                   <div key={row.l} className="flex items-center justify-between gap-2">
@@ -1654,9 +1882,9 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             <div className="mt-4 border-t border-border pt-3">
               <div className="mb-1.5 flex justify-between text-[11px]">
                 <span className="font-medium text-foreground">Swap</span>
-                <span className="font-mono tabular-nums text-muted-foreground">949 M / 975 M</span>
+                <span className="font-mono tabular-nums text-muted-foreground">{(swapUsedGb * 1024).toFixed(0)} M / {(swapTotalGb * 1024).toFixed(0)} M</span>
               </div>
-              <Progress value={97} className="h-1.5 [&>div]:bg-[oklch(0.7_0.28_320)]" />
+              <Progress value={swapPct} className="h-1.5 [&>div]:bg-[oklch(0.7_0.28_320)]" />
             </div>
           </section>
 
@@ -1666,7 +1894,7 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
               color="var(--color-brand-orange)"
               icon={Network}
               title="Network I/O"
-              action={<span className="font-mono text-[10px] text-muted-foreground">ens192</span>}
+              action={<span className="font-mono text-[10px] text-muted-foreground">{sys?.netIface ?? "—"}</span>}
             />
             <div className="space-y-4">
               <div>
@@ -1678,13 +1906,12 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                     <span className="font-medium text-foreground">Inbound</span>
                   </span>
                   <span className="font-mono text-[12px] font-bold tabular-nums text-[var(--color-brand-green)]">
-                    570 K/s
+                    {fmtBytes(sys?.netRxRate ?? 0)}/s
                   </span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-border/60">
                   <div className="h-full rounded-full bg-[var(--color-brand-green)]" style={{ width: "40%" }} />
                 </div>
-                <div className="mt-1 text-right font-mono text-[10px] text-muted-foreground">Total ↓ 1.32 T</div>
               </div>
               <div>
                 <div className="mb-1.5 flex items-center justify-between">
@@ -1695,18 +1922,17 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
                     <span className="font-medium text-foreground">Outbound</span>
                   </span>
                   <span className="font-mono text-[12px] font-bold tabular-nums text-[var(--color-brand-orange)]">
-                    122 K/s
+                    {fmtBytes(sys?.netTxRate ?? 0)}/s
                   </span>
                 </div>
                 <div className="h-1.5 overflow-hidden rounded-full bg-border/60">
                   <div className="h-full rounded-full bg-[var(--color-brand-orange)]" style={{ width: "12%" }} />
                 </div>
-                <div className="mt-1 text-right font-mono text-[10px] text-muted-foreground">Total ↑ 644 G</div>
               </div>
             </div>
             <div className="mt-4 flex items-center justify-between border-t border-border pt-3 text-[11px]">
               <span className="text-muted-foreground">IP Address</span>
-              <span className="font-mono font-bold tabular-nums text-foreground">{host.ip}</span>
+              <span className="font-mono font-bold tabular-nums text-foreground">{sys?.ip ?? "—"}</span>
             </div>
           </section>
 
@@ -1719,25 +1945,25 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             />
             <div className="mt-2 flex items-center gap-3">
               <RingGauge
-                value={host.diskUsed}
+                value={diskPct}
                 label="DISK"
                 gradientId="g-disk"
-                from="oklch(0.78 0.16 150)"
-                to="oklch(0.62 0.18 145)"
                 size={52}
                 stroke={5}
               />
               <div className="flex-1 space-y-1.5">
-                <div className="font-mono text-[10px] text-muted-foreground">/dev/sda1 · ext4</div>
+                <div className="font-mono text-[10px] text-muted-foreground">
+                  {sys?.diskDev ? `/dev/${sys.diskDev}` : "—"}
+                </div>
                 <div className="flex items-baseline gap-1.5">
-                  <span className="text-xl font-bold tabular-nums text-foreground">{host.diskUsed}</span>
+                  <span className="text-xl font-bold tabular-nums text-foreground">{diskPct.toFixed(0)}</span>
                   <span className="text-[10px] text-muted-foreground">%</span>
                   <span className="ml-auto font-mono text-[10px] tabular-nums text-muted-foreground">
-                    79.5 G / 92.0 G
+                    {diskUsedGb.toFixed(1)} G / {diskTotalGb.toFixed(1)} G
                   </span>
                 </div>
                 <Progress
-                  value={host.diskUsed}
+                  value={diskPct}
                   className="h-1 [&>div]:bg-[var(--color-brand-green)]"
                 />
               </div>
@@ -1745,109 +1971,114 @@ function HostDashboardView({ host, onBack }: { host: ServerStat; onBack: () => v
             <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5 border-t border-border pt-2 text-[10px]">
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-orange)]/40 px-1 text-[9px] text-[var(--color-brand-orange)]">R</Badge>
-                <span className="font-mono font-bold tabular-nums text-foreground">40.0 K/s</span>
+                <span className="font-mono font-bold tabular-nums text-foreground">
+                  {sys?.diskDev ? fmtBytes(sys.diskReadRate) + "/s" : "—"}
+                </span>
               </div>
               <div className="flex items-center gap-1">
                 <Badge variant="outline" className="h-3.5 border-[var(--color-brand-cyan)]/40 px-1 text-[9px] text-[var(--color-brand-cyan)]">W</Badge>
-                <span className="font-mono font-bold tabular-nums text-foreground">1.64 M/s</span>
+                <span className="font-mono font-bold tabular-nums text-foreground">
+                  {sys?.diskDev ? fmtBytes(sys.diskWriteRate) + "/s" : "—"}
+                </span>
               </div>
               <div className="text-muted-foreground">
-                Latency <span className="font-mono font-bold text-foreground">0.25 ms</span>
+                Latency{" "}
+                <span className="font-mono font-bold text-foreground">
+                  {sys?.diskDev
+                    ? (() => {
+                        const r = sys.diskReadLatencyMs;
+                        const w = sys.diskWriteLatencyMs;
+                        const avg = r > 0 && w > 0 ? (r + w) / 2 : r > 0 ? r : w;
+                        return avg > 0 ? `${avg.toFixed(1)} ms` : "0 ms";
+                      })()
+                    : "—"}
+                </span>
               </div>
               <div className="text-muted-foreground">
-                IOPS <span className="font-mono font-bold text-foreground">178</span>
+                IOPS{" "}
+                <span className="font-mono font-bold text-foreground">
+                  {sys?.diskDev ? Math.round(sys.diskIops).toLocaleString() : "—"}
+                </span>
               </div>
             </div>
           </section>
         </div>
 
         {/* ─── DOCKER CONTAINERS ──────────────────────────────────── */}
-        <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
-          <SectionLabel
-            color="oklch(0.65 0.22 270)"
-            icon={Container}
-            title="Docker Containers"
-            action={
-              <div className="flex items-center gap-2 text-[11px]">
-                <span className="flex items-center gap-1 text-muted-foreground">
-                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
-                  {containers.filter((c) => c.status === "up").length} running
-                </span>
-                <span className="h-1 w-1 rounded-full bg-border" />
-                <span className="flex items-center gap-1 text-muted-foreground">
-                  <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
-                  {containers.filter((c) => c.status !== "up").length} stopped
-                </span>
-              </div>
-            }
-          />
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
-            {containers.map((c) => {
-              const isUp = c.status === "up";
-              return (
-                <div
-                  key={c.name}
-                  className="group relative overflow-hidden rounded-xl border border-border bg-background/40 p-3.5 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))]"
-                >
-                  <div
-                    aria-hidden
-                    className="absolute inset-y-0 left-0 w-[3px]"
-                    style={{ background: isUp ? "var(--color-brand-green)" : "var(--color-border)" }}
-                  />
-                  <div className="flex items-center justify-between">
-                    <div className="min-w-0">
-                      <div className="truncate text-[12px] font-semibold text-foreground">{c.name}</div>
-                      <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
-                        <span
-                          className={`h-1.5 w-1.5 rounded-full ${
-                            isUp
-                              ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
-                              : "bg-muted-foreground/50"
-                          }`}
-                        />
-                        <span className="font-mono">{isUp ? `Up · ${c.uptime}` : c.uptime}</span>
+        {pollContainers !== null && (
+          <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
+            <SectionLabel
+              color="oklch(0.65 0.22 270)"
+              icon={Container}
+              title="Docker Containers"
+              action={
+                <div className="flex items-center gap-2 text-[11px]">
+                  <span className="flex items-center gap-1 text-muted-foreground">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
+                    {pollContainers.filter((c) => c.state === "running").length} running
+                  </span>
+                  <span className="h-1 w-1 rounded-full bg-border" />
+                  <span className="flex items-center gap-1 text-muted-foreground">
+                    <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
+                    {pollContainers.filter((c) => c.state !== "running").length} stopped
+                  </span>
+                </div>
+              }
+            />
+            {pollContainers.length === 0 ? (
+              <div className="py-8 text-center text-sm text-muted-foreground">No containers found.</div>
+            ) : (
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+                {pollContainers.map((c) => {
+                  const isUp = c.state === "running";
+                  const memPct = c.memLimitBytes > 0 ? (c.memUsedBytes / c.memLimitBytes) * 100 : 0;
+                  return (
+                    <div
+                      key={c.id}
+                      className="group relative overflow-hidden rounded-xl border border-border bg-background/40 p-3.5 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))]"
+                    >
+                      <div
+                        aria-hidden
+                        className="absolute inset-y-0 left-0 w-[3px]"
+                        style={{ background: isUp ? "var(--color-brand-green)" : "var(--color-border)" }}
+                      />
+                      <div className="flex items-center justify-between">
+                        <div className="min-w-0">
+                          <div className="truncate text-[12px] font-semibold text-foreground">{c.name}</div>
+                          <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                            <span
+                              className={`h-1.5 w-1.5 rounded-full ${
+                                isUp
+                                  ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
+                                  : "bg-muted-foreground/50"
+                              }`}
+                            />
+                            <span className="font-mono">{c.state}</span>
+                          </div>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-3">
+                          <RingGauge value={c.cpuPct} label="CPU" gradientId={`g-cpu-${c.id}`} />
+                          <RingGauge value={memPct} label="RAM" gradientId={`g-ram-${c.id}`} />
+                        </div>
+                        <div className="flex flex-1 items-stretch gap-3 text-[10px]">
+                          <IoStat
+                            label="Network"
+                            rows={[
+                              { icon: ArrowDownToLine, value: fmtBytes(c.netRxRate), unit: "/s" },
+                              { icon: ArrowUpFromLine, value: fmtBytes(c.netTxRate), unit: "/s" },
+                            ]}
+                          />
+                        </div>
                       </div>
                     </div>
-                  </div>
-                  <div className="mt-3 flex items-center justify-between gap-3">
-                    <div className="flex items-center gap-3">
-                      <RingGauge
-                        value={c.cpu}
-                        label="CPU"
-                        gradientId={`g-cpu-${c.name}`}
-                        from="oklch(0.78 0.16 200)"
-                        to="oklch(0.62 0.18 240)"
-                      />
-                      <RingGauge
-                        value={c.ram}
-                        label="RAM"
-                        gradientId={`g-ram-${c.name}`}
-                        from="oklch(0.88 0.18 95)"
-                        to="oklch(0.72 0.20 55)"
-                      />
-                    </div>
-                    <div className="flex flex-1 items-stretch gap-3 text-[10px]">
-                      <IoStat
-                        label="Network"
-                        rows={[
-                          { icon: ArrowDownToLine, value: c.netRx, unit: c.netRxUnit },
-                          { icon: ArrowUpFromLine, value: c.netTx, unit: c.netTxUnit },
-                        ]}
-                      />
-                      <IoStat
-                        label="Block IO"
-                        rows={[
-                          { icon: ArrowDownToLine, value: c.ioRead, unit: c.ioReadUnit, letter: "R" },
-                          { icon: ArrowUpFromLine, value: c.ioWrite, unit: c.ioWriteUnit, letter: "W" },
-                        ]}
-                      />
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </section>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        )}
       </div>
     </ScrollArea>
   );
@@ -1862,7 +2093,7 @@ function HostsView({
   onConnectHost,
 }: {
   onNewTerminal?: () => void;
-  onNewSftp?: () => void;
+  onNewSftp?: (host?: Host) => void;
   onConnectHost: (host: Host) => void;
 }) {
   const [query, setQuery] = useState("");
@@ -2021,7 +2252,7 @@ function HostsView({
               { label: "New group", icon: <FolderPlus className="h-3.5 w-3.5" />, onClick: () => setGroupModal({ open: true, parentId: null }) },
             ]}
           />
-          {/* <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={onNewSftp} /> */}{/* temporarily hidden */}
+          {onNewSftp && <ToolbarButton icon={<Folder className="h-4 w-4" />} label="SFTP" onClick={() => onNewSftp()} />}
           <ToolbarButton icon={<TerminalSquare className="h-4 w-4" />} label="Terminal" onClick={onNewTerminal} />
         </div>
         <div className="flex items-center gap-1">
@@ -2147,6 +2378,7 @@ function HostsView({
                 onEditHost={setEditingHost}
                 onDeleteHost={setRemovingHostId}
                 onConnectHost={onConnectHost}
+                onOpenSftp={onNewSftp}
               />
             ))}
 
@@ -2158,6 +2390,7 @@ function HostsView({
               onConnectHost={onConnectHost}
               onEditHost={setEditingHost}
               onDeleteHost={setRemovingHostId}
+              onOpenSftp={onNewSftp}
             />
           </>
         )}
@@ -2201,7 +2434,7 @@ function HostsView({
 
 /* ---- Group rendering (recursive) ---- */
 function GroupNode({
-  group, depth, groups, hosts, viewMode, collapsed, onToggle, onAddSubgroup, onAddHost, onEditGroup, onDeleteGroup, onEditHost, onDeleteHost, onConnectHost,
+  group, depth, groups, hosts, viewMode, collapsed, onToggle, onAddSubgroup, onAddHost, onEditGroup, onDeleteGroup, onEditHost, onDeleteHost, onConnectHost, onOpenSftp,
 }: {
   group: HostGroup;
   depth: number;
@@ -2217,6 +2450,7 @@ function GroupNode({
   onEditHost: (host: Host) => void;
   onDeleteHost: (id: string) => void;
   onConnectHost: (host: Host) => void;
+  onOpenSftp?: (host: Host) => void;
 }) {
   const isOpen = !collapsed[group.id];
   const children = groups.filter((g) => g.parentId === group.id);
@@ -2287,6 +2521,7 @@ function GroupNode({
               onEditHost={onEditHost}
               onDeleteHost={onDeleteHost}
               onConnectHost={onConnectHost}
+              onOpenSftp={onOpenSftp}
             />
           ))}
           {groupHosts.length > 0 && (
@@ -2297,6 +2532,7 @@ function GroupNode({
               onConnectHost={onConnectHost}
               onEditHost={onEditHost}
               onDeleteHost={onDeleteHost}
+              onOpenSftp={onOpenSftp}
             />
           )}
         </div>
@@ -2312,6 +2548,7 @@ function HostsList({
   onConnectHost,
   onEditHost,
   onDeleteHost,
+  onOpenSftp,
 }: {
   hosts: Host[];
   viewMode: "grid" | "list";
@@ -2319,6 +2556,7 @@ function HostsList({
   onConnectHost: (host: Host) => void;
   onEditHost: (host: Host) => void;
   onDeleteHost: (id: string) => void;
+  onOpenSftp?: (host: Host) => void;
 }) {
   if (hosts.length === 0 && query) {
     return (
@@ -2347,6 +2585,15 @@ function HostsList({
               <div className="truncate text-xs text-muted-foreground">ssh, {h.user}</div>
             </div>
             <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+              {onOpenSftp && (
+                <button
+                  title="Open SFTP"
+                  onClick={(e) => { e.stopPropagation(); onOpenSftp(h); }}
+                  className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-[var(--color-brand-cyan)]"
+                >
+                  <Folder className="h-3.5 w-3.5" />
+                </button>
+              )}
               <button
                 title="Edit"
                 onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
@@ -2385,6 +2632,15 @@ function HostsList({
             <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}</div>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            {onOpenSftp && (
+              <button
+                title="Open SFTP"
+                onClick={(e) => { e.stopPropagation(); onOpenSftp(h); }}
+                className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-[var(--color-brand-cyan)] group-hover:opacity-100"
+              >
+                <Folder className="h-3.5 w-3.5" />
+              </button>
+            )}
             <button
               title="Edit"
               onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
@@ -4043,25 +4299,553 @@ function Segmented({
 
 /* ---------------- SFTP view ---------------- */
 
-function SftpView() {
-  const files = [
-    { n: "Applications", d: "5/9/2026, 1:58 PM", k: "folder" },
-    { n: "CascadeProjects", d: "5/28/2025, 7:38 PM", k: "folder" },
-    { n: "Desktop", d: "6/3/2026, 9:14 AM", k: "folder" },
-    { n: "Documents", d: "6/13/2026, 1:51 PM", k: "folder" },
-    { n: "Downloads", d: "6/17/2026, 8:59 AM", k: "folder" },
-    { n: "Library", d: "5/14/2026, 8:21 PM", k: "folder" },
-    { n: "Movies", d: "2/26/2026, 10:05 PM", k: "folder" },
-    { n: "Music", d: "2/4/2026, 7:40 PM", k: "folder" },
-    { n: "Pictures", d: "5/13/2026, 8:32 AM", k: "folder" },
-    { n: "Public", d: "11/17/2024, 7:55 AM", k: "folder" },
-    { n: "Dockerfile", d: "7/23/2025, 10:13 AM", k: "file", size: "1.05 kB" },
-  ];
+function SftpConnectingOverlay({
+  message, hostTitle, hostLabel, failed, error, onRetry, onChangeHost,
+}: {
+  message: string;
+  hostTitle: string;
+  hostLabel: string;
+  failed: boolean;
+  error: string | null;
+  onRetry: () => void;
+  onChangeHost: () => void;
+}) {
+  const accent = failed ? "oklch(0.55 0.18 25)" : "oklch(0.55 0.14 145)";
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center bg-background">
+      {/* Icon with pulsing glow rings */}
+      <div className="relative mb-8 flex items-center justify-center">
+        {!failed && (
+          <>
+            <span
+              className="absolute h-24 w-24 animate-ping rounded-full opacity-10"
+              style={{ background: accent, animationDuration: "2s" }}
+            />
+            <span
+              className="absolute h-16 w-16 animate-ping rounded-full opacity-15"
+              style={{ background: accent, animationDuration: "2s", animationDelay: "0.4s" }}
+            />
+          </>
+        )}
+        <div
+          className="relative flex h-14 w-14 items-center justify-center rounded-2xl"
+          style={{
+            background: `color-mix(in oklab, ${accent} 18%, var(--color-surface))`,
+            border: `1px solid color-mix(in oklab, ${accent} 35%, transparent)`,
+            boxShadow: `0 0 32px color-mix(in oklab, ${accent} 20%, transparent)`,
+          }}
+        >
+          <Folder className="h-7 w-7" style={{ color: accent }} />
+        </div>
+      </div>
+
+      {/* Host info */}
+      <h2 className="text-lg font-semibold tracking-tight text-foreground">
+        {hostTitle || "SFTP"}
+      </h2>
+      {hostLabel && (
+        <p className="mt-1 text-xs text-muted-foreground">{hostLabel}</p>
+      )}
+
+      {/* Status / error */}
+      {!failed ? (
+        <p className="mt-6 text-xs text-muted-foreground">{message || "Connecting..."}</p>
+      ) : (
+        <div className="mt-6 flex w-full max-w-xs flex-col items-center gap-4">
+          <p className="text-center text-xs text-red-400">{error}</p>
+          <div className="flex w-full gap-2">
+            <button
+              className="flex-1 rounded-lg border border-border bg-[var(--color-surface-2)] py-2 text-xs font-semibold text-foreground hover:bg-white/5"
+              onClick={onRetry}
+            >
+              Retry
+            </button>
+            <button
+              className="flex-1 rounded-lg border border-border bg-[var(--color-surface-2)] py-2 text-xs font-semibold text-muted-foreground hover:bg-white/5"
+              onClick={onChangeHost}
+            >
+              Change host
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function SftpView({ tab }: { tab: AppTab }) {
+  const homeDir = "/Users/" + (typeof window !== "undefined"
+    ? window.navigator.userAgent.match(/Mac/) ? "admin" : "user"
+    : "user");
+
+  const [localPath, setLocalPath] = useState(homeDir);
+  const [localFiles, setLocalFiles] = useState<LocalFileEntry[]>([]);
+  const [localLoading, setLocalLoading] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  const [sftpSessionId] = useState(() => `sftp-${tab.id}-${Date.now()}`);
+  const [pickedHostId, setPickedHostId] = useState<string | undefined>(tab.sftpHostId);
+  const [allHosts, setAllHosts] = useState<Host[]>([]);
+  const [hostQuery, setHostQuery] = useState("");
+  const [isConnected, setIsConnected] = useState(false);
+  // Start in "connecting" immediately if a host is pre-selected — avoids first-render flash
+  const [isConnecting, setIsConnecting] = useState(!!tab.sftpHostId);
+  const [connectError, setConnectError] = useState<string | null>(null);
+  const [connectStage, setConnectStage] = useState<"connecting" | "handshaking" | "authenticating" | "ready">("connecting");
+  const [connectMessage, setConnectMessage] = useState(tab.sftpHostId ? "Opening TCP connection..." : "");
+  const [connectLogs, setConnectLogs] = useState<string[]>([]);
+  // Use tab.title so host name shows immediately without waiting for host list load
+  const [connectHostTitle, setConnectHostTitle] = useState(tab.sftpHostId ? (tab.title || "SFTP") : "");
+  const [connectHostLabel, setConnectHostLabel] = useState("");
+  const [remotePath, setRemotePath] = useState("/");
+  const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
+  const [remoteLoading, setRemoteLoading] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [watchedFile, setWatchedFile] = useState<{ tmpPath: string; remotePath: string; changed: boolean } | null>(null);
+  const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState<{ targets: string[]; isLocal: boolean; label: string } | null>(null);
+  const [newFolderTarget, setNewFolderTarget] = useState<"local" | "remote" | null>(null);
+
+  // Load hosts for picker (only when no host is pre-selected)
+  useEffect(() => {
+    if (!tab.sftpHostId) {
+      invoke<{ hosts: Host[] }>("list_hosts")
+        .then((v) => setAllHosts(v.hosts))
+        .catch(() => {});
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [selectedLocal, setSelectedLocal] = useState<Set<string>>(new Set());
+  const [selectedRemote, setSelectedRemote] = useState<Set<string>>(new Set());
+  const [lastLocalClick, setLastLocalClick] = useState<string | null>(null);
+  const [lastRemoteClick, setLastRemoteClick] = useState<string | null>(null);
+  const [transferProgress, setTransferProgress] = useState<TransferProgress | null>(null);
+  const [transferOverall, setTransferOverall] = useState<{ current: number; total: number; fileName: string } | null>(null);
+  const [transferError, setTransferError] = useState<string | null>(null);
+  const [localDragOver, setLocalDragOver] = useState(false);
+  const [remoteDragOver, setRemoteDragOver] = useState(false);
+  const [showHiddenLocal, setShowHiddenLocal] = useState(false);
+  const [showHiddenRemote, setShowHiddenRemote] = useState(false);
+  const [localMenuOpen, setLocalMenuOpen] = useState(false);
+  const [remoteMenuOpen, setRemoteMenuOpen] = useState(false);
+  const [localClipboard, setLocalClipboard] = useState<string[]>([]);
+  const [remoteClipboard, setRemoteClipboard] = useState<string[]>([]);
+  const [renameTarget, setRenameTarget] = useState<{ path: string; name: string; isLocal: boolean } | null>(null);
+  const [permTarget, setPermTarget] = useState<string | null>(null);
+  const [openWithTarget, setOpenWithTarget] = useState<{ path: string; isLocal: boolean } | null>(null);
+  const [openWithApp, setOpenWithApp] = useState("");
+
+  // Resizable divider — 50% default
+  const [localWidthPct, setLocalWidthPct] = useState(50);
+  const paneContainerRef = useRef<HTMLDivElement>(null);
+
+  const onDividerMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const container = paneContainerRef.current;
+    if (!container) return;
+    const stripWidth = 48;
+    const containerWidth = container.getBoundingClientRect().width - stripWidth;
+    const startPct = localWidthPct;
+
+    const onMove = (mv: MouseEvent) => {
+      const delta = mv.clientX - startX;
+      const newPct = Math.max(20, Math.min(80, startPct + (delta / containerWidth) * 100));
+      setLocalWidthPct(newPct);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }, [localWidthPct]);
+
+  // Listen for progress events
+  useEffect(() => {
+    if (!isConnected) return;
+    const unlisten = listen<TransferProgress>(`sftp:${sftpSessionId}:progress`, (event) => {
+      setTransferProgress(event.payload);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [isConnected, sftpSessionId]);
+
+  // Listen for file-changed events (remote watch)
+  useEffect(() => {
+    if (!sftpSessionId) return;
+    const unlisten = listen<{ tmp_path: string; remote_path: string }>(
+      `sftp:${sftpSessionId}:file-changed`,
+      (ev) => {
+        setWatchedFile({
+          tmpPath: ev.payload.tmp_path,
+          remotePath: ev.payload.remote_path,
+          changed: true,
+        });
+      }
+    );
+    return () => { void unlisten.then((fn) => fn()); };
+  }, [sftpSessionId]);
+
+  const handleLocalClick = (e: React.MouseEvent, path: string) => {
+    if (e.shiftKey && lastLocalClick) {
+      const paths = localFiles.map((f) => f.path);
+      const a = paths.indexOf(lastLocalClick);
+      const b = paths.indexOf(path);
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      setSelectedLocal(new Set(paths.slice(lo, hi + 1)));
+    } else if (e.metaKey || e.ctrlKey) {
+      setSelectedLocal((prev) => {
+        const next = new Set(prev);
+        if (next.has(path)) next.delete(path); else next.add(path);
+        return next;
+      });
+    } else {
+      if (selectedLocal.size === 1 && selectedLocal.has(path)) {
+        setSelectedLocal(new Set());
+        setLastLocalClick(null);
+        return;
+      }
+      setSelectedLocal(new Set([path]));
+    }
+    setLastLocalClick(path);
+  };
+
+  const handleRemoteClick = (e: React.MouseEvent, path: string) => {
+    if (e.shiftKey && lastRemoteClick) {
+      const paths = remoteFiles.map((f) => f.path);
+      const a = paths.indexOf(lastRemoteClick);
+      const b = paths.indexOf(path);
+      const [lo, hi] = a < b ? [a, b] : [b, a];
+      setSelectedRemote(new Set(paths.slice(lo, hi + 1)));
+    } else if (e.metaKey || e.ctrlKey) {
+      setSelectedRemote((prev) => {
+        const next = new Set(prev);
+        if (next.has(path)) next.delete(path); else next.add(path);
+        return next;
+      });
+    } else {
+      if (selectedRemote.size === 1 && selectedRemote.has(path)) {
+        setSelectedRemote(new Set());
+        setLastRemoteClick(null);
+        return;
+      }
+      setSelectedRemote(new Set([path]));
+    }
+    setLastRemoteClick(path);
+  };
+
+  const invokeTransfer = async (
+    command: string,
+    args: Record<string, string>,
+  ): Promise<void> => {
+    let unlisten: (() => void) | undefined;
+    try {
+      await new Promise<void>(async (resolve, reject) => {
+        unlisten = await listen<{ ok: boolean; error?: string }>(
+          `sftp:${sftpSessionId}:transfer-done`,
+          (ev) => {
+            unlisten?.();
+            if (ev.payload.ok) resolve();
+            else reject(new Error(ev.payload.error ?? "Transfer failed"));
+          }
+        );
+        invoke(command, args).catch((e: unknown) => { unlisten?.(); reject(e); });
+      });
+    } finally {
+      unlisten?.();
+    }
+  };
+
+  const handleDownload = async (paths?: string[]) => {
+    const targets = paths ?? [...selectedRemote];
+    if (targets.length === 0 || !isConnected) return;
+    setTransferError(null);
+    setTransferProgress(null);
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        const rp = targets[i];
+        const fileName = rp.split("/").pop() ?? "file";
+        setTransferOverall({ current: i + 1, total: targets.length, fileName });
+        await invokeTransfer("sftp_download", {
+          sessionId: sftpSessionId,
+          remotePath: rp,
+          localPath: `${localPath}/${fileName}`,
+        });
+      }
+      await loadLocalDir(localPath);
+    } catch (e) {
+      if (!String(e).includes("Cancelled")) {
+        setTransferError(String(e));
+      } else {
+        setTransferOverall(null);
+        setTransferProgress(null);
+      }
+    } finally {
+      setTransferProgress(null);
+      setTransferOverall(null);
+    }
+  };
+
+  const handleUpload = async (paths?: string[]) => {
+    const targets = paths ?? [...selectedLocal];
+    if (targets.length === 0 || !isConnected) return;
+    setTransferError(null);
+    setTransferProgress(null);
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        const lp = targets[i];
+        const fileName = lp.split("/").pop() ?? "file";
+        setTransferOverall({ current: i + 1, total: targets.length, fileName });
+        await invokeTransfer("sftp_upload", {
+          sessionId: sftpSessionId,
+          localPath: lp,
+          remotePath: `${remotePath}/${fileName}`,
+        });
+      }
+      await loadRemoteDir(remotePath);
+    } catch (e) {
+      if (!String(e).includes("Cancelled")) {
+        setTransferError(String(e));
+      } else {
+        setTransferOverall(null);
+        setTransferProgress(null);
+      }
+    } finally {
+      setTransferProgress(null);
+      setTransferOverall(null);
+    }
+  };
+
+  const handleOpenLocal = (path: string) => {
+    void invoke("sftp_open_local", { path });
+  };
+
+  const handleOpenWithLocal = (path: string, app: string) => {
+    void invoke("sftp_open_with_local", { path, app });
+  };
+
+  const handleOpenRemote = async (path: string) => {
+    const tmpPath = await invoke<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: path });
+    await invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath, remotePath: path });
+  };
+
+  const handleCopyLocal = (paths: string[]) => setLocalClipboard(paths);
+  const handlePasteLocal = () => {
+    if (!localClipboard.length) return;
+    void invoke("sftp_copy_local", { paths: localClipboard, destDir: localPath })
+      .then(() => loadLocalDir(localPath))
+      .catch((e: unknown) => toast.error(String(e)));
+  };
+
+  const handleCopyRemote = (paths: string[]) => setRemoteClipboard(paths);
+  const handlePasteRemote = () => {
+    if (!remoteClipboard.length || !remotePath) return;
+    void invoke("sftp_copy_remote", { sessionId: sftpSessionId, paths: remoteClipboard, destDir: remotePath })
+      .then(() => loadRemoteDir(remotePath))
+      .catch((e: unknown) => toast.error(String(e)));
+  };
+
+  const handleDeleteLocal = (paths: string[]) => {
+    void invoke("sftp_delete_local", { paths })
+      .then(() => loadLocalDir(localPath))
+      .catch((e: unknown) => toast.error(String(e)));
+  };
+
+  const handleRenameConfirm = async (newName: string) => {
+    if (!renameTarget) return;
+    try {
+      if (renameTarget.isLocal) {
+        await invoke("sftp_rename_local", { path: renameTarget.path, newName });
+        await loadLocalDir(localPath);
+      } else {
+        const dir = renameTarget.path.substring(0, renameTarget.path.lastIndexOf("/")) || "/";
+        await invoke("sftp_rename_remote", {
+          sessionId: sftpSessionId,
+          fromPath: renameTarget.path,
+          toPath: `${dir}/${newName}`,
+        });
+        if (remotePath) await loadRemoteDir(remotePath);
+      }
+    } catch (e) { toast.error(String(e)); }
+    setRenameTarget(null);
+  };
+
+  const connectCleanupRef = useRef<(() => void) | null>(null);
+
+  const performDisconnect = () => {
+    void invoke("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
+    setIsConnected(false);
+    setPickedHostId(undefined);
+    setConnectError(null);
+    setRemoteFiles([]);
+    invoke<{ hosts: Host[] }>("list_hosts").then((v) => setAllHosts(v.hosts)).catch(() => {});
+  };
+
+  const handleConnect = async (hostId?: string, hostObj?: Host) => {
+    const targetHostId = hostId ?? pickedHostId;
+    if (!targetHostId) return;
+    if (hostId) setPickedHostId(hostId);
+
+    const resolvedHost = hostObj ?? allHosts.find((h) => h.id === targetHostId);
+    setConnectHostTitle(resolvedHost?.name || resolvedHost?.hostname || "SFTP");
+    setConnectHostLabel(resolvedHost ? `${resolvedHost.user}@${resolvedHost.hostname}:${resolvedHost.port}` : "");
+
+    setIsConnecting(true);
+    setConnectError(null);
+    setConnectMessage("Connecting...");
+    setConnectLogs([]);
+
+    // Subscribe to progress + done events before firing the command
+    const [unlistenProgress, unlistenDone] = await Promise.all([
+      listen<{ stage: string; message: string }>(`sftp:${sftpSessionId}:connect`, (ev) => {
+        setConnectMessage(ev.payload.message);
+      }),
+      listen<{ ok: boolean; remote_path?: string; error?: string }>(`sftp:${sftpSessionId}:done`, async (ev) => {
+        connectCleanupRef.current?.();
+        connectCleanupRef.current = null;
+        if (ev.payload.ok && ev.payload.remote_path) {
+          setIsConnected(true);
+          await loadRemoteDir(ev.payload.remote_path);
+        } else {
+          setConnectError(ev.payload.error ?? "Connection failed");
+        }
+        setIsConnecting(false);
+      }),
+    ]);
+
+    const cleanup = () => { unlistenProgress(); unlistenDone(); };
+    connectCleanupRef.current = cleanup;
+
+    // Command returns immediately — actual connection runs in Rust background thread
+    try {
+      await invoke("sftp_connect_from_host", { hostId: targetHostId, sessionId: sftpSessionId });
+    } catch (e) {
+      // Only fires if credential resolution fails (before background spawn)
+      cleanup();
+      connectCleanupRef.current = null;
+      setConnectError(String(e));
+      setIsConnecting(false);
+    }
+  };
+
+  const loadRemoteDir = async (path: string) => {
+    setRemoteLoading(true);
+    setRemoteError(null);
+    try {
+      const files = await invoke<RemoteFileEntry[]>("sftp_list_remote", {
+        sessionId: sftpSessionId,
+        path,
+      });
+      setRemoteFiles(files);
+      setRemotePath(path);
+    } catch (e) {
+      setRemoteError(String(e));
+    } finally {
+      setRemoteLoading(false);
+    }
+  };
+
+  // Auto-connect on mount if hostId is pre-set
+  useEffect(() => {
+    if (tab.sftpHostId && !isConnected) {
+      void handleConnect();
+    }
+    return () => {
+      connectCleanupRef.current?.();
+      connectCleanupRef.current = null;
+      void invoke("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const loadLocalDir = async (path: string) => {
+    setLocalLoading(true);
+    setLocalError(null);
+    try {
+      const files = await invoke<LocalFileEntry[]>("sftp_list_local", { path });
+      setLocalFiles(files);
+      setLocalPath(path);
+    } catch (e) {
+      setLocalError(String(e));
+    } finally {
+      setLocalLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadLocalDir(localPath);
+  }, []); // load on mount
+
+  const localParent = localPath.split("/").slice(0, -1).join("/") || "/";
+  const localPathParts = localPath.split("/").filter(Boolean);
 
   return (
-    <div className="flex h-full min-h-0 flex-1">
+    <div className="flex h-full min-h-0 flex-1 flex-col">
+      {/* Transfer progress — fixed bottom sheet, does not affect layout */}
+      {(transferOverall || transferError) && (
+        <div className="fixed bottom-0 left-0 right-0 z-40 flex h-12 items-center gap-3 border-t border-border bg-[var(--color-surface-2)] px-4 text-xs shadow-[0_-4px_24px_rgba(0,0,0,0.3)]">
+          {transferError ? (
+            <span className="text-red-400">{transferError}</span>
+          ) : transferOverall ? (() => {
+            const filePct = transferProgress && transferProgress.total_bytes > 0
+              ? transferProgress.bytes_transferred / transferProgress.total_bytes
+              : 0;
+            const overallPct = transferOverall.total > 1
+              ? ((transferOverall.current - 1 + filePct) / transferOverall.total) * 100
+              : filePct * 100;
+            return (
+              <>
+                {transferOverall.total > 1 && (
+                  <span className="shrink-0 tabular-nums text-muted-foreground">
+                    {transferOverall.current}/{transferOverall.total}
+                  </span>
+                )}
+                <span className="min-w-0 truncate text-muted-foreground">{transferOverall.fileName}</span>
+                <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-border">
+                  <div
+                    className="h-full rounded-full bg-[var(--color-brand-cyan)] transition-all"
+                    style={{ width: `${Math.round(overallPct)}%` }}
+                  />
+                </div>
+                <span className="shrink-0 tabular-nums text-muted-foreground">
+                  {Math.round(overallPct)}%
+                </span>
+                <button
+                  className="shrink-0 rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+                  onClick={() => void invoke("sftp_cancel_transfer", { sessionId: sftpSessionId })}
+                >
+                  Cancel
+                </button>
+              </>
+            );
+          })() : null}
+        </div>
+      )}
+      <div ref={paneContainerRef} className="flex min-h-0 flex-1">
       {/* Local pane */}
-      <div className="flex min-w-0 flex-1 flex-col border-r border-border">
+      <div
+        className={`flex flex-col border-r border-border overflow-hidden transition-colors ${localDragOver ? "bg-[var(--color-brand-cyan)]/5" : ""}`}
+        style={{ width: `${localWidthPct}%` }}
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setLocalDragOver(true); }}
+        onDragLeave={() => setLocalDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setLocalDragOver(false);
+          const data = e.dataTransfer.getData("application/x-sftp-remote");
+          if (data) {
+            const paths: string[] = JSON.parse(data);
+            void handleDownload(paths);
+          }
+        }}
+      >
         <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4">
           <div className="flex items-center gap-2 text-sm font-medium">
             <span className="flex h-5 w-5 items-center justify-center rounded bg-[oklch(0.55_0.18_230)]">
@@ -4069,50 +4853,601 @@ function SftpView() {
             </span>
             Local
           </div>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            <button className="flex items-center gap-1 hover:text-foreground"><Search className="h-3.5 w-3.5" /> Filter</button>
-            <button className="flex items-center gap-1 hover:text-foreground">Actions <ChevronDown className="h-3.5 w-3.5" /></button>
+          <div className="relative">
+            <button
+              className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+              onClick={() => setLocalMenuOpen((v) => !v)}
+            >
+              <MoreVertical className="h-3.5 w-3.5" />
+            </button>
+            {localMenuOpen && (
+              <>
+                <div className="fixed inset-0 z-10" onClick={() => setLocalMenuOpen(false)} />
+                <div className="absolute right-0 top-full z-20 mt-1 w-44 overflow-hidden rounded-lg border border-border bg-popover shadow-lg">
+                  <button
+                    className="flex w-full items-center justify-between px-3 py-2 text-xs text-foreground hover:bg-[var(--color-surface)]"
+                    onClick={() => { setShowHiddenLocal((v) => !v); setLocalMenuOpen(false); }}
+                  >
+                    Show hidden files
+                    <span className={`h-3.5 w-3.5 rounded border ${showHiddenLocal ? "border-[var(--color-brand-cyan)] bg-[var(--color-brand-cyan)]" : "border-border"}`} />
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
-        <div className="border-b border-border px-4 py-2 text-xs text-muted-foreground">
-          <span className="text-foreground/80">Users</span> <span className="opacity-50">›</span> <span className="text-foreground">admin</span>
+
+        {/* Breadcrumb */}
+        <div className="flex items-center gap-1 border-b border-border px-4 py-2 text-xs text-muted-foreground overflow-x-auto">
+          <button
+            className="hover:text-foreground"
+            onClick={() => void loadLocalDir("/")}
+          >
+            /
+          </button>
+          {localPathParts.map((part, i) => {
+            const partPath = "/" + localPathParts.slice(0, i + 1).join("/");
+            return (
+              <span key={partPath} className="flex items-center gap-1">
+                <span className="opacity-40">›</span>
+                <button
+                  className="hover:text-foreground"
+                  onClick={() => void loadLocalDir(partPath)}
+                >
+                  {part}
+                </button>
+              </span>
+            );
+          })}
         </div>
-        <div className="grid grid-cols-[1fr_180px_100px_80px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
-          <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
-        </div>
-        <div className="flex-1 overflow-y-auto">
-          {files.map((f) => (
-            <div key={f.n} className="grid grid-cols-[1fr_180px_100px_80px] items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]">
-              <div className="flex items-center gap-2 text-foreground">
-                <Folder className={`h-4 w-4 ${f.k === "folder" ? "text-[oklch(0.7_0.13_230)]" : "text-muted-foreground"}`} />
-                {f.n}
-              </div>
-              <div className="text-xs text-muted-foreground">{f.d}</div>
-              <div className="text-xs text-muted-foreground">{f.size ?? "—"}</div>
-              <div className="text-xs text-muted-foreground">{f.k}</div>
-            </div>
-          ))}
+
+        {/* Column headers + file list — shared horizontal scroll */}
+        <div className="flex min-h-0 flex-1 flex-col overflow-x-auto">
+          <div className="grid min-w-[560px] grid-cols-[1fr_180px_100px_80px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
+            <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
+          </div>
+          <SftpEmptyContextMenu
+            onNewFolder={() => setNewFolderTarget("local")}
+            onRefresh={() => void loadLocalDir(localPath)}
+          >
+          <div className="flex-1 overflow-y-auto" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedLocal(new Set()); setLastLocalClick(null); } }}>
+            {localLoading && (
+              <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
+            )}
+            {localError && (
+              <div className="px-4 py-8 text-center text-sm text-red-400">{localError}</div>
+            )}
+            {!localLoading && !localError && (
+              <>
+                {localPath !== "/" && (
+                  <div
+                    className="grid min-w-[560px] grid-cols-[1fr_180px_100px_80px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
+                    onDoubleClick={() => void loadLocalDir(localParent)}
+                  >
+                    <div className="flex items-center gap-2 text-muted-foreground">
+                      <Folder className="h-4 w-4 text-[oklch(0.7_0.13_230)]" />
+                      ..
+                    </div>
+                    <div /><div /><div />
+                  </div>
+                )}
+                {localFiles.filter((f) => showHiddenLocal || !f.name.startsWith(".")).map((f) => (
+                  <SftpContextMenu
+                    key={f.path}
+                    isLocal={true}
+                    isConnected={isConnected}
+                    file={f}
+                    hasClipboard={localClipboard.length > 0}
+                    onOpen={() => handleOpenLocal(f.path)}
+                    onOpenWith={() => setOpenWithTarget({ path: f.path, isLocal: true })}
+                    onDownload={() => {}}
+                    onUpload={() => void handleUpload(selectedLocal.has(f.path) ? [...selectedLocal] : [f.path])}
+                    onCopy={() => handleCopyLocal(selectedLocal.size > 0 ? [...selectedLocal] : [f.path])}
+                    onPaste={handlePasteLocal}
+                    onRename={() => setRenameTarget({ path: f.path, name: f.name, isLocal: true })}
+                    onDelete={() => {
+                      const targets = selectedLocal.has(f.path) ? [...selectedLocal] : [f.path];
+                      const allEntries = localFiles;
+                      const label = targets.length === 1
+                        ? (allEntries.find((e) => e.path === targets[0])?.name ?? targets[0])
+                        : (() => {
+                            const dirs = targets.filter((p) => allEntries.find((e) => e.path === p)?.is_dir).length;
+                            const files = targets.length - dirs;
+                            const parts = [];
+                            if (files > 0) parts.push(`${files} file${files > 1 ? "s" : ""}`);
+                            if (dirs > 0) parts.push(`${dirs} folder${dirs > 1 ? "s" : ""}`);
+                            return parts.join(" and ");
+                          })();
+                      setTimeout(() => setDeleteConfirm({ targets, isLocal: true, label }), 0);
+                    }}
+                    onRefresh={() => void loadLocalDir(localPath)}
+                    onEditPermissions={() => {}}
+                  >
+                  <div
+                    draggable={!f.is_dir}
+                    onDragStart={(e) => {
+                      const toDrag = selectedLocal.has(f.path) ? [...selectedLocal].filter((p) => !localFiles.find((lf) => lf.path === p)?.is_dir) : [f.path];
+                      e.dataTransfer.setData("application/x-sftp-local", JSON.stringify(toDrag));
+                      e.dataTransfer.effectAllowed = "copy";
+                    }}
+                    className={`grid min-w-[560px] grid-cols-[1fr_180px_100px_80px] cursor-pointer items-center px-4 py-2 text-sm ${
+                      selectedLocal.has(f.path)
+                        ? "bg-[var(--color-brand-cyan)]/10 ring-1 ring-inset ring-[var(--color-brand-cyan)]/20"
+                        : "hover:bg-[var(--color-surface)]"
+                    }`}
+                    onClick={(e) => handleLocalClick(e, f.path)}
+                    onDoubleClick={() => {
+                      if (f.is_dir) void loadLocalDir(f.path);
+                    }}
+                  >
+                    <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-foreground">
+                      {f.is_dir
+                        ? <Folder className="h-4 w-4 shrink-0 text-[oklch(0.7_0.13_230)]" />
+                        : <File   className="h-4 w-4 shrink-0 text-muted-foreground" />}
+                      {f.name}
+                    </div>
+                    <div className="text-xs text-muted-foreground">{f.modified ?? "—"}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {f.size != null ? formatBytes(f.size) : "—"}
+                    </div>
+                    <div className="text-xs text-muted-foreground">{f.is_dir ? "folder" : "file"}</div>
+                  </div>
+                  </SftpContextMenu>
+                ))}
+              </>
+            )}
+          </div>
+          </SftpEmptyContextMenu>
         </div>
       </div>
 
-      {/* Remote pane (placeholder) */}
-      <div className="flex w-[42%] min-w-[320px] flex-col">
-        <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4 text-sm">
-          <span className="text-muted-foreground">Remote</span>
-        </div>
-        <div className="flex flex-1 flex-col items-center justify-center px-6 text-center">
-          <div className="flex h-14 w-14 items-center justify-center rounded-xl bg-[var(--color-surface-2)]">
-            <Folder className="h-6 w-6 text-muted-foreground" />
-          </div>
-          <h3 className="mt-5 text-base font-semibold">Connect to host</h3>
-          <p className="mt-1 max-w-xs text-sm text-muted-foreground">
-            Start by connecting to a saved host to manage your files with SFTP.
-          </p>
-          <button className="mt-5 rounded-md bg-[var(--color-surface-2)] px-4 py-2 text-xs font-semibold text-foreground hover:bg-white/5">
-            Select host
-          </button>
-        </div>
+      {/* Resizable divider */}
+      <div
+        className="flex w-6 flex-shrink-0 cursor-col-resize items-center justify-center border-r border-border bg-[var(--color-surface)] select-none"
+        onMouseDown={onDividerMouseDown}
+      >
+        <GripVertical className="h-3.5 w-3.5 text-muted-foreground" />
       </div>
+
+      {/* Remote pane */}
+      <div
+        className={`flex flex-col overflow-hidden transition-colors ${remoteDragOver ? "bg-[oklch(0.45_0.12_145)]/5" : ""}`}
+        style={{ width: `calc(100% - ${localWidthPct}% - 24px)` }}
+        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setRemoteDragOver(true); }}
+        onDragLeave={() => setRemoteDragOver(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setRemoteDragOver(false);
+          const data = e.dataTransfer.getData("application/x-sftp-local");
+          if (data) {
+            const paths: string[] = JSON.parse(data);
+            void handleUpload(paths);
+          }
+        }}
+      >
+        <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <span className="flex h-5 w-5 items-center justify-center rounded bg-[oklch(0.45_0.12_145)]">
+              <Folder className="h-3 w-3 text-white" />
+            </span>
+            Remote
+          </div>
+          <div className="flex items-center gap-2">
+            {isConnected && (
+              <button
+                className="text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => {
+                  if (transferOverall !== null) {
+                    setShowDisconnectConfirm(true);
+                  } else {
+                    performDisconnect();
+                  }
+                }}
+              >
+                Disconnect
+              </button>
+            )}
+            <div className="relative">
+              <button
+                className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+                onClick={() => setRemoteMenuOpen((v) => !v)}
+              >
+                <MoreVertical className="h-3.5 w-3.5" />
+              </button>
+              {remoteMenuOpen && (
+                <>
+                  <div className="fixed inset-0 z-10" onClick={() => setRemoteMenuOpen(false)} />
+                  <div className="absolute right-0 top-full z-20 mt-1 w-44 overflow-hidden rounded-lg border border-border bg-popover shadow-lg">
+                    <button
+                      className="flex w-full items-center justify-between px-3 py-2 text-xs text-foreground hover:bg-[var(--color-surface)]"
+                      onClick={() => { setShowHiddenRemote((v) => !v); setRemoteMenuOpen(false); }}
+                    >
+                      Show hidden files
+                      <span className={`h-3.5 w-3.5 rounded border ${showHiddenRemote ? "border-[var(--color-brand-cyan)] bg-[var(--color-brand-cyan)]" : "border-border"}`} />
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Not connected — host picker (no host selected yet) */}
+        {!isConnected && !isConnecting && !pickedHostId && (
+          <div className="flex flex-1 flex-col overflow-hidden">
+            <div className="border-b border-border px-4 py-3">
+              <p className="mb-2 text-xs text-muted-foreground">Select a host to connect</p>
+              <div className="flex items-center gap-2 rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-1.5">
+                <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <input
+                  className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground"
+                  placeholder="Search hosts..."
+                  value={hostQuery}
+                  onChange={(e) => setHostQuery(e.target.value)}
+                  autoFocus
+                />
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto">
+              {allHosts.length === 0 && (
+                <div className="px-4 py-8 text-center text-xs text-muted-foreground">No saved hosts</div>
+              )}
+              {allHosts
+                .filter((h) => {
+                  const q = hostQuery.toLowerCase();
+                  return !q || h.name.toLowerCase().includes(q) || h.hostname.toLowerCase().includes(q) || h.user.toLowerCase().includes(q);
+                })
+                .map((h) => (
+                  <button
+                    key={h.id}
+                    className="flex w-full items-center gap-3 border-b border-border px-4 py-2.5 text-left hover:bg-[var(--color-surface)]"
+                    onClick={() => void handleConnect(h.id, h)}
+                  >
+                    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[var(--color-surface-2)]">
+                      <Server className="h-3.5 w-3.5 text-muted-foreground" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium text-foreground">{h.name || h.hostname}</div>
+                      <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}:{h.port}</div>
+                    </div>
+                  </button>
+                ))}
+            </div>
+          </div>
+        )}
+
+        {/* Connecting — XTerminal-style step indicator */}
+        {(isConnecting || (!isConnected && pickedHostId)) && <SftpConnectingOverlay
+          message={connectMessage}
+          hostTitle={connectHostTitle}
+          hostLabel={connectHostLabel}
+          failed={!isConnecting && !!connectError}
+          error={connectError}
+          onRetry={() => void handleConnect()}
+          onChangeHost={() => { setPickedHostId(undefined); setConnectError(null); setConnectLogs([]); }}
+        />}
+
+        {/* Connected file browser */}
+        {isConnected && (
+          <>
+            {/* Breadcrumb */}
+            <div className="flex items-center gap-1 border-b border-border px-4 py-2 text-xs text-muted-foreground overflow-x-auto">
+              <button className="hover:text-foreground" onClick={() => void loadRemoteDir("/")}>
+                /
+              </button>
+              {remotePath.split("/").filter(Boolean).map((part, i, arr) => {
+                const partPath = "/" + arr.slice(0, i + 1).join("/");
+                return (
+                  <span key={partPath} className="flex items-center gap-1">
+                    <span className="opacity-40">›</span>
+                    <button className="hover:text-foreground" onClick={() => void loadRemoteDir(partPath)}>
+                      {part}
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+
+            {/* Column headers + file list — shared horizontal scroll */}
+            <div className="flex min-h-0 flex-1 flex-col overflow-x-auto">
+              <div className="grid min-w-[500px] grid-cols-[1fr_160px_90px_70px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
+                <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
+              </div>
+              <SftpEmptyContextMenu
+                onNewFolder={() => setNewFolderTarget("remote")}
+                onRefresh={() => remotePath && void loadRemoteDir(remotePath)}
+              >
+              <div className="flex-1 overflow-y-auto" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedRemote(new Set()); setLastRemoteClick(null); } }}>
+                {remoteLoading && (
+                  <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
+                )}
+                {remoteError && (
+                  <div className="px-4 py-8 text-center text-sm text-red-400">{remoteError}</div>
+                )}
+                {!remoteLoading && !remoteError && (
+                  <>
+                    {remotePath !== "/" && (
+                      <div
+                        className="grid min-w-[500px] grid-cols-[1fr_160px_90px_70px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
+                        onDoubleClick={() => {
+                          const parent = remotePath.split("/").slice(0, -1).join("/") || "/";
+                          void loadRemoteDir(parent);
+                        }}
+                      >
+                        <div className="flex items-center gap-2 text-muted-foreground">
+                          <Folder className="h-4 w-4 text-[oklch(0.65_0.12_145)]" />
+                          ..
+                        </div>
+                        <div /><div /><div />
+                      </div>
+                    )}
+                    {remoteFiles.filter((f) => showHiddenRemote || !f.name.startsWith(".")).map((f) => (
+                      <SftpContextMenu
+                        key={f.path}
+                        isLocal={false}
+                        isConnected={isConnected}
+                        file={f}
+                        hasClipboard={remoteClipboard.length > 0}
+                        onOpen={() => void handleOpenRemote(f.path).catch((e: unknown) => toast.error(String(e)))}
+                        onOpenWith={() => setOpenWithTarget({ path: f.path, isLocal: false })}
+                        onDownload={() => void handleDownload(selectedRemote.has(f.path) ? [...selectedRemote] : [f.path])}
+                        onUpload={() => {}}
+                        onCopy={() => handleCopyRemote(selectedRemote.size > 0 ? [...selectedRemote] : [f.path])}
+                        onPaste={handlePasteRemote}
+                        onRename={() => setRenameTarget({ path: f.path, name: f.name, isLocal: false })}
+                        onDelete={() => {
+                          const targets = selectedRemote.has(f.path) ? [...selectedRemote] : [f.path];
+                          const allEntries = remoteFiles;
+                          const label = targets.length === 1
+                            ? (allEntries.find((e) => e.path === targets[0])?.name ?? targets[0])
+                            : (() => {
+                                const dirs = targets.filter((p) => allEntries.find((e) => e.path === p)?.is_dir).length;
+                                const files = targets.length - dirs;
+                                const parts = [];
+                                if (files > 0) parts.push(`${files} file${files > 1 ? "s" : ""}`);
+                                if (dirs > 0) parts.push(`${dirs} folder${dirs > 1 ? "s" : ""}`);
+                                return parts.join(" and ");
+                              })();
+                          setTimeout(() => setDeleteConfirm({ targets, isLocal: false, label }), 0);
+                        }}
+                        onRefresh={() => remotePath && void loadRemoteDir(remotePath)}
+                        onEditPermissions={() => setPermTarget(f.path)}
+                      >
+                      <div
+                        draggable={!f.is_dir}
+                        onDragStart={(e) => {
+                          const toDrag = selectedRemote.has(f.path) ? [...selectedRemote].filter((p) => !remoteFiles.find((rf) => rf.path === p)?.is_dir) : [f.path];
+                          e.dataTransfer.setData("application/x-sftp-remote", JSON.stringify(toDrag));
+                          e.dataTransfer.effectAllowed = "copy";
+                        }}
+                        className={`grid min-w-[500px] grid-cols-[1fr_160px_90px_70px] cursor-pointer items-center px-4 py-2 text-sm ${
+                          selectedRemote.has(f.path)
+                            ? "bg-[oklch(0.45_0.12_145)]/10 ring-1 ring-inset ring-[oklch(0.45_0.12_145)]/20"
+                            : "hover:bg-[var(--color-surface)]"
+                        }`}
+                        onClick={(e) => handleRemoteClick(e, f.path)}
+                        onDoubleClick={() => {
+                          if (f.is_dir) void loadRemoteDir(f.path);
+                        }}
+                      >
+                        <div className="flex min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap text-foreground">
+                          {f.is_dir
+                            ? <Folder className="h-4 w-4 shrink-0 text-[oklch(0.65_0.12_145)]" />
+                            : <File   className="h-4 w-4 shrink-0 text-muted-foreground" />}
+                          {f.name}
+                          {f.is_symlink && <span className="text-[10px] text-muted-foreground">→</span>}
+                        </div>
+                        <div className="text-xs text-muted-foreground">{f.modified ?? "—"}</div>
+                        <div className="text-xs text-muted-foreground">
+                          {f.size != null ? formatBytes(f.size) : "—"}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {f.is_symlink ? "symlink" : f.is_dir ? "folder" : "file"}
+                        </div>
+                      </div>
+                      </SftpContextMenu>
+                    ))}
+                  </>
+                )}
+              </div>
+              </SftpEmptyContextMenu>
+            </div>
+          </>
+        )}
+
+        {/* Remote file watch bar */}
+        {watchedFile?.changed && (
+          <div className="flex h-10 flex-shrink-0 items-center justify-between border-t border-border bg-[var(--color-surface)] px-4">
+            <span className="text-xs text-muted-foreground">
+              <span className="mr-1 text-foreground">{watchedFile.remotePath.split("/").pop()}</span>
+              was modified locally
+            </span>
+            <div className="flex gap-2">
+              <button
+                className="rounded px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => {
+                  void invoke("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
+                  setWatchedFile(null);
+                }}
+              >
+                Reject
+              </button>
+              <button
+                className="rounded bg-[oklch(0.45_0.12_145)] px-2.5 py-1 text-xs font-medium text-white hover:bg-[oklch(0.5_0.12_145)]"
+                onClick={async () => {
+                  try {
+                    await invokeTransfer("sftp_upload", {
+                      sessionId: sftpSessionId,
+                      localPath: watchedFile.tmpPath,
+                      remotePath: watchedFile.remotePath,
+                    });
+                    await invoke("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
+                    setWatchedFile(null);
+                    if (remotePath) await loadRemoteDir(remotePath);
+                  } catch (e) { toast.error(String(e)); }
+                }}
+              >
+                Upload
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+      </div>
+
+      {/* Rename dialog */}
+      <SftpRenameDialog
+        open={renameTarget !== null}
+        currentName={renameTarget?.name ?? ""}
+        onConfirm={(n) => void handleRenameConfirm(n)}
+        onClose={() => setRenameTarget(null)}
+      />
+
+      {/* Edit Permissions dialog */}
+      <SftpPermissionsDialog
+        open={permTarget !== null}
+        sessionId={sftpSessionId}
+        path={permTarget ?? ""}
+        onClose={() => setPermTarget(null)}
+      />
+
+      {/* Open With dialog */}
+      {openWithTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="w-80 rounded-xl border border-border bg-[var(--color-surface)] p-5 shadow-xl">
+            <p className="mb-3 text-sm font-semibold text-foreground">Open With</p>
+            <input
+              autoFocus
+              placeholder="App name or path…"
+              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[var(--color-brand-cyan)]"
+              value={openWithApp}
+              onChange={(e) => setOpenWithApp(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && openWithApp.trim()) {
+                  if (openWithTarget.isLocal) handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
+                  else void invoke("sftp_open_remote", { sessionId: sftpSessionId, remotePath: openWithTarget.path })
+                    .then((tmp) => invoke("sftp_open_with_local", { path: tmp as string, app: openWithApp.trim() }).then(() => tmp))
+                    .then((tmp) => invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: openWithTarget.path }))
+                    .catch((e: unknown) => toast.error(String(e)));
+                  setOpenWithTarget(null);
+                  setOpenWithApp("");
+                }
+                if (e.key === "Escape") { setOpenWithTarget(null); setOpenWithApp(""); }
+              }}
+            />
+            <div className="mt-3 flex justify-end gap-2">
+              <button className="rounded px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground" onClick={() => { setOpenWithTarget(null); setOpenWithApp(""); }}>Cancel</button>
+              <button
+                className="rounded bg-[var(--color-brand-cyan)] px-3 py-1.5 text-xs font-medium text-black"
+                onClick={() => {
+                  if (openWithApp.trim()) {
+                    if (openWithTarget.isLocal) {
+                      handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
+                    } else {
+                      const app = openWithApp.trim();
+                      const target = openWithTarget;
+                      invoke<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: target.path })
+                        .then((tmp) => invoke("sftp_open_with_local", { path: tmp, app }).then(() => tmp))
+                        .then((tmp) => invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: target.path }))
+                        .catch((e: unknown) => toast.error(String(e)));
+                    }
+                  }
+                  setOpenWithTarget(null); setOpenWithApp("");
+                }}
+              >Open</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* New folder dialog */}
+      <SftpNewFolderDialog
+        open={newFolderTarget !== null}
+        onConfirm={(name) => {
+          if (newFolderTarget === "local") {
+            void invoke("sftp_mkdir_local", { path: `${localPath}/${name}` })
+              .then(() => loadLocalDir(localPath))
+              .catch((e: unknown) => toast.error(String(e)));
+          } else if (newFolderTarget === "remote" && remotePath) {
+            void invoke("sftp_mkdir_remote", { sessionId: sftpSessionId, path: `${remotePath}/${name}` })
+              .then(() => loadRemoteDir(remotePath))
+              .catch((e: unknown) => toast.error(String(e)));
+          }
+        }}
+        onClose={() => setNewFolderTarget(null)}
+      />
+
+      {/* Disconnect-during-transfer confirmation */}
+      <AlertDialog.Root open={!!deleteConfirm} onOpenChange={(open) => { if (!open) setDeleteConfirm(null); }}>
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/40" />
+          <AlertDialog.Content className="fixed left-1/2 top-1/2 z-50 w-96 -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-[var(--color-surface-2)] p-5 shadow-xl">
+            <AlertDialog.Title className="text-sm font-medium text-foreground">Delete</AlertDialog.Title>
+            <AlertDialog.Description className="mt-2 text-xs text-muted-foreground">
+              {deleteConfirm && deleteConfirm.targets.length === 1
+                ? <>Are you sure you want to delete <span className="font-medium text-foreground">"{deleteConfirm.label}"</span>? This action cannot be undone.</>
+                : <>Are you sure you want to delete <span className="font-medium text-foreground">{deleteConfirm?.label}</span>? This action cannot be undone.</>
+              }
+            </AlertDialog.Description>
+            <div className="mt-4 flex justify-end gap-2">
+              <AlertDialog.Cancel asChild>
+                <button className="rounded px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground">
+                  Cancel
+                </button>
+              </AlertDialog.Cancel>
+              <AlertDialog.Action asChild>
+                <button
+                  className="rounded bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500"
+                  onClick={() => {
+                    if (!deleteConfirm) return;
+                    if (deleteConfirm.isLocal) {
+                      handleDeleteLocal(deleteConfirm.targets);
+                    } else {
+                      void invoke("sftp_delete_remote", { sessionId: sftpSessionId, paths: deleteConfirm.targets })
+                        .then(() => remotePath && loadRemoteDir(remotePath))
+                        .catch((e: unknown) => toast.error(String(e)));
+                    }
+                    setDeleteConfirm(null);
+                  }}
+                >
+                  Delete
+                </button>
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
+
+      <AlertDialog.Root open={showDisconnectConfirm} onOpenChange={setShowDisconnectConfirm}>
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/40" />
+          <AlertDialog.Content className="fixed left-1/2 top-1/2 z-50 w-96 -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-[var(--color-surface-2)] p-5 shadow-xl">
+            <AlertDialog.Title className="text-sm font-medium text-foreground">Transfer in progress</AlertDialog.Title>
+            <AlertDialog.Description className="mt-2 text-xs text-muted-foreground">
+              Cancelling will interrupt the current transfer. This may leave a partial file on the remote server.
+            </AlertDialog.Description>
+            <div className="mt-4 flex justify-end gap-2">
+              <AlertDialog.Cancel asChild>
+                <button className="rounded px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground">
+                  Keep transferring
+                </button>
+              </AlertDialog.Cancel>
+              <AlertDialog.Action asChild>
+                <button
+                  className="rounded bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500"
+                  onClick={() => {
+                    void invoke("sftp_cancel_transfer", { sessionId: sftpSessionId });
+                    setShowDisconnectConfirm(false);
+                    performDisconnect();
+                  }}
+                >
+                  Cancel transfer &amp; disconnect
+                </button>
+              </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
     </div>
   );
 }
