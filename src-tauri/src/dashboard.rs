@@ -6,6 +6,12 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
+// ─── Internal type aliases ────────────────────────────────────────────────────
+
+/// Return type of `parse_container_cgroup`:
+/// (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu_ns, next_net)
+type CgroupStats = (f32, u64, u64, f64, f64, Option<u64>, Option<(u64, u64)>);
+
 // ─── Public types emitted to frontend ────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -379,7 +385,7 @@ pub(crate) fn parse_container_cgroup(
     prev_cpu_ns: Option<u64>,
     prev_net: Option<(u64, u64)>,
     poll_secs: f64,
-) -> (f32, u64, u64, f64, f64, Option<u64>, Option<(u64, u64)>) {
+) -> CgroupStats {
     let mut mem_used: u64 = 0;
     let mut mem_limit: u64 = u64::MAX;
     let mut cpu_usage_ns: u64 = 0;
@@ -520,16 +526,21 @@ struct ActorState {
     prev_total_ticks_for_proc: u64,      // aggregate CPU ticks at last process sample
 }
 
-fn run_actor(
-    app: AppHandle,
+struct ActorConfig {
     host_id: String,
     hostname: String,
     port: u16,
     user: String,
     password: Option<String>,
     key_path: Option<std::path::PathBuf>,
+}
+
+fn run_actor(
+    app: AppHandle,
+    cfg: ActorConfig,
     rx: std::sync::mpsc::Receiver<ActorCmd>,
 ) {
+    let ActorConfig { host_id, hostname, port, user, password, key_path } = cfg;
     // Initial connection
     let session = match ssh_connect(&hostname, port, &user, password.as_deref(), key_path.as_deref()) {
         Ok(s) => s,
@@ -762,7 +773,7 @@ fn collect_processes(state: &mut ActorState, num_cores: u32) -> Result<Vec<Proce
     let (cpu_raw, user_raw) = rest.split_once("===USER===\n").unwrap_or((rest, ""));
 
     // Aggregate CPU ticks for delta normalization
-    let total_ticks: u64 = cpu_raw.trim()
+    let total_ticks: u64 = cpu_raw
         .split_whitespace().skip(1)
         .filter_map(|v| v.parse::<u64>().ok())
         .take(7).sum();
@@ -840,6 +851,12 @@ pub struct DashboardManager {
     actors: HashMap<String, HostActor>,
 }
 
+impl Default for DashboardManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DashboardManager {
     pub fn new() -> Self {
         Self { actors: HashMap::new() }
@@ -884,7 +901,7 @@ pub fn spawn_host_actor(
 
     std::thread::Builder::new()
         .name(format!("dashboard-{}", host_id))
-        .spawn(move || run_actor(app, host_id, hostname, port, user, password, key_path, rx))
+        .spawn(move || run_actor(app, ActorConfig { host_id, hostname, port, user, password, key_path }, rx))
         .expect("dashboard actor thread spawn");
 
     HostActor { tx }

@@ -1,4 +1,6 @@
+mod crypto;
 mod hosts;
+mod vault;
 mod port_forwarding;
 mod pty_manager;
 mod sftp;
@@ -205,6 +207,62 @@ fn remove_host_group(app: tauri::AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn vault_status(app: tauri::AppHandle) -> Result<vault::VaultStatus, String> {
+    vault::op_status(&app)
+}
+
+#[tauri::command]
+fn vault_init(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
+    vault::op_init(&app, &master_password)
+}
+
+#[tauri::command]
+fn vault_unlock(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
+    vault::op_unlock(&app, &master_password)
+}
+
+#[tauri::command]
+fn vault_lock(app: tauri::AppHandle) {
+    vault::op_lock();
+    let _ = app.emit("vault-locked", ());
+}
+
+#[tauri::command]
+fn vault_change_master_password(
+    app: tauri::AppHandle,
+    old_password: String,
+    new_password: String,
+) -> Result<(), String> {
+    vault::op_change_master_password(&app, &old_password, &new_password)
+}
+
+#[tauri::command]
+fn get_vault_lock_policy(app: tauri::AppHandle) -> String {
+    let policy = vault::get_lock_policy(&app);
+    serde_json::to_string(&policy)
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_else(|_| "on_restart".to_string())
+}
+
+#[tauri::command]
+fn set_vault_lock_policy(app: tauri::AppHandle, policy: String) -> Result<(), String> {
+    let p: vault::LockPolicy = serde_json::from_str(&format!("\"{}\"", policy))
+        .map_err(|_| format!("Unknown lock policy: {policy}"))?;
+    vault::set_lock_policy(&app, p)
+}
+
+#[tauri::command]
+fn get_host_password(app: tauri::AppHandle, host_id: String) -> Result<Option<String>, String> {
+    let vault = hosts::list_hosts(&app)?;
+    let host = vault
+        .hosts
+        .iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| "Host not found".to_string())?;
+    Ok(hosts::decrypt_host_password(host))
+}
+
+#[tauri::command]
 async fn test_host_connection(
     app: tauri::AppHandle,
     request: TestHostConnectionRequest,
@@ -350,7 +408,7 @@ async fn sftp_connect_from_host(
         hostname: host.hostname.clone(),
         port: host.port,
         username: host.user.clone(),
-        password: host.password.clone(),
+        password: hosts::decrypt_host_password(&host),
         private_key_path,
         default_remote_path: host.default_sftp_path.clone(),
     };
@@ -546,7 +604,7 @@ fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
     let dest = p.parent()
         .ok_or("No parent dir")?
         .join(&new_name);
-    std::fs::rename(&p, &dest).map_err(|e| format!("Rename: {}", e))
+    std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
 }
 
 #[tauri::command]
@@ -778,7 +836,7 @@ async fn dashboard_connect(
             host.hostname.clone(),
             host.port,
             host.user.clone(),
-            host.password.clone(),
+            hosts::decrypt_host_password(host),
             key_path,
         );
 
@@ -838,6 +896,85 @@ fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
 }
 
+/// Global AppHandle for the screen-lock notification callback.
+/// Populated once in `start_screen_lock_monitor` before the observer is registered.
+#[cfg(target_os = "macos")]
+static SCREEN_LOCK_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// CoreFoundation callback fired when macOS emits `com.apple.screenIsLocked`.
+/// Runs on the main thread (the Cocoa run loop delivers it there).
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn screen_locked_callback(
+    _center: *mut std::ffi::c_void,
+    _observer: *const std::ffi::c_void,
+    _name: *mut std::ffi::c_void,
+    _object: *const std::ffi::c_void,
+    _user_info: *mut std::ffi::c_void,
+) {
+    eprintln!("[vault] screen lock notification received");
+    if let Some(app) = SCREEN_LOCK_APP.get() {
+        vault::on_screen_lock(app);
+    }
+}
+
+/// Registers for the `com.apple.screenIsLocked` Darwin distributed notification
+/// on the main thread so delivery uses the existing Cocoa run loop.
+///
+/// Unlike the old polling approach this fires only on a genuine lock transition,
+/// never on transient display-sleep states or polling races at startup.
+#[cfg(target_os = "macos")]
+fn start_screen_lock_monitor(app: tauri::AppHandle) {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    let _ = SCREEN_LOCK_APP.set(app.clone());
+
+    let _ = app.run_on_main_thread(|| unsafe {
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFNotificationCenterGetDistributedCenter() -> *mut c_void;
+            fn CFNotificationCenterAddObserver(
+                center: *mut c_void,
+                observer: *const c_void,
+                callback: unsafe extern "C" fn(
+                    *mut c_void,
+                    *const c_void,
+                    *mut c_void,
+                    *const c_void,
+                    *mut c_void,
+                ),
+                name: *mut c_void,
+                object: *const c_void,
+                suspension_behavior: isize,
+            );
+            fn CFStringCreateWithCString(
+                alloc: *const c_void,
+                c_str: *const i8,
+                encoding: u32,
+            ) -> *mut c_void;
+            fn CFRelease(cf: *const c_void);
+        }
+
+        let center = CFNotificationCenterGetDistributedCenter();
+        let name_bytes = b"com.apple.screenIsLocked\0";
+        let name = CFStringCreateWithCString(
+            ptr::null(),
+            name_bytes.as_ptr() as *const i8,
+            0x0800_0100u32, // kCFStringEncodingUTF8
+        );
+        // kCFNotificationSuspensionBehaviorDeliverImmediately = 4
+        CFNotificationCenterAddObserver(
+            center,
+            ptr::null(),
+            screen_locked_callback,
+            name,
+            ptr::null(),
+            4,
+        );
+        CFRelease(name as *const c_void); // AddObserver retains; we release our ref
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -873,6 +1010,14 @@ pub fn run() {
             remove_hosts,
             save_host_group,
             remove_host_group,
+            vault_status,
+            vault_init,
+            vault_unlock,
+            vault_lock,
+            vault_change_master_password,
+            get_vault_lock_policy,
+            set_vault_lock_policy,
+            get_host_password,
             test_host_connection,
             list_port_forwards,
             save_port_forward,
@@ -979,10 +1124,15 @@ pub fn run() {
                 let settings = MenuItemBuilder::with_id("open-settings", "Settings...")
                     .accelerator("CmdOrCtrl+,")
                     .build(app)?;
+                let lock_vault = MenuItemBuilder::with_id("lock-vault", "Lock Vault")
+                    .accelerator("CmdOrCtrl+Shift+L")
+                    .build(app)?;
 
                 let file_menu = SubmenuBuilder::new(app, "File")
                     .item(&new_terminal)
                     .item(&settings)
+                    .separator()
+                    .item(&lock_vault)
                     .separator()
                     .item(&PredefinedMenuItem::close_window(app, None)?)
                     .separator()
@@ -1022,6 +1172,10 @@ pub fn run() {
                     "open-settings" => {
                         let _ = open_settings_window_inner(&handle);
                     }
+                    "lock-vault" => {
+                        vault::op_lock();
+                        let _ = handle.emit("vault-locked", ());
+                    }
                     _ => {}
                 });
             }
@@ -1033,11 +1187,22 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // Try to unlock the vault silently using the keychain-cached master password,
+            // so a returning user on this device isn't prompted again.
+            let _ = vault::op_try_cached_unlock(app.handle());
+
+            // Start background screen-lock monitor (macOS only).
+            #[cfg(target_os = "macos")]
+            start_screen_lock_monitor(app.handle().clone());
+
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                vault::on_app_exit(app_handle);
+            }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
                 if !has_visible_windows {

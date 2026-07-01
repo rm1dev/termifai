@@ -135,6 +135,9 @@ import { SftpRenameDialog } from "./SftpRenameDialog";
 import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
 import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
+import { VaultGate } from "./VaultGate";
+import { vaultStatus, vaultLock, getHostPassword } from "@/lib/api/vault";
+import type { VaultStatus } from "@/lib/api/vault";
 import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
 
 const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = [
@@ -153,6 +156,9 @@ export function AppShell() {
   ]);
   const [activeTab, setActiveTab] = useState("t-term");
   const [activeSidebar, setActiveSidebar] = useState<SidebarKey>("hosts");
+  // Cached vault status; the Hosts view is gated by VaultGate until the vault
+  // is unlocked, rather than prompting with a modal on app startup.
+  const [vaultInfo, setVaultInfo] = useState<{ initialized: boolean; unlocked: boolean } | null>(null);
   const shortcutsRef = useRef<ShortcutMap>(loadShortcuts());
   const newTabRef = useRef<(kind: TabKind) => void>(null!);
 
@@ -184,6 +190,7 @@ export function AppShell() {
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
+    const resolvedPassword = await getHostPassword(host.id).catch(() => null);
     setTabs((currentTabs) => {
       const existingCount = currentTabs.filter((t) => t.hostId === host.id).length;
       const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
@@ -195,7 +202,7 @@ export function AppShell() {
           title,
           closable: true,
           initialCommand: command,
-          initialPassword: host.password,
+          initialPassword: resolvedPassword ?? undefined,
           readyMarker,
           connectionLabel: `${host.user}@${host.hostname}:${host.port}`,
           connectionTitle: host.name || host.hostname,
@@ -266,6 +273,33 @@ export function AppShell() {
   };
 
   useEffect(() => {
+    const refreshVault = () =>
+      vaultStatus()
+        .then((status: VaultStatus) => {
+          setVaultInfo({ initialized: status.initialized, unlocked: status.unlocked });
+        })
+        .catch(console.error);
+
+    void refreshVault();
+
+    // Backend locks the vault on screen lock (per policy); re-gate immediately.
+    const unlistenPromise = listen("vault-locked", () => {
+      setVaultInfo((prev) => ({ initialized: prev?.initialized ?? true, unlocked: false }));
+    });
+
+    // Fallback: re-check status whenever the window regains focus, so returning
+    // from a locked screen re-gates even if the event was missed.
+    const onFocus = () => void refreshVault();
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      void unlistenPromise.then((un) => un());
+      window.removeEventListener("focus", onFocus);
+    };
+  }, []);
+
+
+  useEffect(() => {
     newTabRef.current = newTab;
   });
 
@@ -322,6 +356,9 @@ export function AppShell() {
         invoke("open_settings_window").catch((err) =>
           console.error("open_settings_window failed:", err)
         );
+      } else if (isShortcutMatch(event, shortcuts["lock-vault"])) {
+        event.preventDefault();
+        vaultLock().catch((err) => console.error("vault_lock failed:", err));
       }
     };
 
@@ -403,25 +440,34 @@ export function AppShell() {
               className="min-w-0 flex-1"
             >
             {t.kind === "vaults" && (
-              <>
-                <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
-                <main className="flex min-w-0 flex-1 flex-col">
-                  {activeSidebar === "dashboard" && <DashboardView />}
-                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
-                  {activeSidebar === "port-forwarding" && <PortForwardingView />}
-                  {activeSidebar === "snippets" && <SnippetsView />}
-                  {activeSidebar === "ssh-keys" && <SshKeysView />}
-                  {activeSidebar === "logs" && (
-                    <EmptyState icon={ClipboardList} title="Connection logs" subtitle="Audit of recent sessions, transfers and tunnels." />
-                  )}
-                </main>
-              </>
+              vaultInfo && !vaultInfo.unlocked ? (
+                <VaultGate
+                  initialized={vaultInfo.initialized}
+                  active={t.id === activeTab}
+                  onUnlocked={() => setVaultInfo({ initialized: true, unlocked: true })}
+                />
+              ) : (
+                <>
+                  <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
+                  <main className="flex min-w-0 flex-1 flex-col">
+                    {activeSidebar === "dashboard" && <DashboardView />}
+                    {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
+                    {activeSidebar === "port-forwarding" && <PortForwardingView />}
+                    {activeSidebar === "snippets" && <SnippetsView />}
+                    {activeSidebar === "ssh-keys" && <SshKeysView />}
+                    {activeSidebar === "logs" && (
+                      <EmptyState icon={ClipboardList} title="Connection logs" subtitle="Audit of recent sessions, transfers and tunnels." />
+                    )}
+                  </main>
+                </>
+              )
             )}
             {t.kind === "sftp" && <SftpView tab={t} />}
           </div>
           ) : null
         )}
       </div>
+
     </div>
   );
 }
@@ -553,6 +599,11 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
         <DropdownMenuItem onSelect={() => void invoke("open_settings_window")}>
           Settings
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => void vaultLock()}>
+          Lock Vault
+          <span className="ml-auto text-xs text-muted-foreground">Ctrl+Shift+L</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => void win.setFullscreen(!isFullscreen)}>
