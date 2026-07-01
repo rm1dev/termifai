@@ -135,8 +135,7 @@ import { SftpRenameDialog } from "./SftpRenameDialog";
 import { SftpPermissionsDialog } from "./SftpPermissionsDialog";
 import { SftpEmptyContextMenu } from "./SftpEmptyContextMenu";
 import { SftpNewFolderDialog } from "./SftpNewFolderDialog";
-import { VaultSetupDialog } from "./VaultSetupDialog";
-import { VaultUnlockDialog } from "./VaultUnlockDialog";
+import { VaultGate } from "./VaultGate";
 import { vaultStatus, getHostPassword } from "@/lib/api/vault";
 import type { VaultStatus } from "@/lib/api/vault";
 import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
@@ -157,10 +156,8 @@ export function AppShell() {
   ]);
   const [activeTab, setActiveTab] = useState("t-term");
   const [activeSidebar, setActiveSidebar] = useState<SidebarKey>("hosts");
-  const [vaultDialogState, setVaultDialogState] = useState<"none" | "setup" | "unlock">("none");
-  // Cached vault status; the setup/unlock dialog is deferred until the user
-  // actually opens the Hosts view (where host passwords are needed), rather
-  // than prompting on app startup.
+  // Cached vault status; the Hosts view is gated by VaultGate until the vault
+  // is unlocked, rather than prompting with a modal on app startup.
   const [vaultInfo, setVaultInfo] = useState<{ initialized: boolean; unlocked: boolean } | null>(null);
   const shortcutsRef = useRef<ShortcutMap>(loadShortcuts());
   const newTabRef = useRef<(kind: TabKind) => void>(null!);
@@ -283,15 +280,6 @@ export function AppShell() {
       .catch(console.error);
   }, []);
 
-  // Whether the currently visible view is the Hosts list (inside the vaults tab).
-  const activeTabObj = tabs.find((t) => t.id === activeTab);
-  const viewingHosts = activeTabObj?.kind === "vaults" && activeSidebar === "hosts";
-
-  // Prompt for setup/unlock only once the user opens the Hosts view.
-  useEffect(() => {
-    if (!vaultInfo || vaultInfo.unlocked || !viewingHosts) return;
-    setVaultDialogState(vaultInfo.initialized ? "unlock" : "setup");
-  }, [viewingHosts, vaultInfo]);
 
   useEffect(() => {
     newTabRef.current = newTab;
@@ -435,7 +423,16 @@ export function AppShell() {
                 <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
                 <main className="flex min-w-0 flex-1 flex-col">
                   {activeSidebar === "dashboard" && <DashboardView />}
-                  {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
+                  {activeSidebar === "hosts" && (
+                    vaultInfo && !vaultInfo.unlocked ? (
+                      <VaultGate
+                        initialized={vaultInfo.initialized}
+                        onUnlocked={() => setVaultInfo({ initialized: true, unlocked: true })}
+                      />
+                    ) : (
+                      <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />
+                    )
+                  )}
                   {activeSidebar === "port-forwarding" && <PortForwardingView />}
                   {activeSidebar === "snippets" && <SnippetsView />}
                   {activeSidebar === "ssh-keys" && <SshKeysView />}
@@ -451,29 +448,6 @@ export function AppShell() {
         )}
       </div>
 
-      {/* Vault dialogs — shown when the user opens the Hosts view, not on startup */}
-      <VaultSetupDialog
-        open={vaultDialogState === "setup"}
-        onSuccess={() => {
-          setVaultDialogState("none");
-          setVaultInfo({ initialized: true, unlocked: true });
-        }}
-        onCancel={() => {
-          setVaultDialogState("none");
-          setActiveSidebar("dashboard");
-        }}
-      />
-      <VaultUnlockDialog
-        open={vaultDialogState === "unlock"}
-        onSuccess={() => {
-          setVaultDialogState("none");
-          setVaultInfo((prev) => ({ initialized: prev?.initialized ?? true, unlocked: true }));
-        }}
-        onCancel={() => {
-          setVaultDialogState("none");
-          setActiveSidebar("dashboard");
-        }}
-      />
     </div>
   );
 }
