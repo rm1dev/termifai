@@ -910,6 +910,7 @@ unsafe extern "C" fn screen_locked_callback(
     _object: *const std::ffi::c_void,
     _user_info: *mut std::ffi::c_void,
 ) {
+    eprintln!("[vault] screen lock notification received");
     if let Some(app) = SCREEN_LOCK_APP.get() {
         vault::on_screen_lock(app);
     }
