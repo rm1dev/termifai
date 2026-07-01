@@ -27,7 +27,7 @@ import {
   type TerminalFont,
 } from "@/lib/terminal-appearance";
 import { toast } from "sonner";
-import { vaultStatus, vaultLock, vaultChangeMasterPassword, getLockPolicy, setLockPolicy } from "@/lib/api/vault";
+import { vaultStatus, vaultChangeMasterPassword, getLockPolicy, setLockPolicy } from "@/lib/api/vault";
 import type { VaultStatus, LockPolicy } from "@/lib/api/vault";
 import {
   appThemes,
@@ -62,11 +62,17 @@ export function SettingsWindow() {
   const [pwLoading, setPwLoading] = useState(false);
 
   useEffect(() => {
-    vaultStatus().then((s) => {
-      setVaultSt(s);
-      setLockPolicyState(s.lockPolicy);
-    }).catch(console.error);
+    const refresh = () => {
+      vaultStatus().then((s) => {
+        setVaultSt(s);
+        setLockPolicyState(s.lockPolicy);
+      }).catch(console.error);
+    };
+    refresh();
     getLockPolicy().then(setLockPolicyState).catch(console.error);
+    // Reflect lock/unlock changes made from the main window.
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
   }, []);
 
   const handleSetLockPolicy = async (policy: LockPolicy) => {
@@ -74,16 +80,6 @@ export function SettingsWindow() {
       await setLockPolicy(policy);
       setLockPolicyState(policy);
       toast.success("Lock policy updated");
-    } catch (e: unknown) {
-      toast.error(String(e));
-    }
-  };
-
-  const handleLock = async () => {
-    try {
-      await vaultLock();
-      setVaultSt((s) => (s ? { ...s, unlocked: false } : s));
-      toast.success("Vault locked");
     } catch (e: unknown) {
       toast.error(String(e));
     }
@@ -451,8 +447,20 @@ export function SettingsWindow() {
           </TabsContent>
 
           <TabsContent value="security" className="mt-4 space-y-4 pb-10">
+            {/* Vault must be unlocked to access these settings */}
+            {vaultSt?.initialized && !vaultSt.unlocked && (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-sm">Vault Locked</CardTitle>
+                  <CardDescription className="text-xs">
+                    Unlock the vault from the Hosts tab to change these settings.
+                  </CardDescription>
+                </CardHeader>
+              </Card>
+            )}
+
             {/* Lock Policy */}
-            {vaultSt?.initialized && (
+            {vaultSt?.initialized && vaultSt.unlocked && (
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">Ask for Master Password</CardTitle>
@@ -508,28 +516,7 @@ export function SettingsWindow() {
               </Card>
             )}
 
-            {vaultSt?.initialized && (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">Vault Status</CardTitle>
-                  <CardDescription className="text-xs">
-                    {vaultSt.unlocked ? "Vault is unlocked." : "Vault is locked."}
-                  </CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    disabled={!vaultSt.unlocked}
-                    onClick={() => void handleLock()}
-                  >
-                    Lock Vault
-                  </Button>
-                </CardContent>
-              </Card>
-            )}
-
-            {vaultSt?.initialized && (
+            {vaultSt?.initialized && vaultSt.unlocked && (
               <Card>
                 <CardHeader>
                   <CardTitle className="text-sm">Change Master Password</CardTitle>
