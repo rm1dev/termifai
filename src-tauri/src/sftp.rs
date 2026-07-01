@@ -208,7 +208,7 @@ impl SftpManager {
                 let is_dir = stat.file_type().is_dir();
                 let is_symlink = stat.file_type().is_symlink();
                 let size = if is_dir { None } else { Some(stat.size.unwrap_or(0)) };
-                let modified = stat.mtime.map(|t| format_unix_timestamp(t as u64));
+                let modified = stat.mtime.map(format_unix_timestamp);
                 Some(RemoteFileEntry {
                     name,
                     path: pb.to_string_lossy().to_string(),
@@ -531,16 +531,22 @@ mod tests {
 
     #[test]
     fn test_download_no_session_returns_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         let manager = SftpManager::new();
-        let result = manager.download_file("nonexistent", "/remote/file.txt", "/tmp/out.txt", |_| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = manager.download_file("nonexistent", "/remote/file.txt", "/tmp/out.txt", cancel, |_| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
 
     #[test]
     fn test_upload_no_session_returns_error() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
         let manager = SftpManager::new();
-        let result = manager.upload_file("nonexistent", "/tmp/local.txt", "/remote/file.txt", |_| {});
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = manager.upload_file("nonexistent", "/tmp/local.txt", "/remote/file.txt", cancel, |_| {});
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
