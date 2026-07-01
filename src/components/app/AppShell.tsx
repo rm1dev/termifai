@@ -158,6 +158,10 @@ export function AppShell() {
   const [activeTab, setActiveTab] = useState("t-term");
   const [activeSidebar, setActiveSidebar] = useState<SidebarKey>("hosts");
   const [vaultDialogState, setVaultDialogState] = useState<"none" | "setup" | "unlock">("none");
+  // Cached vault status; the setup/unlock dialog is deferred until the user
+  // actually opens the Hosts view (where host passwords are needed), rather
+  // than prompting on app startup.
+  const [vaultInfo, setVaultInfo] = useState<{ initialized: boolean; unlocked: boolean } | null>(null);
   const shortcutsRef = useRef<ShortcutMap>(loadShortcuts());
   const newTabRef = useRef<(kind: TabKind) => void>(null!);
 
@@ -274,14 +278,20 @@ export function AppShell() {
   useEffect(() => {
     vaultStatus()
       .then((status: VaultStatus) => {
-        if (!status.initialized) {
-          setVaultDialogState("setup");
-        } else if (!status.unlocked) {
-          setVaultDialogState("unlock");
-        }
+        setVaultInfo({ initialized: status.initialized, unlocked: status.unlocked });
       })
       .catch(console.error);
   }, []);
+
+  // Whether the currently visible view is the Hosts list (inside the vaults tab).
+  const activeTabObj = tabs.find((t) => t.id === activeTab);
+  const viewingHosts = activeTabObj?.kind === "vaults" && activeSidebar === "hosts";
+
+  // Prompt for setup/unlock only once the user opens the Hosts view.
+  useEffect(() => {
+    if (!vaultInfo || vaultInfo.unlocked || !viewingHosts) return;
+    setVaultDialogState(vaultInfo.initialized ? "unlock" : "setup");
+  }, [viewingHosts, vaultInfo]);
 
   useEffect(() => {
     newTabRef.current = newTab;
@@ -441,14 +451,28 @@ export function AppShell() {
         )}
       </div>
 
-      {/* Vault dialogs — shown on startup if vault needs setup or unlock */}
+      {/* Vault dialogs — shown when the user opens the Hosts view, not on startup */}
       <VaultSetupDialog
         open={vaultDialogState === "setup"}
-        onSuccess={() => setVaultDialogState("none")}
+        onSuccess={() => {
+          setVaultDialogState("none");
+          setVaultInfo({ initialized: true, unlocked: true });
+        }}
+        onCancel={() => {
+          setVaultDialogState("none");
+          setActiveSidebar("dashboard");
+        }}
       />
       <VaultUnlockDialog
         open={vaultDialogState === "unlock"}
-        onSuccess={() => setVaultDialogState("none")}
+        onSuccess={() => {
+          setVaultDialogState("none");
+          setVaultInfo((prev) => ({ initialized: prev?.initialized ?? true, unlocked: true }));
+        }}
+        onCancel={() => {
+          setVaultDialogState("none");
+          setActiveSidebar("dashboard");
+        }}
       />
     </div>
   );
