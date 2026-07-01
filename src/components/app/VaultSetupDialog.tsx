@@ -7,9 +7,10 @@ import { ShieldCheck } from "lucide-react";
 interface VaultSetupDialogProps {
   open: boolean;
   onSuccess: () => void;
+  onCancel: () => void;
 }
 
-export function VaultSetupDialog({ open, onSuccess }: VaultSetupDialogProps) {
+export function VaultSetupDialog({ open, onSuccess, onCancel }: VaultSetupDialogProps) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -37,13 +38,11 @@ export function VaultSetupDialog({ open, onSuccess }: VaultSetupDialogProps) {
   };
 
   return (
-    <Dialog.Root open={open} onOpenChange={() => {}}>
+    <Dialog.Root open={open} onOpenChange={(next) => { if (!next) onCancel(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm" />
         <Dialog.Content
           className="fixed left-1/2 top-1/2 z-50 w-96 -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-[var(--color-surface)] p-6 shadow-xl focus:outline-none"
-          onEscapeKeyDown={(e) => e.preventDefault()}
-          onPointerDownOutside={(e) => e.preventDefault()}
         >
           <div className="mb-5 flex items-center gap-3">
             <ShieldCheck className="h-5 w-5 text-[var(--color-brand-cyan)]" />
@@ -78,7 +77,10 @@ export function VaultSetupDialog({ open, onSuccess }: VaultSetupDialogProps) {
             />
           </div>
           {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
-          <div className="mt-5 flex justify-end">
+          <div className="mt-5 flex justify-end gap-2">
+            <Button size="sm" variant="ghost" onClick={onCancel} disabled={loading}>
+              Cancel
+            </Button>
             <Button size="sm" onClick={() => void handleCreate()} disabled={loading}>
               {loading ? "Creating…" : "Create Vault"}
             </Button>

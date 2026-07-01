@@ -7,9 +7,10 @@ import { LockKeyhole } from "lucide-react";
 interface VaultUnlockDialogProps {
   open: boolean;
   onSuccess: () => void;
+  onCancel: () => void;
 }
 
-export function VaultUnlockDialog({ open, onSuccess }: VaultUnlockDialogProps) {
+export function VaultUnlockDialog({ open, onSuccess, onCancel }: VaultUnlockDialogProps) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -29,13 +30,11 @@ export function VaultUnlockDialog({ open, onSuccess }: VaultUnlockDialogProps) {
   };
 
   return (
-    <Dialog.Root open={open} onOpenChange={() => {}}>
+    <Dialog.Root open={open} onOpenChange={(next) => { if (!next) onCancel(); }}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm" />
         <Dialog.Content
           className="fixed left-1/2 top-1/2 z-50 w-80 -translate-x-1/2 -translate-y-1/2 rounded-xl border border-border bg-[var(--color-surface)] p-6 shadow-xl focus:outline-none"
-          onEscapeKeyDown={(e) => e.preventDefault()}
-          onPointerDownOutside={(e) => e.preventDefault()}
         >
           <div className="mb-5 flex items-center gap-3">
             <LockKeyhole className="h-5 w-5 text-[var(--color-brand-cyan)]" />
@@ -58,7 +57,10 @@ export function VaultUnlockDialog({ open, onSuccess }: VaultUnlockDialogProps) {
             }}
           />
           {error && <p className="mt-2 text-xs text-red-400">{error}</p>}
-          <div className="mt-5 flex justify-end">
+          <div className="mt-5 flex justify-end gap-2">
+            <Button size="sm" variant="ghost" onClick={onCancel} disabled={loading}>
+              Cancel
+            </Button>
             <Button size="sm" onClick={() => void handleUnlock()} disabled={loading}>
               {loading ? "Unlocking…" : "Unlock"}
             </Button>
