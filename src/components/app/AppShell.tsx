@@ -419,28 +419,26 @@ export function AppShell() {
               className="min-w-0 flex-1"
             >
             {t.kind === "vaults" && (
-              <>
-                <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
-                <main className="flex min-w-0 flex-1 flex-col">
-                  {activeSidebar === "dashboard" && <DashboardView />}
-                  {activeSidebar === "hosts" && (
-                    vaultInfo && !vaultInfo.unlocked ? (
-                      <VaultGate
-                        initialized={vaultInfo.initialized}
-                        onUnlocked={() => setVaultInfo({ initialized: true, unlocked: true })}
-                      />
-                    ) : (
-                      <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />
-                    )
-                  )}
-                  {activeSidebar === "port-forwarding" && <PortForwardingView />}
-                  {activeSidebar === "snippets" && <SnippetsView />}
-                  {activeSidebar === "ssh-keys" && <SshKeysView />}
-                  {activeSidebar === "logs" && (
-                    <EmptyState icon={ClipboardList} title="Connection logs" subtitle="Audit of recent sessions, transfers and tunnels." />
-                  )}
-                </main>
-              </>
+              vaultInfo && !vaultInfo.unlocked ? (
+                <VaultGate
+                  initialized={vaultInfo.initialized}
+                  onUnlocked={() => setVaultInfo({ initialized: true, unlocked: true })}
+                />
+              ) : (
+                <>
+                  <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
+                  <main className="flex min-w-0 flex-1 flex-col">
+                    {activeSidebar === "dashboard" && <DashboardView />}
+                    {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
+                    {activeSidebar === "port-forwarding" && <PortForwardingView />}
+                    {activeSidebar === "snippets" && <SnippetsView />}
+                    {activeSidebar === "ssh-keys" && <SshKeysView />}
+                    {activeSidebar === "logs" && (
+                      <EmptyState icon={ClipboardList} title="Connection logs" subtitle="Audit of recent sessions, transfers and tunnels." />
+                    )}
+                  </main>
+                </>
+              )
             )}
             {t.kind === "sftp" && <SftpView tab={t} />}
           </div>
