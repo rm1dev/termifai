@@ -70,9 +70,17 @@ export function SettingsWindow() {
     };
     refresh();
     getLockPolicy().then(setLockPolicyState).catch(console.error);
-    // Reflect lock/unlock changes made from the main window.
-    window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
+    // The settings window is reused (shown/hidden), so the component mounts
+    // once while the vault is still locked. Refresh whenever the window
+    // regains focus to reflect lock/unlock changes made from the main window.
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        if (focused) refresh();
+      })
+      .then((fn) => { unlisten = fn; })
+      .catch(console.error);
+    return () => unlisten?.();
   }, []);
 
   const handleSetLockPolicy = async (policy: LockPolicy) => {
