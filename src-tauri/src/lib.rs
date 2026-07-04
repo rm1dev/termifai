@@ -1,8 +1,13 @@
+mod crypto;
 mod hosts;
+mod vault;
 mod port_forwarding;
 mod pty_manager;
+mod sftp;
 mod snippets;
 mod ssh_keys;
+pub mod dashboard;
+use dashboard::DashboardManager;
 
 use hosts::{
     Host, HostGroup, HostsVault, SaveHostGroupRequest, SaveHostRequest, TestHostConnectionRequest,
@@ -12,10 +17,31 @@ use port_forwarding::{
     PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus,
 };
 use pty_manager::{PtyManager, TabInfo};
+use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
+use serde::Serialize;
+
+#[derive(Serialize, Clone)]
+struct SftpConnectEvent {
+    stage: String,
+    message: String,
+}
+
+#[derive(Serialize, Clone)]
+struct SftpConnectDone {
+    ok: bool,
+    remote_path: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct SftpTransferDone {
+    ok: bool,
+    error: Option<String>,
+}
 use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -26,6 +52,10 @@ static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(0);
 struct AppState {
     pty_manager: Mutex<PtyManager>,
     tunnel_manager: TunnelManagerState,
+    sftp_manager: Mutex<SftpManager>,
+    watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
+    transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+    dashboard_manager: Mutex<DashboardManager>,
 }
 
 #[tauri::command]
@@ -177,6 +207,62 @@ fn remove_host_group(app: tauri::AppHandle, id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn vault_status(app: tauri::AppHandle) -> Result<vault::VaultStatus, String> {
+    vault::op_status(&app)
+}
+
+#[tauri::command]
+fn vault_init(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
+    vault::op_init(&app, &master_password)
+}
+
+#[tauri::command]
+fn vault_unlock(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
+    vault::op_unlock(&app, &master_password)
+}
+
+#[tauri::command]
+fn vault_lock(app: tauri::AppHandle) {
+    vault::op_lock();
+    let _ = app.emit("vault-locked", ());
+}
+
+#[tauri::command]
+fn vault_change_master_password(
+    app: tauri::AppHandle,
+    old_password: String,
+    new_password: String,
+) -> Result<(), String> {
+    vault::op_change_master_password(&app, &old_password, &new_password)
+}
+
+#[tauri::command]
+fn get_vault_lock_policy(app: tauri::AppHandle) -> String {
+    let policy = vault::get_lock_policy(&app);
+    serde_json::to_string(&policy)
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_else(|_| "on_restart".to_string())
+}
+
+#[tauri::command]
+fn set_vault_lock_policy(app: tauri::AppHandle, policy: String) -> Result<(), String> {
+    let p: vault::LockPolicy = serde_json::from_str(&format!("\"{}\"", policy))
+        .map_err(|_| format!("Unknown lock policy: {policy}"))?;
+    vault::set_lock_policy(&app, p)
+}
+
+#[tauri::command]
+fn get_host_password(app: tauri::AppHandle, host_id: String) -> Result<Option<String>, String> {
+    let vault = hosts::list_hosts(&app)?;
+    let host = vault
+        .hosts
+        .iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| "Host not found".to_string())?;
+    Ok(hosts::decrypt_host_password(host))
+}
+
+#[tauri::command]
 async fn test_host_connection(
     app: tauri::AppHandle,
     request: TestHostConnectionRequest,
@@ -295,8 +381,598 @@ fn run_snippet_script(
 }
 
 #[tauri::command]
+async fn sftp_connect_from_host(
+    app: tauri::AppHandle,
+    host_id: String,
+    session_id: String,
+) -> Result<(), String> {
+    // Resolve credentials synchronously (fast local file reads) before spawning
+    let vault = hosts::list_hosts(&app)?;
+    let host = vault
+        .hosts
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| format!("Host '{}' not found", host_id))?;
+
+    let private_key_path = if let Some(key_id) = &host.ssh_key_id {
+        let keys = ssh_keys::list_ssh_keys(&app)?;
+        keys.into_iter()
+            .find(|k| &k.id == key_id)
+            .map(|k| k.private_key_path)
+    } else {
+        None
+    };
+
+    let request = SftpConnectRequest {
+        session_id: session_id.clone(),
+        hostname: host.hostname.clone(),
+        port: host.port,
+        username: host.user.clone(),
+        password: hosts::decrypt_host_password(&host),
+        private_key_path,
+        default_remote_path: host.default_sftp_path.clone(),
+    };
+
+    // Spawn blocking work in background — command returns immediately so the
+    // loading screen appears before any network round-trips begin.
+    let app_bg = app.clone();
+    tokio::spawn(async move {
+        let app_inner = app_bg.clone();
+        let sid = session_id.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            let app_log = app_inner.clone();
+            let sid_log = sid.clone();
+            let log = move |stage: &str, msg: &str| {
+                let _ = app_log.emit(
+                    &format!("sftp:{}:connect", sid_log),
+                    SftpConnectEvent { stage: stage.to_string(), message: msg.to_string() },
+                );
+            };
+            let state = app_inner.state::<AppState>();
+            let mut manager = state.sftp_manager.lock().unwrap();
+            manager.connect(request, log)
+        })
+        .await;
+
+        let done = match result {
+            Ok(Ok(info)) => SftpConnectDone { ok: true, remote_path: Some(info.remote_path), error: None },
+            Ok(Err(e)) => SftpConnectDone { ok: false, remote_path: None, error: Some(e) },
+            Err(e) => SftpConnectDone { ok: false, remote_path: None, error: Some(format!("Task panic: {e}")) },
+        };
+        let _ = app_bg.emit(&format!("sftp:{}:done", session_id), done);
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_list_local(path: String) -> Result<Vec<LocalFileEntry>, String> {
+    sftp::list_local(&path)
+}
+
+#[tauri::command]
+fn sftp_list_remote(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+) -> Result<Vec<RemoteFileEntry>, String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.list_remote(&session_id, &path)
+}
+
+#[tauri::command]
+async fn sftp_download(
+    app: tauri::AppHandle,
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    let app_bg = app.clone();
+    let sid = session_id.clone();
+    let cancel_flag = {
+        let state = app.state::<AppState>();
+        let mut flags = state.transfer_cancel_flags.lock().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        flags.insert(session_id.clone(), Arc::clone(&flag));
+        flag
+    };
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let app_prog = app_bg.clone();
+            let sid_prog = sid.clone();
+            let state = app_bg.state::<AppState>();
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.download_file(&sid, &remote_path, &local_path, Arc::clone(&cancel_flag), move |progress| {
+                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+            })
+        })
+        .await;
+        let state = app.state::<AppState>();
+        state.transfer_cancel_flags.lock().unwrap().remove(&session_id);
+        let done = match result {
+            Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
+            Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
+            Err(e) => SftpTransferDone { ok: false, error: Some(format!("Task panic: {e}")) },
+        };
+        let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn sftp_upload(
+    app: tauri::AppHandle,
+    session_id: String,
+    local_path: String,
+    remote_path: String,
+) -> Result<(), String> {
+    let app_bg = app.clone();
+    let sid = session_id.clone();
+    let cancel_flag = {
+        let state = app.state::<AppState>();
+        let mut flags = state.transfer_cancel_flags.lock().unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        flags.insert(session_id.clone(), Arc::clone(&flag));
+        flag
+    };
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let app_prog = app_bg.clone();
+            let sid_prog = sid.clone();
+            let state = app_bg.state::<AppState>();
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.upload_file(&sid, &local_path, &remote_path, Arc::clone(&cancel_flag), move |progress| {
+                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+            })
+        })
+        .await;
+        let state = app.state::<AppState>();
+        state.transfer_cancel_flags.lock().unwrap().remove(&session_id);
+        let done = match result {
+            Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
+            Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
+            Err(e) => SftpTransferDone { ok: false, error: Some(format!("Task panic: {e}")) },
+        };
+        let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_delete_remote(
+    state: State<AppState>,
+    session_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.delete_remote(&session_id, &paths)
+}
+
+#[tauri::command]
+fn sftp_rename_remote(
+    state: State<AppState>,
+    session_id: String,
+    from_path: String,
+    to_path: String,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.rename_remote(&session_id, &from_path, &to_path)
+}
+
+#[tauri::command]
+fn sftp_mkdir_remote(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.mkdir_remote(&session_id, &path)
+}
+
+#[tauri::command]
+fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), String> {
+    let mut manager = state.sftp_manager.lock().unwrap();
+    manager.disconnect(&session_id)
+}
+
+#[tauri::command]
+fn sftp_cancel_transfer(
+    state: State<AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let flags = state.transfer_cancel_flags.lock().unwrap();
+    if let Some(flag) = flags.get(&session_id) {
+        flag.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_stat_remote(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+) -> Result<sftp::RemoteStatResult, String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.stat_remote(&session_id, &path)
+}
+
+#[tauri::command]
+fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    let dest = p.parent()
+        .ok_or("No parent dir")?
+        .join(&new_name);
+    std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
+}
+
+#[tauri::command]
+fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
+    for path in &paths {
+        let p = std::path::Path::new(path);
+        if p.is_dir() {
+            std::fs::remove_dir_all(p).map_err(|e| format!("Delete dir '{}': {}", path, e))?;
+        } else {
+            std::fs::remove_file(p).map_err(|e| format!("Delete '{}': {}", path, e))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_mkdir_local(path: String) -> Result<(), String> {
+    std::fs::create_dir_all(&path)
+        .map_err(|e| format!("Create dir '{}': {}", path, e))
+}
+
+#[tauri::command]
+fn sftp_copy_local(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
+    let dest = std::path::Path::new(&dest_dir);
+    for path in &paths {
+        let src = std::path::Path::new(path);
+        let name = src.file_name().ok_or("No file name")?;
+        let target = dest.join(name);
+        if src.is_dir() {
+            copy_dir_all(src, &target).map_err(|e| format!("Copy dir '{}': {}", path, e))?;
+        } else {
+            std::fs::copy(src, &target).map_err(|e| format!("Copy '{}': {}", path, e))?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_open_local(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("cmd").args(["/c", "start", "", &path]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    return Err("Platform not supported for open_local".to_string());
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_open_with_local(path: String, app: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").args(["-a", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    std::process::Command::new(&app).arg(&path).spawn().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    std::process::Command::new("cmd").args(["/c", "start", "", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    return Err("Platform not supported for open_with_local".to_string());
+    Ok(())
+}
+
+#[derive(Serialize, Clone)]
+struct SftpFileChangedEvent {
+    tmp_path: String,
+    remote_path: String,
+}
+
+#[tauri::command]
+async fn sftp_open_remote(
+    _app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    remote_path: String,
+) -> Result<String, String> {
+    let tmp_path = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.open_remote(&session_id, &remote_path)?
+    };
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(&tmp_path).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(&tmp_path).spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd").args(["/c", "start", "", &tmp_path]).spawn();
+    Ok(tmp_path)
+}
+
+#[tauri::command]
+async fn sftp_watch_remote(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    tmp_path: String,
+    remote_path: String,
+) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    {
+        let mut handles = state.watch_handles.lock().unwrap();
+        // Cancel any existing watch for this tmp_path
+        if let Some(old_tx) = handles.remove(&tmp_path) {
+            let _ = old_tx.send(());
+        }
+        handles.insert(tmp_path.clone(), tx);
+    }
+    let app_bg = app.clone();
+    let sid = session_id.clone();
+    let tp = tmp_path.clone();
+    let rp = remote_path.clone();
+    tokio::spawn(async move {
+        let initial_mtime = std::fs::metadata(&tp)
+            .and_then(|m| m.modified())
+            .ok();
+        let mut last_mtime = initial_mtime;
+        let mut rx = rx;
+        loop {
+            tokio::select! {
+                _ = &mut rx => break,
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                    let current = std::fs::metadata(&tp).and_then(|m| m.modified()).ok();
+                    if current != last_mtime && current.is_some() {
+                        last_mtime = current;
+                        let _ = app_bg.emit(
+                            &format!("sftp:{}:file-changed", sid),
+                            SftpFileChangedEvent { tmp_path: tp.clone(), remote_path: rp.clone() },
+                        );
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_stop_watch(
+    state: State<AppState>,
+    tmp_path: String,
+) -> Result<(), String> {
+    let mut handles = state.watch_handles.lock().unwrap();
+    if let Some(tx) = handles.remove(&tmp_path) {
+        let _ = tx.send(());
+    }
+    let _ = std::fs::remove_file(&tmp_path);
+    Ok(())
+}
+
+#[tauri::command]
+fn sftp_chmod(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+    mode: String,
+    recursive: bool,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.chmod(&session_id, &path, &mode, recursive)
+}
+
+#[tauri::command]
+fn sftp_chown(
+    state: State<AppState>,
+    session_id: String,
+    path: String,
+    user: String,
+    group: String,
+    recursive: bool,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.chown(&session_id, &path, &user, &group, recursive)
+}
+
+#[tauri::command]
+fn sftp_copy_remote(
+    state: State<AppState>,
+    session_id: String,
+    paths: Vec<String>,
+    dest_dir: String,
+) -> Result<(), String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.copy_remote(&session_id, &paths, &dest_dir)
+}
+
+#[tauri::command]
+fn sftp_get_users_groups(
+    state: State<AppState>,
+    session_id: String,
+) -> Result<sftp::UsersGroups, String> {
+    let manager = state.sftp_manager.lock().unwrap();
+    manager.get_users_groups(&session_id)
+}
+
+#[tauri::command]
+async fn dashboard_connect(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    host_ids: Vec<String>,
+) -> Result<(), String> {
+    let vault = hosts::list_hosts(&app)?;
+
+    for host in vault.hosts.iter().filter(|h| host_ids.contains(&h.id)) {
+        let key_path = if let Some(key_id) = &host.ssh_key_id {
+            let keys = crate::ssh_keys::list_ssh_keys(&app).unwrap_or_default();
+            keys.into_iter()
+                .find(|k| &k.id == key_id)
+                .map(|k| std::path::PathBuf::from(k.private_key_path))
+        } else {
+            None
+        };
+
+        let actor = dashboard::spawn_host_actor(
+            app.clone(),
+            host.id.clone(),
+            host.hostname.clone(),
+            host.port,
+            host.user.clone(),
+            hosts::decrypt_host_password(host),
+            key_path,
+        );
+
+        let mut dm = state.dashboard_manager.lock().unwrap();
+        dm.connect(host.id.clone(), actor);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn dashboard_poll(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    want_detail: bool,
+    host_id: Option<String>,
+) -> Result<(), String> {
+    let senders = {
+        let dm = state.dashboard_manager.lock().unwrap();
+        match &host_id {
+            Some(id) => dm.sender(id).map(|s| vec![(id.clone(), s)]).unwrap_or_default(),
+            None => dm.senders(),
+        }
+    };
+
+    let handles: Vec<_> = senders.into_iter().map(|(_id, tx)| {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let cmd = dashboard::ActorCmd::Poll { want_detail, reply: reply_tx };
+
+            if tx.try_send(cmd).is_err() { return; }
+
+            if let Ok(result) = reply_rx.await {
+                let _ = app.emit("dash:stat", result);
+            }
+        })
+    }).collect();
+
+    futures::future::join_all(handles).await;
+    Ok(())
+}
+
+#[tauri::command]
+fn dashboard_disconnect(
+    state: tauri::State<'_, AppState>,
+    host_ids: Vec<String>,
+) -> Result<(), String> {
+    let mut dm = state.dashboard_manager.lock().unwrap();
+    for id in &host_ids {
+        dm.disconnect(id);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
+}
+
+/// Global AppHandle for the screen-lock notification callback.
+/// Populated once in `start_screen_lock_monitor` before the observer is registered.
+#[cfg(target_os = "macos")]
+static SCREEN_LOCK_APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// CoreFoundation callback fired when macOS emits `com.apple.screenIsLocked`.
+/// Runs on the main thread (the Cocoa run loop delivers it there).
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn screen_locked_callback(
+    _center: *mut std::ffi::c_void,
+    _observer: *const std::ffi::c_void,
+    _name: *mut std::ffi::c_void,
+    _object: *const std::ffi::c_void,
+    _user_info: *mut std::ffi::c_void,
+) {
+    eprintln!("[vault] screen lock notification received");
+    if let Some(app) = SCREEN_LOCK_APP.get() {
+        vault::on_screen_lock(app);
+    }
+}
+
+/// Registers for the `com.apple.screenIsLocked` Darwin distributed notification
+/// on the main thread so delivery uses the existing Cocoa run loop.
+///
+/// Unlike the old polling approach this fires only on a genuine lock transition,
+/// never on transient display-sleep states or polling races at startup.
+#[cfg(target_os = "macos")]
+fn start_screen_lock_monitor(app: tauri::AppHandle) {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    let _ = SCREEN_LOCK_APP.set(app.clone());
+
+    let _ = app.run_on_main_thread(|| unsafe {
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFNotificationCenterGetDistributedCenter() -> *mut c_void;
+            fn CFNotificationCenterAddObserver(
+                center: *mut c_void,
+                observer: *const c_void,
+                callback: unsafe extern "C" fn(
+                    *mut c_void,
+                    *const c_void,
+                    *mut c_void,
+                    *const c_void,
+                    *mut c_void,
+                ),
+                name: *mut c_void,
+                object: *const c_void,
+                suspension_behavior: isize,
+            );
+            fn CFStringCreateWithCString(
+                alloc: *const c_void,
+                c_str: *const i8,
+                encoding: u32,
+            ) -> *mut c_void;
+            fn CFRelease(cf: *const c_void);
+        }
+
+        let center = CFNotificationCenterGetDistributedCenter();
+        let name_bytes = b"com.apple.screenIsLocked\0";
+        let name = CFStringCreateWithCString(
+            ptr::null(),
+            name_bytes.as_ptr() as *const i8,
+            0x0800_0100u32, // kCFStringEncodingUTF8
+        );
+        // kCFNotificationSuspensionBehaviorDeliverImmediately = 4
+        CFNotificationCenterAddObserver(
+            center,
+            ptr::null(),
+            screen_locked_callback,
+            name,
+            ptr::null(),
+            4,
+        );
+        CFRelease(name as *const c_void); // AddObserver retains; we release our ref
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -312,6 +988,10 @@ pub fn run() {
         .manage(AppState {
             pty_manager: Mutex::new(PtyManager::new()),
             tunnel_manager: port_forwarding::new_tunnel_manager(),
+            sftp_manager: Mutex::new(SftpManager::new()),
+            watch_handles: Mutex::new(std::collections::HashMap::new()),
+            transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
+            dashboard_manager: Mutex::new(DashboardManager::new()),
         })
         .invoke_handler(tauri::generate_handler![
             create_session,
@@ -330,6 +1010,14 @@ pub fn run() {
             remove_hosts,
             save_host_group,
             remove_host_group,
+            vault_status,
+            vault_init,
+            vault_unlock,
+            vault_lock,
+            vault_change_master_password,
+            get_vault_lock_policy,
+            set_vault_lock_policy,
+            get_host_password,
             test_host_connection,
             list_port_forwards,
             save_port_forward,
@@ -341,6 +1029,33 @@ pub fn run() {
             save_snippet,
             remove_snippets,
             run_snippet_script,
+            sftp_connect_from_host,
+            sftp_disconnect,
+            sftp_cancel_transfer,
+            sftp_download,
+            sftp_upload,
+            sftp_list_local,
+            sftp_list_remote,
+            sftp_delete_remote,
+            sftp_rename_remote,
+            sftp_mkdir_remote,
+            sftp_stat_remote,
+            sftp_chmod,
+            sftp_chown,
+            sftp_copy_remote,
+            sftp_get_users_groups,
+            sftp_rename_local,
+            sftp_delete_local,
+            sftp_mkdir_local,
+            sftp_copy_local,
+            sftp_open_local,
+            sftp_open_with_local,
+            sftp_open_remote,
+            sftp_watch_remote,
+            sftp_stop_watch,
+            dashboard_connect,
+            dashboard_poll,
+            dashboard_disconnect,
             quit_app,
         ])
         .on_window_event(|window, event| {
@@ -409,10 +1124,15 @@ pub fn run() {
                 let settings = MenuItemBuilder::with_id("open-settings", "Settings...")
                     .accelerator("CmdOrCtrl+,")
                     .build(app)?;
+                let lock_vault = MenuItemBuilder::with_id("lock-vault", "Lock Vault")
+                    .accelerator("CmdOrCtrl+Shift+L")
+                    .build(app)?;
 
                 let file_menu = SubmenuBuilder::new(app, "File")
                     .item(&new_terminal)
                     .item(&settings)
+                    .separator()
+                    .item(&lock_vault)
                     .separator()
                     .item(&PredefinedMenuItem::close_window(app, None)?)
                     .separator()
@@ -452,6 +1172,10 @@ pub fn run() {
                     "open-settings" => {
                         let _ = open_settings_window_inner(&handle);
                     }
+                    "lock-vault" => {
+                        vault::op_lock();
+                        let _ = handle.emit("vault-locked", ());
+                    }
                     _ => {}
                 });
             }
@@ -463,11 +1187,22 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            // Try to unlock the vault silently using the keychain-cached master password,
+            // so a returning user on this device isn't prompted again.
+            let _ = vault::op_try_cached_unlock(app.handle());
+
+            // Start background screen-lock monitor (macOS only).
+            #[cfg(target_os = "macos")]
+            start_screen_lock_monitor(app.handle().clone());
+
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                vault::on_app_exit(app_handle);
+            }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
                 if !has_visible_windows {
