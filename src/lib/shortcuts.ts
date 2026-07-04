@@ -9,6 +9,7 @@ export type ShortcutActionId =
   | "previous-tab"
   | "open-settings"
   | "open-snippets"
+  | "lock-vault"
   | "terminal-copy"
   | "terminal-paste";
 
@@ -69,6 +70,12 @@ export const shortcutDefinitions: ShortcutDefinition[] = [
     label: "Snippets",
     description: "Open snippets list in the terminal",
     defaultBinding: cmdOrCtrl("s", { shiftKey: true, code: "KeyS" }),
+  },
+  {
+    id: "lock-vault",
+    label: "Lock vault",
+    description: "Lock the password vault immediately",
+    defaultBinding: cmdOrCtrl("l", { shiftKey: true, code: "KeyL" }),
   },
   {
     id: "terminal-copy",
