@@ -198,7 +198,8 @@ pub fn start_tunnel(
     command.arg("ConnectTimeout=10");
 
     // If no password, use BatchMode to avoid hanging on prompts
-    let has_password = host.password.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+    let host_password = crate::hosts::decrypt_host_password(host);
+    let has_password = host_password.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
     if !has_password {
         command.arg("-o");
         command.arg("BatchMode=yes");
@@ -278,7 +279,7 @@ pub fn start_tunnel(
     let _master = pair.master;
 
     // Handle password in a background thread, then keep reading to drain output
-    let password = host.password.clone().unwrap_or_default();
+    let password = host_password.clone().unwrap_or_default();
     thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut output = String::new();
