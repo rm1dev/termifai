@@ -1067,6 +1067,8 @@ pub fn run() {
                     api.prevent_close();
                 }
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (window, event);
         })
         .setup(|app| {
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
