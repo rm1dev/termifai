@@ -4381,11 +4381,7 @@ function formatBytes(bytes: number): string {
 }
 
 function SftpView({ tab }: { tab: AppTab }) {
-  const homeDir = "/Users/" + (typeof window !== "undefined"
-    ? window.navigator.userAgent.match(/Mac/) ? "admin" : "user"
-    : "user");
-
-  const [localPath, setLocalPath] = useState(homeDir);
+  const [localPath, setLocalPath] = useState("/");
   const [localFiles, setLocalFiles] = useState<LocalFileEntry[]>([]);
   const [localLoading, setLocalLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
@@ -4781,7 +4777,9 @@ function SftpView({ tab }: { tab: AppTab }) {
   };
 
   useEffect(() => {
-    void loadLocalDir(localPath);
+    invoke<string>("get_home_dir")
+      .then((home) => loadLocalDir(home))
+      .catch(() => loadLocalDir(localPath));
   }, []); // load on mount
 
   const localParent = localPath.split("/").slice(0, -1).join("/") || "/";

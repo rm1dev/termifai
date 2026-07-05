@@ -452,6 +452,13 @@ fn sftp_list_local(path: String) -> Result<Vec<LocalFileEntry>, String> {
 }
 
 #[tauri::command]
+fn get_home_dir() -> Result<String, String> {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map_err(|_| "Could not determine home directory".to_string())
+}
+
+#[tauri::command]
 fn sftp_list_remote(
     state: State<AppState>,
     session_id: String,
@@ -1035,6 +1042,7 @@ pub fn run() {
             sftp_download,
             sftp_upload,
             sftp_list_local,
+            get_home_dir,
             sftp_list_remote,
             sftp_delete_remote,
             sftp_rename_remote,
