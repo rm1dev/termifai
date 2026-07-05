@@ -3,7 +3,9 @@ use crate::hosts::{self, CryptoMeta};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use tauri::{AppHandle, Emitter, Manager};
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
+use tauri::{AppHandle, Manager};
 
 fn cell() -> &'static Mutex<Option<VaultKey>> {
     static VAULT: OnceLock<Mutex<Option<VaultKey>>> = OnceLock::new();
