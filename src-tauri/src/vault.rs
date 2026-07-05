@@ -257,6 +257,7 @@ pub fn on_app_exit(app: &AppHandle) {
 }
 
 /// Called when screen is locked — clears keychain if policy is OnScreenLock.
+#[cfg(target_os = "macos")]
 pub fn on_screen_lock(app: &AppHandle) {
     if get_lock_policy(app) == LockPolicy::OnScreenLock {
         op_lock();
