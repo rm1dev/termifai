@@ -638,6 +638,20 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
 
 function WindowControls() {
   const win = getCurrentWindow();
+  // Fullscreen and "maximized" are separate window states (most visible on Linux/X11+Wayland).
+  // toggleMaximize() while fullscreen produces an inconsistent state — e.g. the window ends up
+  // maximized underneath but still rendered fullscreen, or fullscreen won't exit cleanly. So
+  // this button exits fullscreen first when active, instead of toggling maximize on top of it.
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void win.isFullscreen().then(setIsFullscreen).catch(() => {});
+    void win.onResized(() => {
+      void win.isFullscreen().then(setIsFullscreen).catch(() => {});
+    }).then((fn) => { unlisten = fn; }).catch(() => {});
+    return () => { unlisten?.(); };
+  }, [win]);
+
   return (
     <div className="flex items-center h-full shrink-0">
       <button
@@ -648,7 +662,7 @@ function WindowControls() {
         <Minus className="h-3.5 w-3.5" />
       </button>
       <button
-        onClick={() => void win.toggleMaximize()}
+        onClick={() => void (isFullscreen ? win.setFullscreen(false) : win.toggleMaximize())}
         className="flex h-full w-11 items-center justify-center text-muted-foreground outline-none hover:bg-[var(--color-surface-2)] hover:text-foreground focus:outline-none focus-visible:outline-none transition-colors"
         aria-label="Maximize"
       >
