@@ -1,24 +1,22 @@
 mod crypto;
+pub mod dashboard;
 mod hosts;
-mod vault;
 mod port_forwarding;
 mod pty_manager;
 mod sftp;
 mod snippets;
 mod ssh_keys;
-pub mod dashboard;
+mod vault;
 use dashboard::DashboardManager;
 
 use hosts::{
     Host, HostGroup, HostsVault, SaveHostGroupRequest, SaveHostRequest, TestHostConnectionRequest,
     TestHostConnectionResult,
 };
-use port_forwarding::{
-    PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus,
-};
+use port_forwarding::{PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus};
 use pty_manager::{PtyManager, TabInfo};
-use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
 use serde::Serialize;
+use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
 
 #[derive(Serialize, Clone)]
 struct SftpConnectEvent {
@@ -309,10 +307,7 @@ fn stop_tunnel(state: State<AppState>, rule_id: String) -> Result<TunnelStatus, 
 }
 
 #[tauri::command]
-fn get_tunnel_statuses(
-    state: State<AppState>,
-    rule_ids: Vec<String>,
-) -> Vec<TunnelStatus> {
+fn get_tunnel_statuses(state: State<AppState>, rule_ids: Vec<String>) -> Vec<TunnelStatus> {
     port_forwarding::get_tunnel_statuses(&state.tunnel_manager, rule_ids)
 }
 
@@ -426,7 +421,10 @@ async fn sftp_connect_from_host(
             let log = move |stage: &str, msg: &str| {
                 let _ = app_log.emit(
                     &format!("sftp:{}:connect", sid_log),
-                    SftpConnectEvent { stage: stage.to_string(), message: msg.to_string() },
+                    SftpConnectEvent {
+                        stage: stage.to_string(),
+                        message: msg.to_string(),
+                    },
                 );
             };
             let state = app_inner.state::<AppState>();
@@ -436,9 +434,21 @@ async fn sftp_connect_from_host(
         .await;
 
         let done = match result {
-            Ok(Ok(info)) => SftpConnectDone { ok: true, remote_path: Some(info.remote_path), error: None },
-            Ok(Err(e)) => SftpConnectDone { ok: false, remote_path: None, error: Some(e) },
-            Err(e) => SftpConnectDone { ok: false, remote_path: None, error: Some(format!("Task panic: {e}")) },
+            Ok(Ok(info)) => SftpConnectDone {
+                ok: true,
+                remote_path: Some(info.remote_path),
+                error: None,
+            },
+            Ok(Err(e)) => SftpConnectDone {
+                ok: false,
+                remote_path: None,
+                error: Some(e),
+            },
+            Err(e) => SftpConnectDone {
+                ok: false,
+                remote_path: None,
+                error: Some(format!("Task panic: {e}")),
+            },
         };
         let _ = app_bg.emit(&format!("sftp:{}:done", session_id), done);
     });
@@ -490,17 +500,36 @@ async fn sftp_download(
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
             let manager = state.sftp_manager.lock().unwrap();
-            manager.download_file(&sid, &remote_path, &local_path, Arc::clone(&cancel_flag), move |progress| {
-                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-            })
+            manager.download_file(
+                &sid,
+                &remote_path,
+                &local_path,
+                Arc::clone(&cancel_flag),
+                move |progress| {
+                    let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+                },
+            )
         })
         .await;
         let state = app.state::<AppState>();
-        state.transfer_cancel_flags.lock().unwrap().remove(&session_id);
+        state
+            .transfer_cancel_flags
+            .lock()
+            .unwrap()
+            .remove(&session_id);
         let done = match result {
-            Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
-            Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
-            Err(e) => SftpTransferDone { ok: false, error: Some(format!("Task panic: {e}")) },
+            Ok(Ok(())) => SftpTransferDone {
+                ok: true,
+                error: None,
+            },
+            Ok(Err(e)) => SftpTransferDone {
+                ok: false,
+                error: Some(e),
+            },
+            Err(e) => SftpTransferDone {
+                ok: false,
+                error: Some(format!("Task panic: {e}")),
+            },
         };
         let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
     });
@@ -529,17 +558,36 @@ async fn sftp_upload(
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
             let manager = state.sftp_manager.lock().unwrap();
-            manager.upload_file(&sid, &local_path, &remote_path, Arc::clone(&cancel_flag), move |progress| {
-                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-            })
+            manager.upload_file(
+                &sid,
+                &local_path,
+                &remote_path,
+                Arc::clone(&cancel_flag),
+                move |progress| {
+                    let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+                },
+            )
         })
         .await;
         let state = app.state::<AppState>();
-        state.transfer_cancel_flags.lock().unwrap().remove(&session_id);
+        state
+            .transfer_cancel_flags
+            .lock()
+            .unwrap()
+            .remove(&session_id);
         let done = match result {
-            Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
-            Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
-            Err(e) => SftpTransferDone { ok: false, error: Some(format!("Task panic: {e}")) },
+            Ok(Ok(())) => SftpTransferDone {
+                ok: true,
+                error: None,
+            },
+            Ok(Err(e)) => SftpTransferDone {
+                ok: false,
+                error: Some(e),
+            },
+            Err(e) => SftpTransferDone {
+                ok: false,
+                error: Some(format!("Task panic: {e}")),
+            },
         };
         let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
     });
@@ -584,10 +632,7 @@ fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), Str
 }
 
 #[tauri::command]
-fn sftp_cancel_transfer(
-    state: State<AppState>,
-    session_id: String,
-) -> Result<(), String> {
+fn sftp_cancel_transfer(state: State<AppState>, session_id: String) -> Result<(), String> {
     let flags = state.transfer_cancel_flags.lock().unwrap();
     if let Some(flag) = flags.get(&session_id) {
         flag.store(true, Ordering::Relaxed);
@@ -608,9 +653,7 @@ fn sftp_stat_remote(
 #[tauri::command]
 fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
     let p = std::path::Path::new(&path);
-    let dest = p.parent()
-        .ok_or("No parent dir")?
-        .join(&new_name);
+    let dest = p.parent().ok_or("No parent dir")?.join(&new_name);
     std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
 }
 
@@ -629,8 +672,7 @@ fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
 
 #[tauri::command]
 fn sftp_mkdir_local(path: String) -> Result<(), String> {
-    std::fs::create_dir_all(&path)
-        .map_err(|e| format!("Create dir '{}': {}", path, e))
+    std::fs::create_dir_all(&path).map_err(|e| format!("Create dir '{}': {}", path, e))
 }
 
 #[tauri::command]
@@ -666,11 +708,20 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 #[tauri::command]
 fn sftp_open_local(path: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("xdg-open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd").args(["/c", "start", "", &path]).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", &path])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return Err("Platform not supported for open_local".to_string());
     Ok(())
@@ -679,11 +730,20 @@ fn sftp_open_local(path: String) -> Result<(), String> {
 #[tauri::command]
 fn sftp_open_with_local(path: String, app: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open").args(["-a", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("open")
+        .args(["-a", &app, &path])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
-    std::process::Command::new(&app).arg(&path).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new(&app)
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd").args(["/c", "start", "", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", &app, &path])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return Err("Platform not supported for open_with_local".to_string());
     Ok(())
@@ -709,9 +769,13 @@ async fn sftp_open_remote(
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&tmp_path).spawn();
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(&tmp_path).spawn();
+    let _ = std::process::Command::new("xdg-open")
+        .arg(&tmp_path)
+        .spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/c", "start", "", &tmp_path]).spawn();
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", &tmp_path])
+        .spawn();
     Ok(tmp_path)
 }
 
@@ -737,9 +801,7 @@ async fn sftp_watch_remote(
     let tp = tmp_path.clone();
     let rp = remote_path.clone();
     tokio::spawn(async move {
-        let initial_mtime = std::fs::metadata(&tp)
-            .and_then(|m| m.modified())
-            .ok();
+        let initial_mtime = std::fs::metadata(&tp).and_then(|m| m.modified()).ok();
         let mut last_mtime = initial_mtime;
         let mut rx = rx;
         loop {
@@ -762,10 +824,7 @@ async fn sftp_watch_remote(
 }
 
 #[tauri::command]
-fn sftp_stop_watch(
-    state: State<AppState>,
-    tmp_path: String,
-) -> Result<(), String> {
+fn sftp_stop_watch(state: State<AppState>, tmp_path: String) -> Result<(), String> {
     let mut handles = state.watch_handles.lock().unwrap();
     if let Some(tx) = handles.remove(&tmp_path) {
         let _ = tx.send(());
@@ -863,24 +922,35 @@ async fn dashboard_poll(
     let senders = {
         let dm = state.dashboard_manager.lock().unwrap();
         match &host_id {
-            Some(id) => dm.sender(id).map(|s| vec![(id.clone(), s)]).unwrap_or_default(),
+            Some(id) => dm
+                .sender(id)
+                .map(|s| vec![(id.clone(), s)])
+                .unwrap_or_default(),
             None => dm.senders(),
         }
     };
 
-    let handles: Vec<_> = senders.into_iter().map(|(_id, tx)| {
-        let app = app.clone();
-        tokio::spawn(async move {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let cmd = dashboard::ActorCmd::Poll { want_detail, reply: reply_tx };
+    let handles: Vec<_> = senders
+        .into_iter()
+        .map(|(_id, tx)| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let cmd = dashboard::ActorCmd::Poll {
+                    want_detail,
+                    reply: reply_tx,
+                };
 
-            if tx.try_send(cmd).is_err() { return; }
+                if tx.try_send(cmd).is_err() {
+                    return;
+                }
 
-            if let Ok(result) = reply_rx.await {
-                let _ = app.emit("dash:stat", result);
-            }
+                if let Ok(result) = reply_rx.await {
+                    let _ = app.emit("dash:stat", result);
+                }
+            })
         })
-    }).collect();
+        .collect();
 
     futures::future::join_all(handles).await;
     Ok(())
@@ -987,9 +1057,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(
             tauri_plugin_window_state::Builder::new()
-                .with_state_flags(
-                    StateFlags::all() & !StateFlags::VISIBLE,
-                )
+                .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
                 .build(),
         )
         .manage(AppState {
@@ -1214,7 +1282,11 @@ pub fn run() {
                 vault::on_app_exit(app_handle);
             }
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
                 if !has_visible_windows {
                     if let Some(window) = app_handle.get_webview_window("main") {
                         let _ = window.show();
@@ -1231,8 +1303,12 @@ fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
         .get_webview_window("settings")
         .ok_or_else(|| "Settings window not found".to_string())?;
 
-    window.show().map_err(|e| format!("Failed to show settings window: {}", e))?;
-    window.set_focus().map_err(|e| format!("Failed to focus settings window: {}", e))?;
+    window
+        .show()
+        .map_err(|e| format!("Failed to show settings window: {}", e))?;
+    window
+        .set_focus()
+        .map_err(|e| format!("Failed to focus settings window: {}", e))?;
 
     Ok(())
 }
