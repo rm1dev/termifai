@@ -3,7 +3,9 @@ use crate::hosts::{self, CryptoMeta};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
-use tauri::{AppHandle, Emitter, Manager};
+#[cfg(target_os = "macos")]
+use tauri::Emitter;
+use tauri::{AppHandle, Manager};
 
 fn cell() -> &'static Mutex<Option<VaultKey>> {
     static VAULT: OnceLock<Mutex<Option<VaultKey>>> = OnceLock::new();
@@ -257,6 +259,7 @@ pub fn on_app_exit(app: &AppHandle) {
 }
 
 /// Called when screen is locked — clears keychain if policy is OnScreenLock.
+#[cfg(target_os = "macos")]
 pub fn on_screen_lock(app: &AppHandle) {
     if get_lock_policy(app) == LockPolicy::OnScreenLock {
         op_lock();
