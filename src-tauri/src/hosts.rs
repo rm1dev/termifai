@@ -322,7 +322,11 @@ pub fn test_host_connection(
     command.arg("-p");
     command.arg(request.port.to_string());
 
-    if let Some(ssh_key_id) = request.ssh_key_id.as_deref().filter(|id| !id.trim().is_empty()) {
+    if let Some(ssh_key_id) = request
+        .ssh_key_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
         let key_path = crate::ssh_keys::private_key_path(app, ssh_key_id)?;
         command.arg("-i");
         command.arg(key_path);
@@ -410,7 +414,10 @@ fn run_ssh_test(
                             }));
                             return;
                         }
-                        if writer.write_all(format!("{}\r", password).as_bytes()).is_err() {
+                        if writer
+                            .write_all(format!("{}\r", password).as_bytes())
+                            .is_err()
+                        {
                             break;
                         }
                         password_sent = true;
@@ -452,7 +459,9 @@ fn ssh_failure_message(output: &str) -> String {
         "SSH connection refused".to_string()
     } else if lower.contains("operation timed out") || lower.contains("connection timed out") {
         "SSH connection timed out".to_string()
-    } else if lower.contains("could not resolve hostname") || lower.contains("name or service not known") {
+    } else if lower.contains("could not resolve hostname")
+        || lower.contains("name or service not known")
+    {
         "SSH hostname could not be resolved".to_string()
     } else if lower.contains("no route to host") {
         "No route to SSH host".to_string()
@@ -583,11 +592,22 @@ mod tests {
     #[test]
     fn decrypt_host_password_passes_through_legacy_plaintext() {
         let host = Host {
-            id: "h1".into(), name: "n".into(), user: "u".into(), hostname: "h".into(),
-            port: 22, os: OsKind::Other, tags: vec![], last_used: None, group_id: None,
-            auth_method: None, password: Some("plainpw".into()), ssh_key_id: None,
-            show_status_in_dashboard: None, working_directory: None,
-            default_sftp_path: None, updated_at: None,
+            id: "h1".into(),
+            name: "n".into(),
+            user: "u".into(),
+            hostname: "h".into(),
+            port: 22,
+            os: OsKind::Other,
+            tags: vec![],
+            last_used: None,
+            group_id: None,
+            auth_method: None,
+            password: Some("plainpw".into()),
+            ssh_key_id: None,
+            show_status_in_dashboard: None,
+            working_directory: None,
+            default_sftp_path: None,
+            updated_at: None,
         };
         assert_eq!(decrypt_host_password(&host), Some("plainpw".to_string()));
     }
@@ -595,11 +615,22 @@ mod tests {
     #[test]
     fn decrypt_host_password_none_when_no_password() {
         let host = Host {
-            id: "h1".into(), name: "n".into(), user: "u".into(), hostname: "h".into(),
-            port: 22, os: OsKind::Other, tags: vec![], last_used: None, group_id: None,
-            auth_method: None, password: None, ssh_key_id: None,
-            show_status_in_dashboard: None, working_directory: None,
-            default_sftp_path: None, updated_at: None,
+            id: "h1".into(),
+            name: "n".into(),
+            user: "u".into(),
+            hostname: "h".into(),
+            port: 22,
+            os: OsKind::Other,
+            tags: vec![],
+            last_used: None,
+            group_id: None,
+            auth_method: None,
+            password: None,
+            ssh_key_id: None,
+            show_status_in_dashboard: None,
+            working_directory: None,
+            default_sftp_path: None,
+            updated_at: None,
         };
         assert_eq!(decrypt_host_password(&host), None);
     }

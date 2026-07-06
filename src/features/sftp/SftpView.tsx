@@ -1200,7 +1200,9 @@ export function SftpView({ tab }: { tab: AppTab }) {
                       handleDeleteLocal(deleteConfirm.targets);
                     } else {
                       void invoke("sftp_delete_remote", { sessionId: sftpSessionId, paths: deleteConfirm.targets })
-                        .then(() => remotePath && loadRemoteDir(remotePath))
+                        .then(() => {
+                          if (remotePath) loadRemoteDir(remotePath);
+                        })
                         .catch((e: unknown) => toast.error(String(e)));
                     }
                     setDeleteConfirm(null);
