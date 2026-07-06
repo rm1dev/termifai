@@ -608,7 +608,15 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
           <Menu className="h-4 w-4" />
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-48">
+      <DropdownMenuContent
+        align="end"
+        className="w-48"
+        // On Linux, a fullscreen webview can emit a spurious focus-outside event right after
+        // the menu opens (GTK/wry focus quirk), which Radix's dismissable layer otherwise reads
+        // as "user focused something else" and closes the menu within a frame of opening it.
+        // Ignore focus-outside; real outside clicks (pointerDownOutside) still close it.
+        onFocusOutside={(e) => e.preventDefault()}
+      >
         <DropdownMenuItem onSelect={() => onNew("terminal")}>
           New Terminal
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+T</span>
