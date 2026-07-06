@@ -219,7 +219,7 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
         last_used: existing_last_used.or(Some(now.clone())),
         group_id: request.group_id.filter(|value| !value.trim().is_empty()),
         auth_method: request.auth_method,
-        password: encrypt_password_for_save(request.password),
+        password: encrypt_password_for_save(request.password)?,
         ssh_key_id: request.ssh_key_id.filter(|value| !value.trim().is_empty()),
         show_status_in_dashboard: request.show_status_in_dashboard,
         working_directory: request
@@ -313,10 +313,12 @@ pub fn test_host_connection(
     let mut command = portable_pty::CommandBuilder::new("ssh");
     command.arg("-o");
     command.arg("BatchMode=no");
+    // accept-new: trust a host's key on first contact (TOFU) and record it in the
+    // user's known_hosts, but hard-fail if a previously recorded key changes —
+    // unlike StrictHostKeyChecking=no + /dev/null known_hosts, which trusted every
+    // connection unconditionally and made this test blind to MITM.
     command.arg("-o");
-    command.arg("StrictHostKeyChecking=no");
-    command.arg("-o");
-    command.arg("UserKnownHostsFile=/dev/null");
+    command.arg("StrictHostKeyChecking=accept-new");
     command.arg("-o");
     command.arg(format!("ConnectTimeout={}", timeout_secs));
     command.arg("-p");
@@ -539,14 +541,18 @@ fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
 }
 
 /// Encrypt a to-be-saved password with the unlocked vault key. If the value is
-/// empty it becomes None. If the vault is locked, the value is stored as-is
-/// (legacy plaintext) — the UI must require an unlock before saving secrets.
-fn encrypt_password_for_save(password: Option<String>) -> Option<String> {
-    let pw = password.filter(|value| !value.is_empty())?;
+/// empty it becomes None. If the vault is locked, we return an error.
+fn encrypt_password_for_save(password: Option<String>) -> Result<Option<String>, String> {
+    let pw = match password.filter(|value| !value.is_empty()) {
+        Some(pw) => pw,
+        None => return Ok(None),
+    };
     let guard = crate::vault::current_key();
     match guard.as_ref() {
-        Some(key) => crate::crypto::encrypt_field(key, &pw).ok(),
-        None => Some(pw),
+        Some(key) => crate::crypto::encrypt_field(key, &pw)
+            .map(Some)
+            .map_err(|e| format!("Encryption failed: {:?}", e)),
+        None => Err("Vault is locked — unlock it to save a password".to_string()),
     }
 }
 
@@ -633,5 +639,21 @@ mod tests {
             updated_at: None,
         };
         assert_eq!(decrypt_host_password(&host), None);
+    }
+
+    #[test]
+    fn encrypt_password_fails_when_locked_but_succeeds_when_none() {
+        // Vault is locked by default in test environment
+        let res = encrypt_password_for_save(Some("secret".to_string()));
+        assert!(res.is_err(), "Expected error when vault is locked");
+        assert_eq!(res.unwrap_err(), "Vault is locked — unlock it to save a password");
+
+        let res_none = encrypt_password_for_save(None);
+        assert!(res_none.is_ok(), "Expected Ok(None) when password is None");
+        assert_eq!(res_none.unwrap(), None);
+
+        let res_empty = encrypt_password_for_save(Some("".to_string()));
+        assert!(res_empty.is_ok(), "Expected Ok(None) when password is empty");
+        assert_eq!(res_empty.unwrap(), None);
     }
 }
