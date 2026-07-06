@@ -1,6 +1,6 @@
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
+use base64::Engine;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use rand::RngCore;
@@ -131,8 +131,10 @@ pub fn unlock_vault(
         Ok(text) if text == VERIFIER_PLAINTEXT => {}
         _ => return Err(CryptoError::WrongPassword),
     }
-    let dek_b64: Zeroizing<String> = Zeroizing::new(decrypt_field(&kek, wrapped_key).map_err(|_| CryptoError::WrongPassword)?);
-    let dek_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(B64.decode(&*dek_b64).map_err(|_| CryptoError::BadToken)?);
+    let dek_b64: Zeroizing<String> =
+        Zeroizing::new(decrypt_field(&kek, wrapped_key).map_err(|_| CryptoError::WrongPassword)?);
+    let dek_bytes: Zeroizing<Vec<u8>> =
+        Zeroizing::new(B64.decode(&*dek_b64).map_err(|_| CryptoError::BadToken)?);
     if dek_bytes.len() != 32 {
         return Err(CryptoError::BadToken);
     }
@@ -171,8 +173,14 @@ mod tests {
         let salt = [7u8; 32];
         let other_salt = [9u8; 32];
         let base = derive_kek("hunter2", &salt).unwrap();
-        assert_ne!(base.as_bytes(), derive_kek("hunter3", &salt).unwrap().as_bytes());
-        assert_ne!(base.as_bytes(), derive_kek("hunter2", &other_salt).unwrap().as_bytes());
+        assert_ne!(
+            base.as_bytes(),
+            derive_kek("hunter3", &salt).unwrap().as_bytes()
+        );
+        assert_ne!(
+            base.as_bytes(),
+            derive_kek("hunter2", &other_salt).unwrap().as_bytes()
+        );
     }
 
     #[test]
@@ -196,14 +204,23 @@ mod tests {
         let key = VaultKey::from_bytes([3u8; 32]);
         let token = encrypt_field(&key, "secret").unwrap();
         let wrong = VaultKey::from_bytes([4u8; 32]);
-        assert!(matches!(decrypt_field(&wrong, &token), Err(CryptoError::Decrypt)));
+        assert!(matches!(
+            decrypt_field(&wrong, &token),
+            Err(CryptoError::Decrypt)
+        ));
     }
 
     #[test]
     fn decrypt_rejects_malformed_token() {
         let key = VaultKey::from_bytes([3u8; 32]);
-        assert!(matches!(decrypt_field(&key, "not-a-token"), Err(CryptoError::BadToken)));
-        assert!(matches!(decrypt_field(&key, "v1:only-one-part"), Err(CryptoError::BadToken)));
+        assert!(matches!(
+            decrypt_field(&key, "not-a-token"),
+            Err(CryptoError::BadToken)
+        ));
+        assert!(matches!(
+            decrypt_field(&key, "v1:only-one-part"),
+            Err(CryptoError::BadToken)
+        ));
     }
 
     #[test]
@@ -226,14 +243,26 @@ mod tests {
     fn rewrap_preserves_dek_and_accepts_new_password() {
         let v = create_vault("old-pw").unwrap();
         let token = encrypt_field(&v.key, "payload").unwrap();
-        let rewrapped = rewrap("old-pw", &v.salt_b64, &v.wrapped_key, &v.verifier, "new-pw").unwrap();
+        let rewrapped =
+            rewrap("old-pw", &v.salt_b64, &v.wrapped_key, &v.verifier, "new-pw").unwrap();
         // Old password no longer unlocks the new envelope.
         assert!(matches!(
-            unlock_vault("old-pw", &rewrapped.salt_b64, &rewrapped.wrapped_key, &rewrapped.verifier),
+            unlock_vault(
+                "old-pw",
+                &rewrapped.salt_b64,
+                &rewrapped.wrapped_key,
+                &rewrapped.verifier
+            ),
             Err(CryptoError::WrongPassword)
         ));
         // New password yields the original DEK ⇒ old ciphertext still decrypts.
-        let unlocked = unlock_vault("new-pw", &rewrapped.salt_b64, &rewrapped.wrapped_key, &rewrapped.verifier).unwrap();
+        let unlocked = unlock_vault(
+            "new-pw",
+            &rewrapped.salt_b64,
+            &rewrapped.wrapped_key,
+            &rewrapped.verifier,
+        )
+        .unwrap();
         assert_eq!(decrypt_field(&unlocked, &token).unwrap(), "payload");
     }
 }

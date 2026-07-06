@@ -199,7 +199,10 @@ pub fn start_tunnel(
 
     // If no password, use BatchMode to avoid hanging on prompts
     let host_password = crate::hosts::decrypt_host_password(host);
-    let has_password = host_password.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+    let has_password = host_password
+        .as_ref()
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
     if !has_password {
         command.arg("-o");
         command.arg("BatchMode=yes");
@@ -321,7 +324,9 @@ pub fn start_tunnel(
                 rule_id,
                 active: false,
                 pid: None,
-                error: Some("SSH tunnel exited immediately. Check host credentials and ports.".to_string()),
+                error: Some(
+                    "SSH tunnel exited immediately. Check host credentials and ports.".to_string(),
+                ),
             });
         }
         Ok(None) => { /* still running, good */ }
@@ -356,7 +361,10 @@ pub fn start_tunnel(
     })
 }
 
-pub fn stop_tunnel(tunnel_mgr: &TunnelManagerState, rule_id: String) -> Result<TunnelStatus, String> {
+pub fn stop_tunnel(
+    tunnel_mgr: &TunnelManagerState,
+    rule_id: String,
+) -> Result<TunnelStatus, String> {
     let mut mgr = tunnel_mgr
         .lock()
         .map_err(|_| "Failed to lock tunnel manager".to_string())?;
@@ -374,10 +382,23 @@ pub fn stop_tunnel(tunnel_mgr: &TunnelManagerState, rule_id: String) -> Result<T
     })
 }
 
-pub fn get_tunnel_statuses(tunnel_mgr: &TunnelManagerState, rule_ids: Vec<String>) -> Vec<TunnelStatus> {
+pub fn get_tunnel_statuses(
+    tunnel_mgr: &TunnelManagerState,
+    rule_ids: Vec<String>,
+) -> Vec<TunnelStatus> {
     let mut mgr = match tunnel_mgr.lock() {
         Ok(m) => m,
-        Err(_) => return rule_ids.iter().map(|id| TunnelStatus { rule_id: id.clone(), active: false, pid: None, error: None }).collect(),
+        Err(_) => {
+            return rule_ids
+                .iter()
+                .map(|id| TunnelStatus {
+                    rule_id: id.clone(),
+                    active: false,
+                    pid: None,
+                    error: None,
+                })
+                .collect()
+        }
     };
 
     let mut statuses = Vec::new();
@@ -422,8 +443,8 @@ fn read_vault(app: &AppHandle) -> Result<PortForwardVault, String> {
     if !path.exists() {
         return Ok(PortForwardVault::default());
     }
-    let contents =
-        fs::read_to_string(path).map_err(|e| format!("Failed to read port forward vault: {}", e))?;
+    let contents = fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read port forward vault: {}", e))?;
     serde_json::from_str(&contents)
         .map_err(|e| format!("Failed to parse port forward vault: {}", e))
 }
