@@ -115,8 +115,7 @@ pub fn set_lock_policy(app: &AppHandle, policy: LockPolicy) -> Result<(), String
 // Writing a token there lets us detect "is this the same session?" cheaply.
 
 fn session_token_path() -> PathBuf {
-    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    PathBuf::from(tmp).join("termifai-vault-session")
+    std::env::temp_dir().join("termifai-vault-session")
 }
 
 fn touch_session_token() {

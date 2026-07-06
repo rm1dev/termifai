@@ -144,7 +144,7 @@ impl PtyManager {
                         if !ready {
                             connection_tracker.handle_output(&data, ready_marker.as_deref());
                         }
-                        if !password_sent {
+                        if !password_sent && !ready {
                             if let Some(password) = password_for_prompt.as_deref() {
                                 recent_output
                                     .push_str(&String::from_utf8_lossy(&buf[..n]).to_lowercase());

@@ -53,7 +53,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { VaultGate } from "./VaultGate";
-import { vaultStatus, vaultLock, getHostPassword } from "@/lib/api/vault";
+import { vaultStatus, vaultLock } from "@/lib/api/vault";
 import type { VaultStatus } from "@/lib/api/vault";
 import { EmptyState } from "@/components/shared/modal-primitives";
 import { PortForwardingView } from "@/features/port-forwarding/PortForwardingView";
@@ -109,11 +109,13 @@ export function AppShell() {
     const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
     const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
     const remoteBootstrap = `printf '${readyMarker}\\n'; ${cdPart}exec ` + "${SHELL:-/bin/sh}" + " -i";
-    const command = `ssh -v -tt -o StrictHostKeyChecking=no${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+    // accept-new: trust a host's key on first contact and record it in the user's
+    // known_hosts, but hard-fail if a previously recorded key changes (unlike
+    // StrictHostKeyChecking=no, which trusted every connection unconditionally).
+    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
-    const resolvedPassword = await getHostPassword(host.id).catch(() => null);
     setTabs((currentTabs) => {
       const existingCount = currentTabs.filter((t) => t.hostId === host.id).length;
       const title = existingCount > 0 ? `${baseTitle} (${existingCount + 1})` : baseTitle;
@@ -125,7 +127,6 @@ export function AppShell() {
           title,
           closable: true,
           initialCommand: command,
-          initialPassword: resolvedPassword ?? undefined,
           readyMarker,
           connectionLabel: `${host.user}@${host.hostname}:${host.port}`,
           connectionTitle: host.name || host.hostname,
@@ -342,7 +343,7 @@ export function AppShell() {
               <XTerminal
                 sessionId={t.sessionId}
                 initialCommand={t.initialCommand}
-                initialPassword={t.initialPassword}
+                hostId={t.hostId}
                 readyMarker={t.readyMarker}
                 connectionLabel={t.connectionLabel}
                 connectionTitle={t.connectionTitle}

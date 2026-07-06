@@ -184,10 +184,10 @@ pub fn start_tunnel(
     // Build the SSH tunnel command
     let mut command = portable_pty::CommandBuilder::new("ssh");
     command.arg("-N"); // no remote command
+                       // accept-new: TOFU against the real known_hosts, hard-fail on a changed key.
+                       // See hosts.rs::test_host_connection for why this replaces StrictHostKeyChecking=no.
     command.arg("-o");
-    command.arg("StrictHostKeyChecking=no");
-    command.arg("-o");
-    command.arg("UserKnownHostsFile=/dev/null");
+    command.arg("StrictHostKeyChecking=accept-new");
     command.arg("-o");
     command.arg("ExitOnForwardFailure=yes");
     command.arg("-o");

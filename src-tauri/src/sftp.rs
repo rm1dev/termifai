@@ -1,7 +1,7 @@
+use crate::ssh;
 use serde::{Deserialize, Serialize};
 use ssh2::Session;
 use std::collections::HashMap;
-use std::net::TcpStream;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -149,46 +149,15 @@ impl SftpManager {
     where
         F: Fn(&str, &str),
     {
-        let addr = format!("{}:{}", req.hostname, req.port);
-
-        log(
-            "connecting",
-            &format!("Opening TCP connection to {}...", addr),
-        );
-        let tcp =
-            TcpStream::connect(&addr).map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
-
-        log("handshaking", "TCP connected. Starting SSH handshake...");
-        let mut session = Session::new().map_err(|e| format!("SSH session init: {}", e))?;
-        session.set_tcp_stream(tcp);
-        session
-            .handshake()
-            .map_err(|e| format!("SSH handshake: {}", e))?;
-
-        log(
-            "authenticating",
-            &format!("Authenticating as {}...", req.username),
-        );
-        if let Some(key_path) = &req.private_key_path {
-            log("authenticating", &format!("Using public key: {}", key_path));
-            session
-                .userauth_pubkey_file(&req.username, None, std::path::Path::new(key_path), None)
-                .map_err(|e| format!("Key auth failed: {}", e))?;
-        } else if let Some(password) = &req.password {
-            log("authenticating", "Using password authentication...");
-            session
-                .userauth_password(&req.username, password)
-                .map_err(|e| format!("Password auth failed: {}", e))?;
-        } else {
-            log("authenticating", "Trying SSH agent...");
-            session
-                .userauth_agent(&req.username)
-                .map_err(|e| format!("Agent auth failed: {}", e))?;
-        }
-
-        if !session.authenticated() {
-            return Err("Authentication failed".to_string());
-        }
+        let key_path = req.private_key_path.as_deref().map(std::path::Path::new);
+        let cfg = ssh::SshConfig {
+            hostname: &req.hostname,
+            port: req.port,
+            username: &req.username,
+            password: req.password.as_deref(),
+            key_path,
+        };
+        let session = ssh::connect(&cfg, &log)?;
 
         let remote_path = req
             .default_remote_path
@@ -614,7 +583,16 @@ impl SftpManager {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "file".to_string());
-        let tmp_path = format!("/tmp/termifai_{}_{}", session_id, file_name);
+
+        let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+        let rand_id = &rand_id[..8];
+        let app_temp_dir = std::env::temp_dir()
+            .join("termifai")
+            .join(format!("{}_{}", session_id, rand_id));
+        std::fs::create_dir_all(&app_temp_dir)
+            .map_err(|e| format!("Create temp dir failed: {}", e))?;
+        let tmp_path = app_temp_dir.join(file_name);
+
         let entry = self
             .sessions
             .get(session_id)
@@ -627,10 +605,10 @@ impl SftpManager {
             .open(std::path::Path::new(remote_path))
             .map_err(|e| format!("Open remote '{}': {}", remote_path, e))?;
         let mut local_file = std::fs::File::create(&tmp_path)
-            .map_err(|e| format!("Create tmp '{}': {}", tmp_path, e))?;
+            .map_err(|e| format!("Create tmp '{:?}': {}", tmp_path, e))?;
         std::io::copy(&mut remote_file, &mut local_file)
             .map_err(|e| format!("Copy to tmp: {}", e))?;
-        Ok(tmp_path)
+        Ok(tmp_path.to_string_lossy().to_string())
     }
 
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
