@@ -497,6 +497,18 @@ function TitleBar({
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   );
 
+  // On macOS the green zoom button also enters native fullscreen, which hides the
+  // traffic lights — collapse their reserved space then so tabs don't sit in a gap.
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  useEffect(() => {
+    if (platform !== "macos") return;
+    const win = getCurrentWindow();
+    void win.isFullscreen().then(setIsFullscreen);
+    let unlisten: (() => void) | undefined;
+    void win.onResized(() => { void win.isFullscreen().then(setIsFullscreen); }).then((fn) => { unlisten = fn; });
+    return () => unlisten?.();
+  }, [platform]);
+
   const handleDragEnd = (e: DragEndEvent) => {
     const { active, over } = e;
     if (!over || active.id === over.id) return;
@@ -508,8 +520,13 @@ function TitleBar({
 
   return (
     <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none" data-tauri-drag-region>
-      {/* Space for native macOS traffic lights */}
-      {platform === "macos" && <div className="w-[80px] h-full shrink-0 flex items-center" />}
+      {/* Space for native macOS traffic lights — collapses in fullscreen, where they hide */}
+      {platform === "macos" && (
+        <div
+          className="h-full shrink-0 flex items-center overflow-hidden transition-[width] duration-200"
+          style={{ width: isFullscreen ? 0 : 80 }}
+        />
+      )}
       {platform !== "macos" && <div className="w-3 h-full shrink-0" />}
 
       <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" data-tauri-drag-region>
@@ -625,21 +642,21 @@ function WindowControls() {
     <div className="flex items-center h-full shrink-0">
       <button
         onClick={() => void win.minimize()}
-        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground transition-colors"
+        className="flex h-full w-11 items-center justify-center text-muted-foreground outline-none hover:bg-[var(--color-surface-2)] hover:text-foreground focus:outline-none focus-visible:outline-none transition-colors"
         aria-label="Minimize"
       >
         <Minus className="h-3.5 w-3.5" />
       </button>
       <button
         onClick={() => void win.toggleMaximize()}
-        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground transition-colors"
+        className="flex h-full w-11 items-center justify-center text-muted-foreground outline-none hover:bg-[var(--color-surface-2)] hover:text-foreground focus:outline-none focus-visible:outline-none transition-colors"
         aria-label="Maximize"
       >
         <Square className="h-3 w-3" />
       </button>
       <button
         onClick={() => void win.close()}
-        className="flex h-full w-11 items-center justify-center text-muted-foreground hover:bg-red-500 hover:text-white transition-colors"
+        className="flex h-full w-11 items-center justify-center text-muted-foreground outline-none hover:bg-red-500 hover:text-white focus:outline-none focus-visible:outline-none transition-colors"
         aria-label="Close"
       >
         <X className="h-3.5 w-3.5" />
