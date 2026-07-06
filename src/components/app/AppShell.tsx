@@ -4380,11 +4380,47 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+// Windows local paths look like "C:\Users\admin\Desktop"; everything else (macOS/Linux) uses "/".
+function isWindowsLocalPath(path: string): boolean {
+  return /^[A-Za-z]:/.test(path);
+}
+
+function getLocalPathRoot(path: string): string {
+  return isWindowsLocalPath(path) ? `${path.slice(0, 2)}\\` : "/";
+}
+
+function getLocalPathParts(path: string): string[] {
+  if (isWindowsLocalPath(path)) {
+    return path.slice(2).split(/[\\/]+/).filter(Boolean);
+  }
+  return path.split("/").filter(Boolean);
+}
+
+function joinLocalPath(path: string, parts: string[]): string {
+  const sep = isWindowsLocalPath(path) ? "\\" : "/";
+  return getLocalPathRoot(path) + parts.join(sep);
+}
+
+function isLocalPathAtRoot(path: string): boolean {
+  return path === getLocalPathRoot(path);
+}
+
+function getLocalParentPath(path: string): string {
+  return joinLocalPath(path, getLocalPathParts(path).slice(0, -1));
+}
+
 function SftpView({ tab }: { tab: AppTab }) {
   const [localPath, setLocalPath] = useState("/");
   const [localFiles, setLocalFiles] = useState<LocalFileEntry[]>([]);
   const [localLoading, setLocalLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  // Rows own the only real scroll area (both axes); the breadcrumb+header strip above them
+  // has no scrollbar of its own — its scrollLeft is mirrored from the rows viewport so the
+  // two stay in sync horizontally while only the rows scroll vertically.
+  const localHeaderRef = useRef<HTMLDivElement>(null);
+  const localRowsRootRef = useRef<HTMLDivElement>(null);
+  const remoteHeaderRef = useRef<HTMLDivElement>(null);
+  const remoteRowsRootRef = useRef<HTMLDivElement>(null);
 
   const [sftpSessionId] = useState(() => `sftp-${tab.id}-${Date.now()}`);
   const [pickedHostId, setPickedHostId] = useState<string | undefined>(tab.sftpHostId);
@@ -4574,7 +4610,7 @@ function SftpView({ tab }: { tab: AppTab }) {
         await invokeTransfer("sftp_download", {
           sessionId: sftpSessionId,
           remotePath: rp,
-          localPath: `${localPath}/${fileName}`,
+          localPath: joinLocalPath(localPath, [...getLocalPathParts(localPath), fileName]),
         });
       }
       await loadLocalDir(localPath);
@@ -4782,8 +4818,45 @@ function SftpView({ tab }: { tab: AppTab }) {
       .catch(() => loadLocalDir(localPath));
   }, []); // load on mount
 
-  const localParent = localPath.split("/").slice(0, -1).join("/") || "/";
-  const localPathParts = localPath.split("/").filter(Boolean);
+  const localParent = getLocalParentPath(localPath);
+  const localPathParts = getLocalPathParts(localPath);
+
+  // Mirror the rows' horizontal scroll position onto the (non-scrolling) breadcrumb+header
+  // strip above them, so the two stay in sync without nesting a second ScrollArea (nesting
+  // broke flex-1 height sizing — Radix's Viewport wraps children in a `display:table` div,
+  // which isn't a flex container, so the inner rows ScrollArea could no longer fill its
+  // parent's remaining height and vertical scrolling stopped working).
+  useEffect(() => {
+    const viewport = localRowsRootRef.current?.querySelector<HTMLDivElement>("[data-radix-scroll-area-viewport]");
+    const header = localHeaderRef.current;
+    if (!viewport || !header) return;
+    const onScroll = () => { header.scrollLeft = viewport.scrollLeft; };
+    viewport.addEventListener("scroll", onScroll);
+    return () => viewport.removeEventListener("scroll", onScroll);
+  }, []);
+
+  useEffect(() => {
+    const viewport = remoteRowsRootRef.current?.querySelector<HTMLDivElement>("[data-radix-scroll-area-viewport]");
+    const header = remoteHeaderRef.current;
+    if (!viewport || !header) return;
+    const onScroll = () => { header.scrollLeft = viewport.scrollLeft; };
+    viewport.addEventListener("scroll", onScroll);
+    return () => viewport.removeEventListener("scroll", onScroll);
+  }, [isConnected]);
+
+  // Reset to the start (Name column visible) whenever the path changes, rather than
+  // keeping whatever horizontal scroll offset was left over from the previous folder.
+  useEffect(() => {
+    const viewport = localRowsRootRef.current?.querySelector<HTMLDivElement>("[data-radix-scroll-area-viewport]");
+    if (viewport) viewport.scrollLeft = 0;
+    if (localHeaderRef.current) localHeaderRef.current.scrollLeft = 0;
+  }, [localPath]);
+
+  useEffect(() => {
+    const viewport = remoteRowsRootRef.current?.querySelector<HTMLDivElement>("[data-radix-scroll-area-viewport]");
+    if (viewport) viewport.scrollLeft = 0;
+    if (remoteHeaderRef.current) remoteHeaderRef.current.scrollLeft = 0;
+  }, [remotePath]);
 
   return (
     <div className="flex h-full min-h-0 flex-1 flex-col">
@@ -4875,40 +4948,42 @@ function SftpView({ tab }: { tab: AppTab }) {
           </div>
         </div>
 
-        {/* Breadcrumb */}
-        <div className="flex items-center gap-1 border-b border-border px-4 py-2 text-xs text-muted-foreground overflow-x-auto">
-          <button
-            className="hover:text-foreground"
-            onClick={() => void loadLocalDir("/")}
-          >
-            /
-          </button>
-          {localPathParts.map((part, i) => {
-            const partPath = "/" + localPathParts.slice(0, i + 1).join("/");
-            return (
-              <span key={partPath} className="flex items-center gap-1">
-                <span className="opacity-40">›</span>
-                <button
-                  className="hover:text-foreground"
-                  onClick={() => void loadLocalDir(partPath)}
-                >
-                  {part}
-                </button>
-              </span>
-            );
-          })}
-        </div>
-
-        {/* Column headers + file list — shared horizontal scroll */}
-        <div className="flex min-h-0 flex-1 flex-col overflow-x-auto">
-          <div className="grid min-w-[560px] grid-cols-[1fr_180px_100px_80px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
-            <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
+        {/* Breadcrumb + column headers stay pinned above the file list; their scrollLeft is
+            mirrored from the rows ScrollArea (see the sync effect above) so they visually track
+            its horizontal position without needing a scrollbar of their own. */}
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div ref={localHeaderRef} className="overflow-hidden">
+            <div className="flex min-w-[560px] items-center gap-1 border-b border-border px-4 py-2 text-xs text-muted-foreground">
+              <button
+                className="hover:text-foreground"
+                onClick={() => void loadLocalDir(getLocalPathRoot(localPath))}
+              >
+                <HardDrive className="h-3.5 w-3.5" />
+              </button>
+              {localPathParts.map((part, i) => {
+                const partPath = joinLocalPath(localPath, localPathParts.slice(0, i + 1));
+                return (
+                  <span key={partPath} className="flex items-center gap-1">
+                    <span className="opacity-40">›</span>
+                    <button
+                      className="hover:text-foreground"
+                      onClick={() => void loadLocalDir(partPath)}
+                    >
+                      {part}
+                    </button>
+                  </span>
+                );
+              })}
+            </div>
+            <div className="grid min-w-[560px] grid-cols-[1fr_180px_100px_80px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
+              <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
+            </div>
           </div>
           <SftpEmptyContextMenu
             onNewFolder={() => setNewFolderTarget("local")}
             onRefresh={() => void loadLocalDir(localPath)}
           >
-          <div className="flex-1 overflow-y-auto" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedLocal(new Set()); setLastLocalClick(null); } }}>
+          <ScrollArea ref={localRowsRootRef} orientation="both" className="min-w-0 flex-1" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedLocal(new Set()); setLastLocalClick(null); } }}>
             {localLoading && (
               <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
             )}
@@ -4917,7 +4992,7 @@ function SftpView({ tab }: { tab: AppTab }) {
             )}
             {!localLoading && !localError && (
               <>
-                {localPath !== "/" && (
+                {!isLocalPathAtRoot(localPath) && (
                   <div
                     className="grid min-w-[560px] grid-cols-[1fr_180px_100px_80px] cursor-pointer items-center px-4 py-2 text-sm hover:bg-[var(--color-surface)]"
                     onDoubleClick={() => void loadLocalDir(localParent)}
@@ -4994,7 +5069,7 @@ function SftpView({ tab }: { tab: AppTab }) {
                 ))}
               </>
             )}
-          </div>
+          </ScrollArea>
           </SftpEmptyContextMenu>
         </div>
       </div>
@@ -5128,34 +5203,36 @@ function SftpView({ tab }: { tab: AppTab }) {
         {/* Connected file browser */}
         {isConnected && (
           <>
-            {/* Breadcrumb */}
-            <div className="flex items-center gap-1 border-b border-border px-4 py-2 text-xs text-muted-foreground overflow-x-auto">
-              <button className="hover:text-foreground" onClick={() => void loadRemoteDir("/")}>
-                /
-              </button>
-              {remotePath.split("/").filter(Boolean).map((part, i, arr) => {
-                const partPath = "/" + arr.slice(0, i + 1).join("/");
-                return (
-                  <span key={partPath} className="flex items-center gap-1">
-                    <span className="opacity-40">›</span>
-                    <button className="hover:text-foreground" onClick={() => void loadRemoteDir(partPath)}>
-                      {part}
-                    </button>
-                  </span>
-                );
-              })}
-            </div>
-
-            {/* Column headers + file list — shared horizontal scroll */}
-            <div className="flex min-h-0 flex-1 flex-col overflow-x-auto">
-              <div className="grid min-w-[500px] grid-cols-[1fr_160px_90px_70px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
-                <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
+            {/* Breadcrumb + column headers stay pinned above the file list; their scrollLeft is
+                mirrored from the rows ScrollArea (see the sync effect above) so they visually
+                track its horizontal position without needing a scrollbar of their own. */}
+            <div className="flex min-h-0 flex-1 flex-col">
+              <div ref={remoteHeaderRef} className="overflow-hidden">
+                <div className="flex min-w-[500px] items-center gap-1 border-b border-border px-4 py-2 text-xs text-muted-foreground">
+                  <button className="hover:text-foreground" onClick={() => void loadRemoteDir("/")}>
+                    <HardDrive className="h-3.5 w-3.5" />
+                  </button>
+                  {remotePath.split("/").filter(Boolean).map((part, i, arr) => {
+                    const partPath = "/" + arr.slice(0, i + 1).join("/");
+                    return (
+                      <span key={partPath} className="flex items-center gap-1">
+                        <span className="opacity-40">›</span>
+                        <button className="hover:text-foreground" onClick={() => void loadRemoteDir(partPath)}>
+                          {part}
+                        </button>
+                      </span>
+                    );
+                  })}
+                </div>
+                <div className="grid min-w-[500px] grid-cols-[1fr_160px_90px_70px] border-b border-border px-4 py-2 text-[11px] uppercase tracking-wider text-muted-foreground">
+                  <span>Name</span><span>Date Modified</span><span>Size</span><span>Kind</span>
+                </div>
               </div>
               <SftpEmptyContextMenu
                 onNewFolder={() => setNewFolderTarget("remote")}
                 onRefresh={() => remotePath && void loadRemoteDir(remotePath)}
               >
-              <div className="flex-1 overflow-y-auto" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedRemote(new Set()); setLastRemoteClick(null); } }}>
+              <ScrollArea ref={remoteRowsRootRef} orientation="both" className="min-w-0 flex-1" onClick={(e) => { if (e.target === e.currentTarget) { setSelectedRemote(new Set()); setLastRemoteClick(null); } }}>
                 {remoteLoading && (
                   <div className="px-4 py-8 text-center text-sm text-muted-foreground">Loading...</div>
                 )}
@@ -5247,7 +5324,7 @@ function SftpView({ tab }: { tab: AppTab }) {
                     ))}
                   </>
                 )}
-              </div>
+              </ScrollArea>
               </SftpEmptyContextMenu>
             </div>
           </>
@@ -5363,7 +5440,7 @@ function SftpView({ tab }: { tab: AppTab }) {
         open={newFolderTarget !== null}
         onConfirm={(name) => {
           if (newFolderTarget === "local") {
-            void invoke("sftp_mkdir_local", { path: `${localPath}/${name}` })
+            void invoke("sftp_mkdir_local", { path: joinLocalPath(localPath, [...getLocalPathParts(localPath), name]) })
               .then(() => loadLocalDir(localPath))
               .catch((e: unknown) => toast.error(String(e)));
           } else if (newFolderTarget === "remote" && remotePath) {
