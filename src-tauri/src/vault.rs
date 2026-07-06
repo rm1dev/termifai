@@ -160,7 +160,8 @@ pub fn op_init(app: &AppHandle, master_password: &str) -> Result<(), String> {
     if hosts::read_crypto_meta(app)?.is_some() {
         return Err("Vault is already initialized".to_string());
     }
-    let v = crypto::create_vault(master_password).map_err(|_| "Failed to create vault".to_string())?;
+    let v =
+        crypto::create_vault(master_password).map_err(|_| "Failed to create vault".to_string())?;
     hosts::write_crypto_meta(
         app,
         CryptoMeta {
@@ -179,11 +180,16 @@ pub fn op_init(app: &AppHandle, master_password: &str) -> Result<(), String> {
 /// Unlock with an explicit master password. Caches per policy on success.
 pub fn op_unlock(app: &AppHandle, master_password: &str) -> Result<(), String> {
     let meta = hosts::read_crypto_meta(app)?.ok_or("Vault is not initialized")?;
-    let key = crypto::unlock_vault(master_password, &meta.salt, &meta.wrapped_key, &meta.verifier)
-        .map_err(|e| match e {
-            crypto::CryptoError::WrongPassword => "Incorrect master password".to_string(),
-            _ => "Failed to unlock vault".to_string(),
-        })?;
+    let key = crypto::unlock_vault(
+        master_password,
+        &meta.salt,
+        &meta.wrapped_key,
+        &meta.verifier,
+    )
+    .map_err(|e| match e {
+        crypto::CryptoError::WrongPassword => "Incorrect master password".to_string(),
+        _ => "Failed to unlock vault".to_string(),
+    })?;
     set_unlocked(key);
     cache_for_policy(app, master_password);
     hosts::migrate_plaintext_passwords(app)?;
@@ -230,12 +236,14 @@ pub fn op_change_master_password(app: &AppHandle, old: &str, new: &str) -> Resul
         return Err("New master password cannot be empty".to_string());
     }
     let meta = hosts::read_crypto_meta(app)?.ok_or("Vault is not initialized")?;
-    let v = crypto::rewrap(old, &meta.salt, &meta.wrapped_key, &meta.verifier, new).map_err(|e| {
-        match e {
-            crypto::CryptoError::WrongPassword => "Current master password is incorrect".to_string(),
+    let v = crypto::rewrap(old, &meta.salt, &meta.wrapped_key, &meta.verifier, new).map_err(
+        |e| match e {
+            crypto::CryptoError::WrongPassword => {
+                "Current master password is incorrect".to_string()
+            }
             _ => "Failed to change master password".to_string(),
-        }
-    })?;
+        },
+    )?;
     hosts::write_crypto_meta(
         app,
         CryptoMeta {
