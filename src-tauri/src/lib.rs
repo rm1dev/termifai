@@ -5,6 +5,7 @@ mod port_forwarding;
 mod pty_manager;
 mod sftp;
 mod snippets;
+mod ssh;
 mod ssh_keys;
 mod vault;
 use dashboard::DashboardManager;
@@ -62,15 +63,27 @@ fn create_session(
     state: State<AppState>,
     cwd: String,
     initial_command: Option<String>,
-    initial_password: Option<String>,
+    host_id: Option<String>,
     ready_marker: Option<String>,
 ) -> Result<TabInfo, String> {
+    let password = if let Some(ref h_id) = host_id {
+        let vault = hosts::list_hosts(&app)?;
+        let host = vault
+            .hosts
+            .iter()
+            .find(|h| h.id == *h_id)
+            .ok_or_else(|| "Host not found".to_string())?;
+        hosts::decrypt_host_password(host)
+    } else {
+        None
+    };
+
     let manager = state.pty_manager.lock().unwrap();
     manager.create_session(
         &app,
         &cwd,
         initial_command.as_deref(),
-        initial_password.as_deref(),
+        password.as_deref(),
         ready_marker.as_deref(),
     )
 }
@@ -249,16 +262,7 @@ fn set_vault_lock_policy(app: tauri::AppHandle, policy: String) -> Result<(), St
     vault::set_lock_policy(&app, p)
 }
 
-#[tauri::command]
-fn get_host_password(app: tauri::AppHandle, host_id: String) -> Result<Option<String>, String> {
-    let vault = hosts::list_hosts(&app)?;
-    let host = vault
-        .hosts
-        .iter()
-        .find(|h| h.id == host_id)
-        .ok_or_else(|| "Host not found".to_string())?;
-    Ok(hosts::decrypt_host_password(host))
-}
+
 
 #[tauri::command]
 async fn test_host_connection(
@@ -347,26 +351,23 @@ fn run_snippet_script(
     // Instead we use heredoc via PTY to write the script to /tmp on the target machine,
     // then execute it. The heredoc content is NOT echoed by the shell (only the cat command is).
     // A wrapper script erases the visible command line with ANSI escapes.
-    //
     // The full sequence sent to PTY:
-    //   printf '\033[1A\033[2K\r' && cat > /tmp/termifai_s_ID.sh << 'TERMIFAI_SNIPPET_EOF'
+    //   printf '\033[1A\033[2K\r' && f=$(mktemp /tmp/termifai_XXXXXXXX.sh) && cat > "$f" << 'TERMIFAI_EOF_random'
     //   [script content - not echoed by shell]
-    //   TERMIFAI_SNIPPET_EOF
-    //   chmod +x /tmp/termifai_s_ID.sh && bash /tmp/termifai_s_ID.sh; rm -f /tmp/termifai_s_ID.sh
+    //   TERMIFAI_EOF_random
+    //   chmod +x "$f" && bash "$f"; rm -f "$f"
 
-    let script_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let script_id = &script_id[..8];
-    let tmp_path = format!("/tmp/termifai_s_{}.sh", script_id);
-    let eof_marker = "TERMIFAI_SNIPPET_EOF";
+    let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let rand_id = &rand_id[..8];
+    let eof_marker = format!("TERMIFAI_EOF_{}", rand_id);
 
     // Build the full payload to send to PTY
-    // Line 1: erase the echoed command + write script via heredoc
+    // Line 1: erase the echoed command + create temp file + write script via heredoc
     // Line 2..N: script content (shell does NOT echo heredoc body)
     // Last line: EOF marker
     // Then: chmod + execute + cleanup
     let payload = format!(
-        " printf '\\033[1A\\033[2K\\r' && cat > {path} << '{eof}'\r{script}\r{eof}\rchmod +x {path} && bash {path}; rm -f {path}\r",
-        path = tmp_path,
+        " printf '\\033[1A\\033[2K\\r' && f=$(mktemp /tmp/termifai_XXXXXXXX.sh) && cat > \"$f\" << '{eof}'\r{script}\r{eof}\rchmod +x \"$f\" && bash \"$f\"; rm -f \"$f\"\r",
         eof = eof_marker,
         script = script.replace('\r', ""),
     );
@@ -1092,7 +1093,7 @@ pub fn run() {
             vault_change_master_password,
             get_vault_lock_policy,
             set_vault_lock_policy,
-            get_host_password,
+
             test_host_connection,
             list_port_forwards,
             save_port_forward,
