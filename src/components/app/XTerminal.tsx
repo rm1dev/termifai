@@ -32,7 +32,7 @@ import { Search } from "lucide-react";
 interface Props {
   sessionId?: string;
   initialCommand?: string;
-  initialPassword?: string;
+  hostId?: string;
   readyMarker?: string;
   connectionLabel?: string;
   connectionTitle?: string;
@@ -147,7 +147,7 @@ function EnumDropdown({
   );
 }
 
-export function XTerminal({ sessionId, initialCommand, initialPassword, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated }: Props) {
+export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [isConnecting, setIsConnecting] = useState(Boolean(readyMarker && !sessionId));
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
@@ -362,7 +362,7 @@ export function XTerminal({ sessionId, initialCommand, initialPassword, readyMar
           const info = await invoke<{ id: string; label: string }>("create_session", {
             cwd: "",
             initialCommand: initialCommand ?? null,
-            initialPassword: initialPassword ?? null,
+            hostId: hostId ?? null,
             readyMarker: readyMarker ?? null,
           });
           sid = info.id;

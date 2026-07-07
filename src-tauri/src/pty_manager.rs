@@ -64,7 +64,6 @@ impl PtyManager {
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
-
         let cwd_path = if !cwd.is_empty() {
             Some(cwd.to_string())
         } else {
@@ -115,8 +114,7 @@ impl PtyManager {
             .unwrap()
             .insert(session_id.clone(), session);
 
-        let mut connection_tracker =
-            ConnectionTracker::new(app.clone(), ready_marker.as_deref());
+        let mut connection_tracker = ConnectionTracker::new(app.clone(), ready_marker.as_deref());
         connection_tracker.start();
 
         thread::spawn(move || {
@@ -146,17 +144,22 @@ impl PtyManager {
                         if !ready {
                             connection_tracker.handle_output(&data, ready_marker.as_deref());
                         }
-                        if !password_sent {
+                        if !password_sent && !ready {
                             if let Some(password) = password_for_prompt.as_deref() {
-                                recent_output.push_str(&String::from_utf8_lossy(&buf[..n]).to_lowercase());
+                                recent_output
+                                    .push_str(&String::from_utf8_lossy(&buf[..n]).to_lowercase());
                                 if recent_output.len() > 2048 {
                                     let keep_from = recent_output.len().saturating_sub(2048);
                                     recent_output = recent_output[keep_from..].to_string();
                                 }
                                 if recent_output.contains("password:") {
                                     if let Ok(mut sessions) = sessions_for_password.lock() {
-                                        if let Some(session) = sessions.get_mut(&password_session_id) {
-                                            let _ = session.writer.write_all(format!("{}\r", password).as_bytes());
+                                        if let Some(session) =
+                                            sessions.get_mut(&password_session_id)
+                                        {
+                                            let _ = session
+                                                .writer
+                                                .write_all(format!("{}\r", password).as_bytes());
                                             let _ = session.writer.flush();
                                             password_sent = true;
                                         }
@@ -168,7 +171,9 @@ impl PtyManager {
                             let _ = app_handle.emit(&event_name, data);
                         } else if let Some(marker) = ready_marker.as_deref() {
                             pending_output.push_str(&data);
-                            if let Some(marker_end) = find_ready_marker_line(&pending_output, marker) {
+                            if let Some(marker_end) =
+                                find_ready_marker_line(&pending_output, marker)
+                            {
                                 ready = true;
                                 connection_tracker.complete();
                                 let _ = app_handle.emit(&event_name, "\x1b[2J\x1b[H".to_string());
@@ -337,7 +342,10 @@ fn parse_posix_command(cmd: &str) -> Vec<String> {
                         Some('"') => break,
                         Some('\\') => match chars.next() {
                             Some(ch @ ('"' | '\\' | '$' | '`' | '\n')) => current.push(ch),
-                            Some(ch) => { current.push('\\'); current.push(ch); }
+                            Some(ch) => {
+                                current.push('\\');
+                                current.push(ch);
+                            }
                             None => break,
                         },
                         Some(ch) => current.push(ch),
@@ -428,7 +436,10 @@ impl ConnectionTracker {
         } else if lower.contains("are you sure you want to continue connecting") {
             // Host key not yet in known_hosts — accept-new flag should handle this automatically,
             // but if it doesn't (older SSH), surface it as a handshake failure
-            self.fail("handshaking", "Host key not verified. Check SSH client version.");
+            self.fail(
+                "handshaking",
+                "Host key not verified. Check SSH client version.",
+            );
         } else if lower.contains("host key verification failed")
             || lower.contains("no matching host key type")
             || lower.contains("no matching key exchange method")

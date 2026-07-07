@@ -42,7 +42,7 @@ export interface AppTab {
   closable: boolean;
   sessionId?: string; // for terminal tabs to preserve session across switches
   initialCommand?: string;
-  initialPassword?: string;
+
   readyMarker?: string;
   connectionLabel?: string;
   connectionTitle?: string;
