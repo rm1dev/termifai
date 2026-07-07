@@ -1,8 +1,7 @@
+use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -54,10 +53,16 @@ pub struct SavePortForwardRequest {
     pub auto_connect: bool,
 }
 
+fn default_version() -> u32 {
+    1
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct PortForwardVault {
-    rules: Vec<PortForwardRule>,
+pub struct PortForwardVault {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub rules: Vec<PortForwardRule>,
 }
 
 /// Manages running SSH tunnel processes.
@@ -80,8 +85,19 @@ pub fn new_tunnel_manager() -> TunnelManagerState {
     Mutex::new(TunnelManager::new())
 }
 
+fn migrate_port_forward_vault(value: &mut serde_json::Value) {
+    if value.get("version").is_none() {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("version".to_string(), serde_json::Value::from(1u32));
+        }
+    }
+}
+
 pub fn list_port_forwards(app: &AppHandle) -> Result<Vec<PortForwardRule>, String> {
-    let vault = read_vault(app)?;
+    let state = app.state::<AppState>();
+    let vault = state.port_forward_store
+        .load_with_migration(migrate_port_forward_vault)
+        .map_err(|e| e.to_string())?;
     Ok(vault.rules)
 }
 
@@ -103,43 +119,48 @@ pub fn save_port_forward(
         return Err("Remote port must be between 1 and 65535".to_string());
     }
 
-    let mut vault = read_vault(app)?;
     let id = request
         .id
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("pf-{}", uuid::Uuid::new_v4()));
 
     let now = now_iso();
-    let existing_created = vault
-        .rules
-        .iter()
-        .find(|r| r.id == id)
-        .map(|r| r.created_at.clone());
+    let state = app.state::<AppState>();
+    let mut saved_rule = None;
 
-    let rule = PortForwardRule {
-        id: id.clone(),
-        name: name.to_string(),
-        host_id: request.host_id.trim().to_string(),
-        direction: request.direction,
-        local_host: if request.local_host.trim().is_empty() {
-            "127.0.0.1".to_string()
-        } else {
-            request.local_host.trim().to_string()
-        },
-        local_port: request.local_port,
-        remote_host: if request.remote_host.trim().is_empty() {
-            "127.0.0.1".to_string()
-        } else {
-            request.remote_host.trim().to_string()
-        },
-        remote_port: request.remote_port,
-        auto_connect: request.auto_connect,
-        created_at: existing_created.unwrap_or(now),
-    };
+    state.port_forward_store.update_with_migration(migrate_port_forward_vault, |vault| {
+        let existing_created = vault
+            .rules
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.created_at.clone());
 
-    upsert_by_id(&mut vault.rules, rule.clone(), |r| &r.id);
-    write_vault(app, &vault)?;
-    Ok(rule)
+        let rule = PortForwardRule {
+            id: id.clone(),
+            name: name.to_string(),
+            host_id: request.host_id.trim().to_string(),
+            direction: request.direction,
+            local_host: if request.local_host.trim().is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                request.local_host.trim().to_string()
+            },
+            local_port: request.local_port,
+            remote_host: if request.remote_host.trim().is_empty() {
+                "127.0.0.1".to_string()
+            } else {
+                request.remote_host.trim().to_string()
+            },
+            remote_port: request.remote_port,
+            auto_connect: request.auto_connect,
+            created_at: existing_created.unwrap_or(now),
+        };
+
+        upsert_by_id(&mut vault.rules, rule.clone(), |r| &r.id);
+        saved_rule = Some(rule);
+    }).map_err(|e| e.to_string())?;
+
+    saved_rule.ok_or_else(|| "Failed to save rule".to_string())
 }
 
 pub fn remove_port_forwards(
@@ -156,9 +177,11 @@ pub fn remove_port_forwards(
         }
     }
 
-    let mut vault = read_vault(app)?;
-    vault.rules.retain(|r| !ids.contains(&r.id));
-    write_vault(app, &vault)
+    let state = app.state::<AppState>();
+    state.port_forward_store.update_with_migration(migrate_port_forward_vault, |vault| {
+        vault.rules.retain(|r| !ids.contains(&r.id));
+    }).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub fn start_tunnel(
@@ -166,7 +189,10 @@ pub fn start_tunnel(
     tunnel_mgr: &TunnelManagerState,
     rule_id: String,
 ) -> Result<TunnelStatus, String> {
-    let vault = read_vault(app)?;
+    let state = app.state::<AppState>();
+    let vault = state.port_forward_store
+        .load_with_migration(migrate_port_forward_vault)
+        .map_err(|e| e.to_string())?;
     let rule = vault
         .rules
         .iter()
@@ -436,37 +462,7 @@ pub fn get_tunnel_statuses(
     statuses
 }
 
-// --- Storage helpers ---
 
-fn read_vault(app: &AppHandle) -> Result<PortForwardVault, String> {
-    let path = vault_path(app)?;
-    if !path.exists() {
-        return Ok(PortForwardVault::default());
-    }
-    let contents = fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read port forward vault: {}", e))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("Failed to parse port forward vault: {}", e))
-}
-
-fn write_vault(app: &AppHandle, vault: &PortForwardVault) -> Result<(), String> {
-    let path = vault_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create port forward vault directory: {}", e))?;
-    }
-    let json = serde_json::to_string_pretty(vault)
-        .map_err(|e| format!("Failed to serialize port forward vault: {}", e))?;
-    fs::write(path, json).map_err(|e| format!("Failed to save port forward vault: {}", e))
-}
-
-fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?
-        .join("port_forwards.json"))
-}
 
 fn upsert_by_id<T, F>(items: &mut Vec<T>, item: T, id: F)
 where

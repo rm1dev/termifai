@@ -1,5 +1,5 @@
 use crate::crypto::{self, VaultKey};
-use crate::hosts::{self, CryptoMeta};
+use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -68,46 +68,84 @@ pub enum LockPolicy {
     OnScreenLock,
 }
 
+fn default_version() -> u32 {
+    1
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoMeta {
+    pub kdf: String,
+    pub salt: String,
+    pub wrapped_key: String,
+    pub verifier: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CryptoVault {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    pub crypto: Option<CryptoMeta>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-struct VaultSettings {
+pub struct VaultSettings {
+    #[serde(default = "default_version")]
+    pub version: u32,
     #[serde(default)]
-    lock_policy: LockPolicy,
+    pub lock_policy: LockPolicy,
 }
 
-fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve data dir: {e}"))?
-        .join("vault_settings.json"))
-}
-
-fn read_settings(app: &AppHandle) -> VaultSettings {
-    settings_path(app)
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn write_settings(app: &AppHandle, settings: &VaultSettings) -> Result<(), String> {
-    let path = settings_path(app)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+fn migrate_vault_settings(value: &mut serde_json::Value) {
+    if value.get("version").is_none() {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("version".to_string(), serde_json::Value::from(1u32));
+        }
     }
-    let json = serde_json::to_string_pretty(settings).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("write: {e}"))
+}
+
+pub fn read_crypto_meta(app: &AppHandle) -> Result<Option<CryptoMeta>, String> {
+    let state = app.state::<AppState>();
+    let vault = state.vault_crypto_store.load().map_err(|e| e.to_string())?;
+    Ok(vault.crypto)
+}
+
+pub fn write_crypto_meta(app: &AppHandle, meta: CryptoMeta) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state.vault_crypto_store.update(|vault| {
+        vault.crypto = Some(meta);
+    }).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+pub fn migrate_crypto_meta_from_hosts(app: &AppHandle, crypto_meta: CryptoMeta) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state.vault_crypto_store.update(|vault| {
+        if vault.crypto.is_none() {
+            vault.crypto = Some(crypto_meta);
+        }
+    }).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub fn get_lock_policy(app: &AppHandle) -> LockPolicy {
-    read_settings(app).lock_policy
+    let state = app.state::<AppState>();
+    state.vault_settings_store
+        .load_with_migration(migrate_vault_settings)
+        .map(|s| s.lock_policy)
+        .unwrap_or_default()
 }
 
 pub fn set_lock_policy(app: &AppHandle, policy: LockPolicy) -> Result<(), String> {
-    let mut s = read_settings(app);
-    s.lock_policy = policy;
-    write_settings(app, &s)
+    let state = app.state::<AppState>();
+    state.vault_settings_store
+        .update_with_migration(migrate_vault_settings, |s| {
+            s.lock_policy = policy;
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ── Session token ─────────────────────────────────────────────────────────────
@@ -141,7 +179,7 @@ pub struct VaultStatus {
 }
 
 pub fn op_status(app: &AppHandle) -> Result<VaultStatus, String> {
-    let initialized = hosts::read_crypto_meta(app)?.is_some();
+    let initialized = read_crypto_meta(app)?.is_some();
     Ok(VaultStatus {
         initialized,
         unlocked: is_unlocked(),
@@ -156,12 +194,12 @@ pub fn op_init(app: &AppHandle, master_password: &str) -> Result<(), String> {
     if master_password.is_empty() {
         return Err("Master password cannot be empty".to_string());
     }
-    if hosts::read_crypto_meta(app)?.is_some() {
+    if read_crypto_meta(app)?.is_some() {
         return Err("Vault is already initialized".to_string());
     }
     let v =
         crypto::create_vault(master_password).map_err(|_| "Failed to create vault".to_string())?;
-    hosts::write_crypto_meta(
+    write_crypto_meta(
         app,
         CryptoMeta {
             kdf: "argon2id".to_string(),
@@ -172,13 +210,12 @@ pub fn op_init(app: &AppHandle, master_password: &str) -> Result<(), String> {
     )?;
     set_unlocked(v.key);
     cache_for_policy(app, master_password);
-    hosts::migrate_plaintext_passwords(app)?;
     Ok(())
 }
 
 /// Unlock with an explicit master password. Caches per policy on success.
 pub fn op_unlock(app: &AppHandle, master_password: &str) -> Result<(), String> {
-    let meta = hosts::read_crypto_meta(app)?.ok_or("Vault is not initialized")?;
+    let meta = read_crypto_meta(app)?.ok_or("Vault is not initialized")?;
     let key = crypto::unlock_vault(
         master_password,
         &meta.salt,
@@ -191,14 +228,13 @@ pub fn op_unlock(app: &AppHandle, master_password: &str) -> Result<(), String> {
     })?;
     set_unlocked(key);
     cache_for_policy(app, master_password);
-    hosts::migrate_plaintext_passwords(app)?;
     Ok(())
 }
 
 /// Attempt a silent unlock using the keychain-cached master password.
 /// Returns Ok(true) if unlocked, Ok(false) if no usable cache.
 pub fn op_try_cached_unlock(app: &AppHandle) -> Result<bool, String> {
-    if hosts::read_crypto_meta(app)?.is_none() {
+    if read_crypto_meta(app)?.is_none() {
         return Ok(false);
     }
     let policy = get_lock_policy(app);
@@ -234,7 +270,7 @@ pub fn op_change_master_password(app: &AppHandle, old: &str, new: &str) -> Resul
     if new.is_empty() {
         return Err("New master password cannot be empty".to_string());
     }
-    let meta = hosts::read_crypto_meta(app)?.ok_or("Vault is not initialized")?;
+    let meta = read_crypto_meta(app)?.ok_or("Vault is not initialized")?;
     let v = crypto::rewrap(old, &meta.salt, &meta.wrapped_key, &meta.verifier, new).map_err(
         |e| match e {
             crypto::CryptoError::WrongPassword => {
@@ -243,7 +279,7 @@ pub fn op_change_master_password(app: &AppHandle, old: &str, new: &str) -> Resul
             _ => "Failed to change master password".to_string(),
         },
     )?;
-    hosts::write_crypto_meta(
+    write_crypto_meta(
         app,
         CryptoMeta {
             kdf: "argon2id".to_string(),
