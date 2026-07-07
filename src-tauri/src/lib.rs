@@ -7,6 +7,7 @@ mod sftp;
 mod snippets;
 mod ssh;
 mod ssh_keys;
+mod store;
 mod vault;
 use dashboard::DashboardManager;
 
@@ -55,6 +56,11 @@ struct AppState {
     watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
     dashboard_manager: Mutex<DashboardManager>,
+    hosts_store: store::JsonStore<hosts::HostsVault>,
+    port_forward_store: store::JsonStore<port_forwarding::PortForwardVault>,
+    snippets_store: store::JsonStore<snippets::SnippetsVault>,
+    vault_settings_store: store::JsonStore<vault::VaultSettings>,
+    vault_crypto_store: store::JsonStore<vault::CryptoVault>,
 }
 
 #[tauri::command]
@@ -224,12 +230,16 @@ fn vault_status(app: tauri::AppHandle) -> Result<vault::VaultStatus, String> {
 
 #[tauri::command]
 fn vault_init(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
-    vault::op_init(&app, &master_password)
+    vault::op_init(&app, &master_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
 fn vault_unlock(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
-    vault::op_unlock(&app, &master_password)
+    vault::op_unlock(&app, &master_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -244,7 +254,9 @@ fn vault_change_master_password(
     old_password: String,
     new_password: String,
 ) -> Result<(), String> {
-    vault::op_change_master_password(&app, &old_password, &new_password)
+    vault::op_change_master_password(&app, &old_password, &new_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1061,14 +1073,7 @@ pub fn run() {
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
                 .build(),
         )
-        .manage(AppState {
-            pty_manager: Mutex::new(PtyManager::new()),
-            tunnel_manager: port_forwarding::new_tunnel_manager(),
-            sftp_manager: Mutex::new(SftpManager::new()),
-            watch_handles: Mutex::new(std::collections::HashMap::new()),
-            transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
-            dashboard_manager: Mutex::new(DashboardManager::new()),
-        })
+
         .invoke_handler(tauri::generate_handler![
             create_session,
             write_to_session,
@@ -1148,6 +1153,22 @@ pub fn run() {
             let _ = (window, event);
         })
         .setup(|app| {
+            let app_data_dir = app.path().app_data_dir()
+                .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+
+            app.manage(AppState {
+                pty_manager: Mutex::new(PtyManager::new()),
+                tunnel_manager: port_forwarding::new_tunnel_manager(),
+                sftp_manager: Mutex::new(SftpManager::new()),
+                watch_handles: Mutex::new(std::collections::HashMap::new()),
+                transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
+                dashboard_manager: Mutex::new(DashboardManager::new()),
+                hosts_store: store::JsonStore::new(app_data_dir.join("hosts.json")),
+                port_forward_store: store::JsonStore::new(app_data_dir.join("port_forwards.json")),
+                snippets_store: store::JsonStore::new(app_data_dir.join("snippets.json")),
+                vault_settings_store: store::JsonStore::new(app_data_dir.join("vault_settings.json")),
+                vault_crypto_store: store::JsonStore::new(app_data_dir.join("vault.json")),
+            });
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
             // Also set UTF-8 (codepage 65001) so ConPTY correctly interprets multi-byte
