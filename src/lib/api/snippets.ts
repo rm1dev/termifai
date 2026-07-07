@@ -1,12 +1,12 @@
-import { invoke } from "@tauri-apps/api/core";
+import { call } from "./transport";
 import type { Snippet } from "@/components/app/types";
 
 export function listSnippets(): Promise<Snippet[]> {
-  return invoke<Snippet[]>("list_snippets");
+  return call<Snippet[]>("list_snippets");
 }
 
 export function saveSnippet(s: Snippet): Promise<Snippet> {
-  return invoke<Snippet>("save_snippet", {
+  return call<Snippet>("save_snippet", {
     request: {
       id: s.id,
       kind: s.kind,
@@ -20,5 +20,5 @@ export function saveSnippet(s: Snippet): Promise<Snippet> {
 }
 
 export function removeSnippets(ids: string[]): Promise<void> {
-  return invoke<void>("remove_snippets", { ids });
+  return call<void>("remove_snippets", { ids });
 }

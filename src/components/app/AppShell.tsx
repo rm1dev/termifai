@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, forwardRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
-import { listen } from "@tauri-apps/api/event";
+import { subscribe } from "@/lib/api/transport";
+import { openSettingsWindow, quitApp } from "@/lib/api/terminal";
+import { listSshKeys } from "@/lib/api/ssh-keys";
 import {
   Server,
   Network,
@@ -27,7 +28,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { AppTab, Host, SidebarKey, SshKey, TabKind } from "./types";
+import type { AppTab, Host, SidebarKey, TabKind } from "./types";
 import { XTerminal } from "./XTerminal";
 import {
   isShortcutMatch,
@@ -98,7 +99,7 @@ export function AppShell() {
     let keyArg = "";
     if (host.sshKeyId) {
       try {
-        const keys = await invoke<SshKey[]>("list_ssh_keys");
+        const keys = await listSshKeys();
         const key = keys.find((item) => item.id === host.sshKeyId);
         if (key?.privateKeyPath) keyArg = ` -i ${shellQuote(key.privateKeyPath)}`;
       } catch {
@@ -207,7 +208,7 @@ export function AppShell() {
     void refreshVault();
 
     // Backend locks the vault on screen lock (per policy); re-gate immediately.
-    const unlistenPromise = listen("vault-locked", () => {
+    const unlistenPromise = subscribe("vault-locked", () => {
       setVaultInfo((prev) => ({ initialized: prev?.initialized ?? true, unlocked: false }));
     });
 
@@ -277,7 +278,7 @@ export function AppShell() {
         if (previous) setActiveTab(previous.id);
       } else if (isShortcutMatch(event, shortcuts["open-settings"])) {
         event.preventDefault();
-        invoke("open_settings_window").catch((err) =>
+        openSettingsWindow().catch((err) =>
           console.error("open_settings_window failed:", err)
         );
       } else if (isShortcutMatch(event, shortcuts["lock-vault"])) {
@@ -289,7 +290,7 @@ export function AppShell() {
     window.addEventListener("storage", onStorageChanged);
     window.addEventListener("keydown", onKeyDown);
 
-    listen<ShortcutMap>(shortcutsChangedEvent, (event) => {
+    subscribe<ShortcutMap>(shortcutsChangedEvent, (event) => {
       applyShortcuts(event.payload);
     })
       .then((unlisten) => {
@@ -298,7 +299,7 @@ export function AppShell() {
       })
       .catch(() => {});
 
-    listen("menu-new-terminal", () => {
+    subscribe("menu-new-terminal", () => {
       newTabRef.current("terminal");
     })
       .then((unlisten) => {
@@ -545,7 +546,7 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
           New Terminal
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+T</span>
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => void invoke("open_settings_window")}>
+        <DropdownMenuItem onSelect={() => void openSettingsWindow()}>
           Settings
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
         </DropdownMenuItem>
@@ -559,7 +560,7 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
           {isFullscreen ? "Exit Full Screen" : "Full Screen"}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void invoke("quit_app")}>
+        <DropdownMenuItem onSelect={() => void quitApp()}>
           Quit
           <span className="ml-auto text-xs text-muted-foreground">Alt+F4</span>
         </DropdownMenuItem>

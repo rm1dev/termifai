@@ -1,4 +1,3 @@
-mod crypto;
 pub mod dashboard;
 mod hosts;
 mod port_forwarding;
@@ -7,9 +6,11 @@ mod sftp;
 mod snippets;
 mod ssh;
 mod ssh_keys;
-mod store;
+mod sync;
+mod tombstones;
 mod vault;
 use dashboard::DashboardManager;
+use termifai_core::store;
 
 use hosts::{
     Host, HostGroup, HostsVault, SaveHostGroupRequest, SaveHostRequest, TestHostConnectionRequest,
@@ -61,6 +62,8 @@ struct AppState {
     snippets_store: store::JsonStore<snippets::SnippetsVault>,
     vault_settings_store: store::JsonStore<vault::VaultSettings>,
     vault_crypto_store: store::JsonStore<vault::CryptoVault>,
+    tombstones_store: store::JsonStore<tombstones::TombstonesVault>,
+    sync_state_store: store::JsonStore<termifai_core::model::sync_state::SyncState>,
 }
 
 #[tauri::command]
@@ -211,6 +214,11 @@ fn remove_hosts(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_host_password(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
+    hosts::get_host_password(&app, &id)
+}
+
+#[tauri::command]
 fn save_host_group(
     app: tauri::AppHandle,
     request: SaveHostGroupRequest,
@@ -272,6 +280,64 @@ fn set_vault_lock_policy(app: tauri::AppHandle, policy: String) -> Result<(), St
     let p: vault::LockPolicy = serde_json::from_str(&format!("\"{}\"", policy))
         .map_err(|_| format!("Unknown lock policy: {policy}"))?;
     vault::set_lock_policy(&app, p)
+}
+
+#[tauri::command]
+fn sync_get_config(app: tauri::AppHandle) -> Result<sync::SyncStatusDto, String> {
+    sync::sync_get_config(&app)
+}
+
+#[tauri::command]
+async fn sync_connect_provider(app: tauri::AppHandle, provider: String) -> Result<String, String> {
+    sync::sync_connect_provider(app, provider).await
+}
+
+#[tauri::command]
+fn sync_set_config(
+    app: tauri::AppHandle,
+    request: sync::SetSyncConfigRequest,
+) -> Result<(), String> {
+    sync::sync_set_config(&app, request)
+}
+
+#[tauri::command]
+fn sync_status(app: tauri::AppHandle) -> Result<sync::SyncStatusDto, String> {
+    sync::sync_status(&app)
+}
+
+#[tauri::command]
+fn sync_disconnect(app: tauri::AppHandle, delete_remote: bool) -> Result<(), String> {
+    sync::sync_disconnect(&app, delete_remote)
+}
+
+#[tauri::command]
+async fn sync_now(
+    app: tauri::AppHandle,
+    request: sync::SyncNowRequest,
+) -> Result<sync::SyncNowResult, String> {
+    tauri::async_runtime::spawn_blocking(move || sync::sync_now(&app, request))
+        .await
+        .map_err(|e| format!("Sync task error: {}", e))?
+}
+
+#[tauri::command]
+async fn vault_init_from_sync(
+    app: tauri::AppHandle,
+    request: sync::VaultInitFromSyncRequest,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || sync::vault_init_from_sync(&app, request))
+        .await
+        .map_err(|e| format!("Sync task error: {}", e))?
+}
+
+#[tauri::command]
+async fn sync_import_foreign(
+    app: tauri::AppHandle,
+    request: sync::SyncImportForeignRequest,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || sync::sync_import_foreign(&app, request))
+        .await
+        .map_err(|e| format!("Sync task error: {}", e))?
 }
 
 #[tauri::command]
@@ -1133,8 +1199,10 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                .with_filter(|label| label != "settings")
                 .build(),
         )
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             create_session,
             write_to_session,
@@ -1150,6 +1218,7 @@ pub fn run() {
             list_hosts,
             save_host,
             remove_hosts,
+            get_host_password,
             save_host_group,
             remove_host_group,
             vault_status,
@@ -1159,6 +1228,14 @@ pub fn run() {
             vault_change_master_password,
             get_vault_lock_policy,
             set_vault_lock_policy,
+            sync_get_config,
+            sync_connect_provider,
+            sync_set_config,
+            sync_status,
+            sync_disconnect,
+            sync_now,
+            vault_init_from_sync,
+            sync_import_foreign,
             test_host_connection,
             list_port_forwards,
             save_port_forward,
@@ -1218,6 +1295,16 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
 
+            // One-time, idempotent move of pre-multi-vault top-level files into
+            // vaults/default/. Every store below reads from vault_dir, never
+            // app_data_dir directly, so this runs before any store is opened.
+            termifai_core::layout::migrate_legacy_layout(&app_data_dir)
+                .map_err(|e| format!("Failed to migrate to vault layout: {}", e))?;
+            let vault_dir = termifai_core::layout::vault_dir(
+                &app_data_dir,
+                termifai_core::layout::DEFAULT_VAULT_ID,
+            );
+
             app.manage(AppState {
                 pty_manager: Mutex::new(PtyManager::new()),
                 tunnel_manager: port_forwarding::new_tunnel_manager(),
@@ -1225,13 +1312,13 @@ pub fn run() {
                 watch_handles: Mutex::new(std::collections::HashMap::new()),
                 transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
                 dashboard_manager: Mutex::new(DashboardManager::new()),
-                hosts_store: store::JsonStore::new(app_data_dir.join("hosts.json")),
-                port_forward_store: store::JsonStore::new(app_data_dir.join("port_forwards.json")),
-                snippets_store: store::JsonStore::new(app_data_dir.join("snippets.json")),
-                vault_settings_store: store::JsonStore::new(
-                    app_data_dir.join("vault_settings.json"),
-                ),
-                vault_crypto_store: store::JsonStore::new(app_data_dir.join("vault.json")),
+                hosts_store: store::JsonStore::new(vault_dir.join("hosts.json")),
+                port_forward_store: store::JsonStore::new(vault_dir.join("port_forwards.json")),
+                snippets_store: store::JsonStore::new(vault_dir.join("snippets.json")),
+                vault_settings_store: store::JsonStore::new(vault_dir.join("vault_settings.json")),
+                vault_crypto_store: store::JsonStore::new(vault_dir.join("vault.json")),
+                tombstones_store: store::JsonStore::new(vault_dir.join("tombstones.json")),
+                sync_state_store: store::JsonStore::new(vault_dir.join("sync_state.json")),
             });
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
@@ -1278,6 +1365,27 @@ pub fn run() {
             .maximizable(false)
             .visible(false)
             .build()?;
+
+            let app_handle = app.handle().clone();
+            if let Some(main_win) = app.get_webview_window("main") {
+                main_win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { .. } = event {
+                        if let Some(settings_win) = app_handle.get_webview_window("settings") {
+                            // On macOS closing "main" only hides it (the app stays in
+                            // the Dock), so the settings window — created once at
+                            // startup — must survive to be reopened later; destroying
+                            // it would make Settings unopenable for the rest of the
+                            // session. Elsewhere closing "main" exits the app, and the
+                            // hidden settings window must be destroyed or it keeps the
+                            // app alive.
+                            #[cfg(target_os = "macos")]
+                            let _ = settings_win.hide();
+                            #[cfg(not(target_os = "macos"))]
+                            let _ = settings_win.close();
+                        }
+                    }
+                });
+            }
 
             // On Linux and Windows the native menubar is replaced by a frontend hamburger menu
             #[cfg(target_os = "macos")]
@@ -1394,9 +1502,40 @@ fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
         .get_webview_window("settings")
         .ok_or_else(|| "Settings window not found".to_string())?;
 
+    // Center on the main window using *logical* coordinates: physical
+    // coordinates are interpreted with the scale factor of the monitor the
+    // settings window currently sits on, so when the main window is on a
+    // monitor with a different scale factor the position lands on the wrong
+    // screen. Logical coordinates are global across monitors.
+    let center_on_main = |window: &tauri::WebviewWindow| {
+        if let Some(main_window) = app.get_webview_window("main") {
+            if let (Ok(main_pos), Ok(main_size), Ok(scale_factor)) = (
+                main_window.outer_position(),
+                main_window.outer_size(),
+                main_window.scale_factor(),
+            ) {
+                let main_pos = main_pos.to_logical::<f64>(scale_factor);
+                let main_size = main_size.to_logical::<f64>(scale_factor);
+                let x = main_pos.x + (main_size.width - 800.0) / 2.0;
+                let y = main_pos.y + (main_size.height - 600.0) / 2.0;
+                let _ = window.set_position(tauri::Position::Logical(
+                    tauri::LogicalPosition::new(x, y),
+                ));
+            }
+        }
+    };
+
+    // Position before showing so the window doesn't flash at its old spot.
+    center_on_main(&window);
+
     window
         .show()
         .map_err(|e| format!("Failed to show settings window: {}", e))?;
+
+    // Re-apply after show: on Windows the window's DPI is only updated once it
+    // actually moves to the other monitor, so the first pass can be slightly off.
+    center_on_main(&window);
+
     window
         .set_focus()
         .map_err(|e| format!("Failed to focus settings window: {}", e))?;

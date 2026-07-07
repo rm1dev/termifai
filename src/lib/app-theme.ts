@@ -1,4 +1,4 @@
-import { emit } from "@tauri-apps/api/event";
+import { publish } from "./api/transport";
 
 export type AppThemeId =
   | "termifai-dark"
@@ -766,10 +766,15 @@ export function applyAppTheme(theme: AppTheme) {
   root.dataset.themeMode = theme.mode.toLowerCase();
 }
 
+export function getAppThemeUpdatedAt(): string | undefined {
+  return localStorage.getItem(`${appThemeStorageKey}:updatedAt`) ?? undefined;
+}
+
 export function saveAppTheme(themeId: AppThemeId) {
   const theme = getAppTheme(themeId);
 
   localStorage.setItem(appThemeStorageKey, theme.id);
+  localStorage.setItem(`${appThemeStorageKey}:updatedAt`, new Date().toISOString());
   applyAppTheme(theme);
   window.dispatchEvent(
     new CustomEvent<AppTheme>(appThemeChangedEvent, {
@@ -777,7 +782,7 @@ export function saveAppTheme(themeId: AppThemeId) {
     })
   );
 
-  void emit(appThemeChangedEvent, theme).catch(() => {
+  void publish(appThemeChangedEvent, theme).catch(() => {
     /* Non-Tauri environments fall back to localStorage + storage events. */
   });
 }

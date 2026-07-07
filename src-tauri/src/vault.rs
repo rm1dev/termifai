@@ -1,11 +1,13 @@
-use crate::crypto::{self, VaultKey};
 use crate::AppState;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 #[cfg(target_os = "macos")]
 use tauri::Emitter;
 use tauri::{AppHandle, Manager};
+use termifai_core::crypto::{self, VaultKey};
+use termifai_core::model::vault::migrate_vault_settings;
+pub use termifai_core::model::vault::{CryptoMeta, CryptoVault, LockPolicy, VaultSettings};
 
 fn cell() -> &'static Mutex<Option<VaultKey>> {
     static VAULT: OnceLock<Mutex<Option<VaultKey>>> = OnceLock::new();
@@ -49,60 +51,6 @@ pub fn cached_master_password() -> Option<String> {
 pub fn forget_master_password() {
     if let Ok(e) = entry() {
         let _ = e.delete_credential();
-    }
-}
-
-// ── Lock Policy ──────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum LockPolicy {
-    /// Cache master password in OS keychain; never auto-lock.
-    Never,
-    /// Cache in keychain; re-ask after system restart/logout (default).
-    #[default]
-    OnRestart,
-    /// Never cache; always ask when app reopens.
-    OnAppClose,
-    /// Cache in keychain; lock when screen is locked.
-    OnScreenLock,
-}
-
-fn default_version() -> u32 {
-    1
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct CryptoMeta {
-    pub kdf: String,
-    pub salt: String,
-    pub wrapped_key: String,
-    pub verifier: String,
-}
-
-#[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct CryptoVault {
-    #[serde(default = "default_version")]
-    pub version: u32,
-    pub crypto: Option<CryptoMeta>,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct VaultSettings {
-    #[serde(default = "default_version")]
-    pub version: u32,
-    #[serde(default)]
-    pub lock_policy: LockPolicy,
-}
-
-fn migrate_vault_settings(value: &mut serde_json::Value) {
-    if value.get("version").is_none() {
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("version".to_string(), serde_json::Value::from(1u32));
-        }
     }
 }
 
@@ -361,14 +309,5 @@ mod tests {
         assert!(is_unlocked());
         clear();
         assert!(!is_unlocked());
-    }
-
-    #[test]
-    fn lock_policy_round_trips() {
-        let p = LockPolicy::OnScreenLock;
-        let s = serde_json::to_string(&p).unwrap();
-        assert_eq!(s, "\"on_screen_lock\"");
-        let back: LockPolicy = serde_json::from_str(&s).unwrap();
-        assert_eq!(back, p);
     }
 }
