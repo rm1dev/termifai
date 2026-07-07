@@ -1,12 +1,12 @@
-import { invoke } from "@tauri-apps/api/core";
+import { call } from "./transport";
 import type { SshKey } from "@/components/app/types";
 
 export function listSshKeys(): Promise<SshKey[]> {
-  return invoke<SshKey[]>("list_ssh_keys");
+  return call<SshKey[]>("list_ssh_keys");
 }
 
 export function removeSshKeys(ids: string[]): Promise<void> {
-  return invoke<void>("remove_ssh_keys", { ids });
+  return call<void>("remove_ssh_keys", { ids });
 }
 
 export interface GenerateSshKeyRequest {
@@ -18,5 +18,5 @@ export interface GenerateSshKeyRequest {
 }
 
 export function generateSshKey(request: GenerateSshKeyRequest): Promise<SshKey> {
-  return invoke<SshKey>("generate_ssh_key", { request });
+  return call<SshKey>("generate_ssh_key", { request });
 }

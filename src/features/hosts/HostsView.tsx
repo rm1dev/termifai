@@ -13,6 +13,7 @@ import {
   Lock,
   PanelRightOpen,
   Plus,
+  RefreshCw,
   Search,
   Server,
   Settings,
@@ -38,6 +39,7 @@ import { OsBadge } from "@/components/app/icons";
 import type { Host, HostGroup, OsKind, SshKey } from "@/components/app/types";
 import { listSshKeys } from "@/lib/api/ssh-keys";
 import {
+  getHostPassword,
   listHosts,
   removeHostGroup,
   removeHosts,
@@ -538,7 +540,14 @@ function HostsList({
           >
             <OsBadge os={h.os} />
             <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-medium text-foreground">{h.name}</div>
+              <div className="flex items-center gap-1.5 truncate text-sm font-medium text-foreground">
+                {h.name}
+                {h.syncServer && (
+                  <span title="Sync server">
+                    <RefreshCw className="h-3 w-3 shrink-0 text-[var(--color-brand-cyan)]" />
+                  </span>
+                )}
+              </div>
               <div className="truncate text-xs text-muted-foreground">ssh, {h.user}</div>
             </div>
             <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
@@ -585,7 +594,14 @@ function HostsList({
         >
           <OsBadge os={h.os} />
           <div className="min-w-0 flex-1">
-            <div className="truncate text-sm font-medium text-foreground">{h.name}</div>
+            <div className="flex items-center gap-1.5 truncate text-sm font-medium text-foreground">
+              {h.name}
+              {h.syncServer && (
+                <span title="Sync server">
+                  <RefreshCw className="h-3 w-3 shrink-0 text-[var(--color-brand-cyan)]" />
+                </span>
+              )}
+            </div>
             <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}</div>
           </div>
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -716,7 +732,30 @@ function HostModal({
   const [hostname, setHostname] = useState(host?.hostname ?? "");
   const [port, setPort] = useState(host?.port ?? 22);
   const [user, setUser] = useState(host?.user ?? "");
-  const [password, setPassword] = useState(host?.password ?? "");
+  // Stored passwords arrive as opaque "v1:" vault tokens; the plaintext is fetched
+  // below so the field shows (and the eye toggle reveals) the real password. Until
+  // it arrives, the token is kept as fallback so saving untouched keeps the password.
+  const storedPasswordToken = host?.password?.startsWith("v1:") ? host.password : null;
+  const [password, setPassword] = useState(storedPasswordToken ? "" : host?.password ?? "");
+  const [passwordLoaded, setPasswordLoaded] = useState(!storedPasswordToken);
+  const effectivePassword = password || (passwordLoaded ? "" : storedPasswordToken) || "";
+
+  useEffect(() => {
+    if (!storedPasswordToken || !host) return;
+    let cancelled = false;
+    getHostPassword(host.id)
+      .then((pw) => {
+        if (cancelled) return;
+        // Don't clobber anything the user already typed.
+        setPassword((curr) => curr || pw || "");
+        setPasswordLoaded(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [showPass, setShowPass] = useState(false);
   const [sshKeyId, setSshKeyId] = useState<string | null>(host?.sshKeyId ?? null);
   const [os, setOs] = useState<OsKind>(host?.os ?? "ubuntu");
@@ -766,7 +805,7 @@ function HostModal({
         hostname: hostname.trim(),
         user: user.trim(),
         port,
-        password,
+        password: effectivePassword,
         sshKeyId,
         timeoutSecs: 5,
       });
@@ -969,12 +1008,14 @@ function HostModal({
                 os,
                 groupId,
                 tags,
-                password,
+                password: effectivePassword,
                 sshKeyId,
-                authMethod: sshKeyId ? "key" : password ? "password" : undefined,
+                authMethod: sshKeyId ? "key" : effectivePassword ? "password" : undefined,
                 showStatusInDashboard: showStatus,
                 workingDirectory: workingDir.trim() || undefined,
                 defaultSftpPath: sftpPath,
+                // Not editable from this form — preserve whatever Settings → Sync set.
+                syncServer: host?.syncServer,
               })
             }
             disabled={!valid}

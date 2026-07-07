@@ -2,9 +2,18 @@ import { useEffect, useRef, useLayoutEffect, useState, useCallback } from "react
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import {
+  closeSession,
+  createSession,
+  onConnectionStatus,
+  onSessionExited,
+  onSessionOutput,
+  resizeSession,
+  runSnippetScript,
+  writeToSession,
+} from "@/lib/api/terminal";
+import { subscribe, type UnlistenFn } from "@/lib/api/transport";
+import { listSnippets } from "@/lib/api/snippets";
 import {
   ensureTerminalFontLoaded,
   getTerminalFontStack,
@@ -205,7 +214,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       if (shortcuts["open-snippets"] && isShortcutMatch(event, shortcuts["open-snippets"])) {
         if (event.type === "keydown") {
           event.preventDefault();
-          invoke<Snippet[]>("list_snippets").then((data) => {
+          listSnippets().then((data) => {
             setSnippets(data);
             setSnippetQuery("");
             setSnippetIndex(0);
@@ -231,7 +240,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
           const sid = sessionRef.current;
           if (sid) {
             navigator.clipboard.readText().then((text) => {
-              invoke("write_to_session", { sessionId: sid, data: text }).catch(() => {});
+              writeToSession(sid, text).catch(() => {});
             }).catch(() => {});
           }
         }
@@ -295,7 +304,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       term.options.lineHeight = appearance.lineHeight;
       safeFit();
     });
-    void listen<TerminalAppearance>(terminalAppearanceChangedEvent, (event) => {
+    void subscribe<TerminalAppearance>(terminalAppearanceChangedEvent, (event) => {
       applyAppearance(event.payload);
     })
       .then((unlisten) => {
@@ -303,7 +312,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
         unlistenAppearance = unlisten;
       })
       .catch(() => {});
-    void listen<AppTheme>(appThemeChangedEvent, (event) => {
+    void subscribe<AppTheme>(appThemeChangedEvent, (event) => {
       applyTheme(event.payload);
     })
       .then((unlisten) => {
@@ -316,7 +325,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
     const dataDisp = term.onData((data) => {
       const sid = sessionRef.current;
       if (sid) {
-        invoke("write_to_session", { sessionId: sid, data }).catch((err) =>
+        writeToSession(sid, data).catch((err) =>
           console.error("write_to_session failed:", err)
         );
       }
@@ -326,7 +335,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
     const resizeDisp = term.onResize(({ cols, rows }) => {
       const sid = sessionRef.current;
       if (sid) {
-        invoke("resize_session", { sessionId: sid, cols, rows }).catch((err) =>
+        resizeSession(sid, cols, rows).catch((err) =>
           console.error("resize_session failed:", err)
         );
       }
@@ -336,20 +345,20 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
     const setup = async () => {
       try {
         if (readyMarker) {
-          unlistenConnectionRef.current = await listen<ConnectionStatusPayload>(
-            `term:${readyMarker}:connection-status`,
-            (event) => {
-              if (event.payload.log) {
-                setConnectionLogs((logs) => [...logs.slice(-80), event.payload.log as string]);
+          unlistenConnectionRef.current = await onConnectionStatus<ConnectionStatusPayload>(
+            readyMarker,
+            (payload) => {
+              if (payload.log) {
+                setConnectionLogs((logs) => [...logs.slice(-80), payload.log as string]);
               }
               setConnectionStatus({
-                stage: event.payload.stage,
-                status: event.payload.status,
-                message: event.payload.message,
+                stage: payload.stage,
+                status: payload.status,
+                message: payload.message,
               });
-              if (event.payload.status === "done") {
+              if (payload.status === "done") {
                 setTimeout(() => setIsConnecting(false), 350);
-              } else if (event.payload.status === "failed") {
+              } else if (payload.status === "failed") {
                 setIsConnecting(true);
                 setShowConnectionLogs(true);
               }
@@ -359,7 +368,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
 
         let sid = sessionRef.current;
         if (!sid) {
-          const info = await invoke<{ id: string; label: string }>("create_session", {
+          const info = await createSession({
             cwd: "",
             initialCommand: initialCommand ?? null,
             hostId: hostId ?? null,
@@ -372,27 +381,21 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
         }
 
         // Listen for PTY output
-        unlistenOutputRef.current = await listen<string>(
-          `term:${sid}:output`,
-          (event) => {
-            if (!readyMarker) setIsConnecting(false);
-            term.write(event.payload);
-          }
-        );
+        unlistenOutputRef.current = await onSessionOutput(sid, (chunk) => {
+          if (!readyMarker) setIsConnecting(false);
+          term.write(chunk);
+        });
 
         // Listen for shell exit
-        unlistenExitRef.current = await listen<boolean>(
-          `term:${sid}:exited`,
-          () => {
-            if (!readyMarker) setIsConnecting(false);
-            term.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
-          }
-        );
+        unlistenExitRef.current = await onSessionExited(sid, () => {
+          if (!readyMarker) setIsConnecting(false);
+          term.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
+        });
 
         // Do an initial fit + resize notification to backend
         safeFit();
         if (term.cols && term.rows) {
-          await invoke("resize_session", { sessionId: sid, cols: term.cols, rows: term.rows });
+          await resizeSession(sid, term.cols, term.rows);
         }
       } catch (err) {
         setConnectionStatus({
@@ -451,7 +454,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
   const closeConnection = () => {
     const sid = sessionRef.current;
     if (sid) {
-      invoke("close_session", { sessionId: sid }).catch(() => {});
+      closeSession(sid).catch(() => {});
     }
     onClose?.();
   };
@@ -515,19 +518,17 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
 
     if (snippet.kind === "text") {
       const body = resolveVars(snippet.body ?? "");
-      invoke("write_to_session", { sessionId: sid, data: body }).catch(() => {});
+      writeToSession(sid, body).catch(() => {});
     } else if (snippet.kind === "command") {
       const cmd = resolveVars(snippet.command ?? "");
-      invoke("write_to_session", { sessionId: sid, data: cmd + "\r" }).catch(() => {});
+      writeToSession(sid, cmd + "\r").catch(() => {});
     } else if (snippet.kind === "script") {
       const script = resolveVars(snippet.script ?? "");
       // Send script to backend — it writes a temp .sh file, executes it, and cleans up
       // Only title message is shown in terminal, not the script content
-      invoke("run_snippet_script", {
-        sessionId: sid,
-        title: snippet.name,
-        script,
-      }).catch((err) => console.error("run_snippet_script failed:", err));
+      runSnippetScript(sid, snippet.name, script).catch((err) =>
+        console.error("run_snippet_script failed:", err)
+      );
     }
 
     setSnippetPalette(false);

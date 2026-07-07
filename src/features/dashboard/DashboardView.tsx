@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useTransition } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { call } from "@/lib/api/transport";
 import {
   Activity,
   ArrowDownToLine,
@@ -235,7 +235,7 @@ export function DashboardView() {
 
   // Load hosts that have showStatusInDashboard enabled
   useEffect(() => {
-    invoke<{ hosts: Host[] }>("list_hosts")
+    call<{ hosts: Host[] }>("list_hosts")
       .then((v) => setHosts(v.hosts.filter((h) => h.showStatusInDashboard !== false)))
       .catch(console.error);
   }, []);

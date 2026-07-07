@@ -1,5 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { call, subscribe } from "./api/transport";
 import { useEffect, useRef, useState } from "react";
 
 export interface CoreMetrics {
@@ -108,12 +107,12 @@ export function useDashboard(hostIds: string[]): {
     setLoading(new Set(hostIds));
 
     // Connect and initial poll
-    invoke("dashboard_connect", { hostIds })
-      .then(() => invoke("dashboard_poll", { wantDetail: false, hostId: null }))
+    call("dashboard_connect", { hostIds })
+      .then(() => call("dashboard_poll", { wantDetail: false, hostId: null }))
       .catch(console.error);
 
     // Receive streaming results
-    const unlistenPromise = listen<HostPollResult>("dash:stat", ({ payload }) => {
+    const unlistenPromise = subscribe<HostPollResult>("dash:stat", ({ payload }) => {
       setStats((prev) => ({ ...prev, [payload.hostId]: payload }));
       setLoading((prev) => {
         const next = new Set(prev);
@@ -124,7 +123,7 @@ export function useDashboard(hostIds: string[]): {
 
     // Poll every 30 seconds
     const interval = setInterval(() => {
-      invoke("dashboard_poll", {
+      call("dashboard_poll", {
         wantDetail: false,
         hostId: null,
       }).catch(console.error);
@@ -133,7 +132,7 @@ export function useDashboard(hostIds: string[]): {
     return () => {
       clearInterval(interval);
       unlistenPromise.then((fn) => fn());
-      invoke("dashboard_disconnect", { hostIds: hostIdsRef.current }).catch(console.error);
+      call("dashboard_disconnect", { hostIds: hostIdsRef.current }).catch(console.error);
     };
   }, [hostIdsKey]); // Re-run when host list changes (hosts load async)
 
@@ -149,7 +148,7 @@ export function useHostDetail(hostId: string | null): {
 
   const refresh = () => {
     if (!hostId) return;
-    invoke("dashboard_poll", { wantDetail: true, hostId }).catch(console.error);
+    call("dashboard_poll", { wantDetail: true, hostId }).catch(console.error);
   };
 
   useEffect(() => {
@@ -158,7 +157,7 @@ export function useHostDetail(hostId: string | null): {
     setDetail(null);
     refresh(); // initial poll — fetches system metrics + process list
 
-    const unlistenPromise = listen<HostPollResult>("dash:stat", ({ payload }) => {
+    const unlistenPromise = subscribe<HostPollResult>("dash:stat", ({ payload }) => {
       if (payload.hostId === hostId) {
         setDetail((prev) => {
           // want_detail=true polls: return processes + sys metrics, containers=null (Docker skipped).
@@ -177,7 +176,7 @@ export function useHostDetail(hostId: string | null): {
     // Docker metrics are handled by useDashboard's 30s interval separately.
     const interval = setInterval(() => {
       if (!hostId) return;
-      invoke("dashboard_poll", { wantDetail: true, hostId }).catch(console.error);
+      call("dashboard_poll", { wantDetail: true, hostId }).catch(console.error);
     }, PROCESS_INTERVAL_MS);
 
     return () => {

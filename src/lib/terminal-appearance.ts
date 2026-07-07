@@ -1,4 +1,4 @@
-import { emit } from "@tauri-apps/api/event";
+import { publish } from "./api/transport";
 
 export const terminalFonts = [
   "Source Code Pro",
@@ -76,6 +76,10 @@ export function loadTerminalAppearance(): TerminalAppearance {
   }
 }
 
+export function getTerminalAppearanceUpdatedAt(): string | undefined {
+  return localStorage.getItem(`${terminalAppearanceStorageKey}:updatedAt`) ?? undefined;
+}
+
 export function saveTerminalAppearance(appearance: TerminalAppearance) {
   const normalized = {
     ...appearance,
@@ -84,13 +88,14 @@ export function saveTerminalAppearance(appearance: TerminalAppearance) {
   };
 
   localStorage.setItem(terminalAppearanceStorageKey, JSON.stringify(normalized));
+  localStorage.setItem(`${terminalAppearanceStorageKey}:updatedAt`, new Date().toISOString());
   window.dispatchEvent(
     new CustomEvent<TerminalAppearance>(terminalAppearanceChangedEvent, {
       detail: normalized,
     })
   );
 
-  void emit(terminalAppearanceChangedEvent, normalized).catch(() => {
+  void publish(terminalAppearanceChangedEvent, normalized).catch(() => {
     /* Non-Tauri environments fall back to localStorage + storage events. */
   });
 }
