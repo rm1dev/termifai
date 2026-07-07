@@ -1,6 +1,5 @@
+use crate::AppState;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -50,9 +49,15 @@ pub struct Snippet {
     pub created_at: Option<String>,
 }
 
+fn default_version() -> u32 {
+    1
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SnippetsVault {
+    #[serde(default = "default_version")]
+    pub version: u32,
     pub snippets: Vec<Snippet>,
 }
 
@@ -73,47 +78,71 @@ pub struct SaveSnippetRequest {
 // Public API
 // ──────────────────────────────────────────────────────────────────────────────
 
+fn migrate_snippets_vault(value: &mut serde_json::Value) {
+    if value.get("version").is_none() {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("version".to_string(), serde_json::Value::from(1u32));
+        }
+    }
+}
+
 pub fn list_snippets(app: &AppHandle) -> Result<Vec<Snippet>, String> {
-    let vault = read_vault(app)?;
+    let state = app.state::<AppState>();
+    let vault = state
+        .snippets_store
+        .load_with_migration(migrate_snippets_vault)
+        .map_err(|e| e.to_string())?;
     Ok(vault.snippets)
 }
 
 pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snippet, String> {
     validate_snippet(&request)?;
 
-    let mut vault = read_vault(app)?;
-
     let id = request
         .id
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
 
-    let existing_created_at = vault
-        .snippets
-        .iter()
-        .find(|s| s.id == id)
-        .and_then(|s| s.created_at.clone());
+    let state = app.state::<AppState>();
+    let mut saved_snippet = None;
 
-    let snippet = Snippet {
-        id: id.clone(),
-        kind: request.kind,
-        name: request.name.trim().to_string(),
-        body: request.body.filter(|v| !v.trim().is_empty()),
-        command: request.command.filter(|v| !v.trim().is_empty()),
-        script: request.script.filter(|v| !v.trim().is_empty()),
-        variables: request.variables,
-        created_at: existing_created_at.or_else(|| Some(now_iso())),
-    };
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            let existing_created_at = vault
+                .snippets
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.created_at.clone());
 
-    upsert_by_id(&mut vault.snippets, snippet.clone());
-    write_vault(app, &vault)?;
-    Ok(snippet)
+            let snippet = Snippet {
+                id: id.clone(),
+                kind: request.kind,
+                name: request.name.trim().to_string(),
+                body: request.body.filter(|v| !v.trim().is_empty()),
+                command: request.command.filter(|v| !v.trim().is_empty()),
+                script: request.script.filter(|v| !v.trim().is_empty()),
+                variables: request.variables,
+                created_at: existing_created_at.or_else(|| Some(now_iso())),
+            };
+
+            upsert_by_id(&mut vault.snippets, snippet.clone());
+            saved_snippet = Some(snippet);
+        })
+        .map_err(|e| e.to_string())?;
+
+    saved_snippet.ok_or_else(|| "Failed to save snippet".to_string())
 }
 
 pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
-    let mut vault = read_vault(app)?;
-    vault.snippets.retain(|s| !ids.contains(&s.id));
-    write_vault(app, &vault)
+    let state = app.state::<AppState>();
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            vault.snippets.retain(|s| !ids.contains(&s.id));
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -174,43 +203,12 @@ fn validate_snippet(request: &SaveSnippetRequest) -> Result<(), String> {
     Ok(())
 }
 
-fn read_vault(app: &AppHandle) -> Result<SnippetsVault, String> {
-    let path = vault_path(app)?;
-    if !path.exists() {
-        return Ok(SnippetsVault::default());
-    }
-
-    let contents =
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read snippets vault: {}", e))?;
-    serde_json::from_str(&contents).map_err(|e| format!("Failed to parse snippets vault: {}", e))
-}
-
-fn write_vault(app: &AppHandle, vault: &SnippetsVault) -> Result<(), String> {
-    let path = vault_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create snippets vault directory: {}", e))?;
-    }
-
-    let json = serde_json::to_string_pretty(vault)
-        .map_err(|e| format!("Failed to serialize snippets vault: {}", e))?;
-    fs::write(path, json).map_err(|e| format!("Failed to save snippets vault: {}", e))
-}
-
 fn upsert_by_id(items: &mut Vec<Snippet>, item: Snippet) {
     if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
         items[index] = item;
     } else {
         items.insert(0, item);
     }
-}
-
-fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?
-        .join("snippets.json"))
 }
 
 fn now_iso() -> String {
