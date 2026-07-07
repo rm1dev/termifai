@@ -94,7 +94,8 @@ fn migrate_port_forward_vault(value: &mut serde_json::Value) {
 
 pub fn list_port_forwards(app: &AppHandle) -> Result<Vec<PortForwardRule>, String> {
     let state = app.state::<AppState>();
-    let vault = state.port_forward_store
+    let vault = state
+        .port_forward_store
         .load_with_migration(migrate_port_forward_vault)
         .map_err(|e| e.to_string())?;
     Ok(vault.rules)
@@ -127,37 +128,40 @@ pub fn save_port_forward(
     let state = app.state::<AppState>();
     let mut saved_rule = None;
 
-    state.port_forward_store.update_with_migration(migrate_port_forward_vault, |vault| {
-        let existing_created = vault
-            .rules
-            .iter()
-            .find(|r| r.id == id)
-            .map(|r| r.created_at.clone());
+    state
+        .port_forward_store
+        .update_with_migration(migrate_port_forward_vault, |vault| {
+            let existing_created = vault
+                .rules
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.created_at.clone());
 
-        let rule = PortForwardRule {
-            id: id.clone(),
-            name: name.to_string(),
-            host_id: request.host_id.trim().to_string(),
-            direction: request.direction,
-            local_host: if request.local_host.trim().is_empty() {
-                "127.0.0.1".to_string()
-            } else {
-                request.local_host.trim().to_string()
-            },
-            local_port: request.local_port,
-            remote_host: if request.remote_host.trim().is_empty() {
-                "127.0.0.1".to_string()
-            } else {
-                request.remote_host.trim().to_string()
-            },
-            remote_port: request.remote_port,
-            auto_connect: request.auto_connect,
-            created_at: existing_created.unwrap_or(now),
-        };
+            let rule = PortForwardRule {
+                id: id.clone(),
+                name: name.to_string(),
+                host_id: request.host_id.trim().to_string(),
+                direction: request.direction,
+                local_host: if request.local_host.trim().is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    request.local_host.trim().to_string()
+                },
+                local_port: request.local_port,
+                remote_host: if request.remote_host.trim().is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    request.remote_host.trim().to_string()
+                },
+                remote_port: request.remote_port,
+                auto_connect: request.auto_connect,
+                created_at: existing_created.unwrap_or(now),
+            };
 
-        upsert_by_id(&mut vault.rules, rule.clone(), |r| &r.id);
-        saved_rule = Some(rule);
-    }).map_err(|e| e.to_string())?;
+            upsert_by_id(&mut vault.rules, rule.clone(), |r| &r.id);
+            saved_rule = Some(rule);
+        })
+        .map_err(|e| e.to_string())?;
 
     saved_rule.ok_or_else(|| "Failed to save rule".to_string())
 }
@@ -177,9 +181,12 @@ pub fn remove_port_forwards(
     }
 
     let state = app.state::<AppState>();
-    state.port_forward_store.update_with_migration(migrate_port_forward_vault, |vault| {
-        vault.rules.retain(|r| !ids.contains(&r.id));
-    }).map_err(|e| e.to_string())?;
+    state
+        .port_forward_store
+        .update_with_migration(migrate_port_forward_vault, |vault| {
+            vault.rules.retain(|r| !ids.contains(&r.id));
+        })
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -220,7 +227,8 @@ pub async fn start_tunnel(
     rule_id: String,
 ) -> Result<TunnelStatus, String> {
     let state = app.state::<AppState>();
-    let vault = state.port_forward_store
+    let vault = state
+        .port_forward_store
         .load_with_migration(migrate_port_forward_vault)
         .map_err(|e| e.to_string())?;
     let rule = vault
@@ -539,8 +547,6 @@ pub fn get_tunnel_statuses(
     }
     statuses
 }
-
-
 
 fn upsert_by_id<T, F>(items: &mut Vec<T>, item: T, id: F)
 where

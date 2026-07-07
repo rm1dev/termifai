@@ -57,7 +57,6 @@ impl<T: Serialize + DeserializeOwned + Default> JsonStore<T> {
         }
     }
 
-
     pub fn load(&self) -> Result<T, StoreError> {
         self.load_with_migration(|_| {})
     }
@@ -84,7 +83,7 @@ impl<T: Serialize + DeserializeOwned + Default> JsonStore<T> {
         }
 
         let tmp_path = self.path.with_extension("json.tmp");
-        
+
         {
             let mut file = File::create(&tmp_path)?;
             let json = serde_json::to_string_pretty(value)?;
@@ -109,7 +108,7 @@ impl<T: Serialize + DeserializeOwned + Default> JsonStore<T> {
         F: FnOnce(&mut T),
     {
         let _lock = self.lock.lock().unwrap();
-        
+
         let mut value = if !self.path.exists() {
             T::default()
         } else {
@@ -126,7 +125,7 @@ impl<T: Serialize + DeserializeOwned + Default> JsonStore<T> {
         }
 
         let tmp_path = self.path.with_extension("json.tmp");
-        
+
         {
             let mut file = File::create(&tmp_path)?;
             let json = serde_json::to_string_pretty(&value)?;
