@@ -4,7 +4,7 @@ use ssh2::Session;
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -133,60 +133,18 @@ pub struct SftpEntry {
     pub session: Session,
 }
 
-pub struct SftpManager {
-    sessions: HashMap<String, SftpEntry>,
+impl std::fmt::Debug for SftpEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SftpEntry").finish()
+    }
 }
 
-impl SftpManager {
-    pub fn new() -> Self {
-        Self {
-            sessions: HashMap::new(),
-        }
-    }
-
-    /// `log(stage, message)` — stage is one of "connecting", "handshaking", "authenticating", "ready"
-    pub fn connect<F>(&mut self, req: SftpConnectRequest, log: F) -> Result<SftpSessionInfo, String>
-    where
-        F: Fn(&str, &str),
-    {
-        let key_path = req.private_key_path.as_deref().map(std::path::Path::new);
-        let cfg = ssh::SshConfig {
-            hostname: &req.hostname,
-            port: req.port,
-            username: &req.username,
-            password: req.password.as_deref(),
-            key_path,
-        };
-        let session = ssh::connect(&cfg, &log)?;
-
-        let remote_path = req
-            .default_remote_path
-            .clone()
-            .unwrap_or_else(|| "/".to_string());
-        self.sessions
-            .insert(req.session_id.clone(), SftpEntry { session });
-
-        log(
-            "ready",
-            &format!("Authenticated. Opening {}...", remote_path),
-        );
-        Ok(SftpSessionInfo {
-            session_id: req.session_id,
-            remote_path,
-        })
-    }
-
+impl SftpEntry {
     pub fn list_remote(
         &self,
-        session_id: &str,
         path: &str,
     ) -> Result<Vec<RemoteFileEntry>, String> {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-
-        let sftp = entry
+        let sftp = self
             .session
             .sftp()
             .map_err(|e| format!("SFTP subsystem: {}", e))?;
@@ -236,12 +194,7 @@ impl SftpManager {
     where
         F: Fn(TransferProgress),
     {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-
-        let sftp = entry
+        let sftp = self
             .session
             .sftp()
             .map_err(|e| format!("SFTP subsystem: {}", e))?;
@@ -321,12 +274,7 @@ impl SftpManager {
     where
         F: Fn(TransferProgress),
     {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-
-        let sftp = entry
+        let sftp = self
             .session
             .sftp()
             .map_err(|e| format!("SFTP subsystem: {}", e))?;
@@ -377,13 +325,8 @@ impl SftpManager {
         Ok(())
     }
 
-    pub fn delete_remote(&self, session_id: &str, paths: &[String]) -> Result<(), String> {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-
-        let sftp = entry
+    pub fn delete_remote(&self, paths: &[String]) -> Result<(), String> {
+        let sftp = self
             .session
             .sftp()
             .map_err(|e| format!("SFTP subsystem: {}", e))?;
@@ -406,16 +349,10 @@ impl SftpManager {
 
     pub fn rename_remote(
         &self,
-        session_id: &str,
         from_path: &str,
         to_path: &str,
     ) -> Result<(), String> {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-
-        let sftp = entry
+        let sftp = self
             .session
             .sftp()
             .map_err(|e| format!("SFTP subsystem: {}", e))?;
@@ -427,13 +364,8 @@ impl SftpManager {
         .map_err(|e| format!("rename '{}' -> '{}': {}", from_path, to_path, e))
     }
 
-    pub fn mkdir_remote(&self, session_id: &str, path: &str) -> Result<(), String> {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-
-        let sftp = entry
+    pub fn mkdir_remote(&self, path: &str) -> Result<(), String> {
+        let sftp = self
             .session
             .sftp()
             .map_err(|e| format!("SFTP subsystem: {}", e))?;
@@ -441,12 +373,8 @@ impl SftpManager {
             .map_err(|e| format!("mkdir '{}': {}", path, e))
     }
 
-    pub fn exec_command(&self, session_id: &str, cmd: &str) -> Result<String, String> {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-        let mut channel = entry
+    pub fn exec_command(&self, cmd: &str) -> Result<String, String> {
+        let mut channel = self
             .session
             .channel_session()
             .map_err(|e| format!("Channel open: {}", e))?;
@@ -470,12 +398,8 @@ impl SftpManager {
         Ok(output)
     }
 
-    pub fn stat_remote(&self, session_id: &str, path: &str) -> Result<RemoteStatResult, String> {
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-        let sftp = entry
+    pub fn stat_remote(&self, path: &str) -> Result<RemoteStatResult, String> {
+        let sftp = self
             .session
             .sftp()
             .map_err(|e| format!("SFTP subsystem: {}", e))?;
@@ -485,7 +409,6 @@ impl SftpManager {
         let permissions = stat.perm.unwrap_or(0) & 0o7777;
         // get owner/group via SSH exec since libssh2 stat doesn't return names
         let owner_out = self.exec_command(
-            session_id,
             &format!(
                 "stat -c '%U %G' {} 2>/dev/null || echo 'root root'",
                 shell_escape(path)
@@ -503,7 +426,6 @@ impl SftpManager {
 
     pub fn chmod(
         &self,
-        session_id: &str,
         path: &str,
         mode: &str,
         recursive: bool,
@@ -513,13 +435,12 @@ impl SftpManager {
         }
         let flag = if recursive { "-R " } else { "" };
         let cmd = format!("chmod {}{} {}", flag, mode, shell_escape(path));
-        self.exec_command(session_id, &cmd)?;
+        self.exec_command(&cmd)?;
         Ok(())
     }
 
     pub fn chown(
         &self,
-        session_id: &str,
         path: &str,
         user: &str,
         group: &str,
@@ -539,30 +460,27 @@ impl SftpManager {
         }
         let flag = if recursive { "-R " } else { "" };
         let cmd = format!("chown {}{}:{} {}", flag, user, group, shell_escape(path));
-        self.exec_command(session_id, &cmd)?;
+        self.exec_command(&cmd)?;
         Ok(())
     }
 
     pub fn copy_remote(
         &self,
-        session_id: &str,
         paths: &[String],
         dest_dir: &str,
     ) -> Result<(), String> {
         for path in paths {
             let cmd = format!("cp -a {} {}/", shell_escape(path), shell_escape(dest_dir));
-            self.exec_command(session_id, &cmd)?;
+            self.exec_command(&cmd)?;
         }
         Ok(())
     }
 
-    pub fn get_users_groups(&self, session_id: &str) -> Result<UsersGroups, String> {
+    pub fn get_users_groups(&self) -> Result<UsersGroups, String> {
         let users_out = self.exec_command(
-            session_id,
             "getent passwd | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/passwd",
         )?;
         let groups_out = self.exec_command(
-            session_id,
             "getent group | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/group",
         )?;
         let users = users_out
@@ -593,11 +511,7 @@ impl SftpManager {
             .map_err(|e| format!("Create temp dir failed: {}", e))?;
         let tmp_path = app_temp_dir.join(file_name);
 
-        let entry = self
-            .sessions
-            .get(session_id)
-            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
-        let sftp = entry
+        let sftp = self
             .session
             .sftp()
             .map_err(|e| format!("SFTP subsystem: {}", e))?;
@@ -609,6 +523,57 @@ impl SftpManager {
         std::io::copy(&mut remote_file, &mut local_file)
             .map_err(|e| format!("Copy to tmp: {}", e))?;
         Ok(tmp_path.to_string_lossy().to_string())
+    }
+}
+
+pub struct SftpManager {
+    sessions: HashMap<String, Arc<Mutex<SftpEntry>>>,
+}
+
+impl SftpManager {
+    pub fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+        }
+    }
+
+    pub fn get_session(&self, session_id: &str) -> Result<Arc<Mutex<SftpEntry>>, String> {
+        self.sessions
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| format!("SFTP session '{}' not found", session_id))
+    }
+
+    /// `log(stage, message)` — stage is one of "connecting", "handshaking", "authenticating", "ready"
+    pub fn connect<F>(&mut self, req: SftpConnectRequest, log: F) -> Result<SftpSessionInfo, String>
+    where
+        F: Fn(&str, &str),
+    {
+        let key_path = req.private_key_path.as_deref().map(std::path::Path::new);
+        let cfg = ssh::SshConfig {
+            hostname: &req.hostname,
+            port: req.port,
+            username: &req.username,
+            password: req.password.as_deref(),
+            key_path,
+        };
+        let session = ssh::connect(&cfg, &log)?;
+
+        let remote_path = req
+            .default_remote_path
+            .clone()
+            .unwrap_or_else(|| "/".to_string());
+        self.sessions
+            .insert(req.session_id.clone(), Arc::new(Mutex::new(SftpEntry { session })));
+
+        log(
+            "ready",
+            &format!("Authenticated. Opening {}...", remote_path),
+        );
+        Ok(SftpSessionInfo {
+            session_id: req.session_id,
+            remote_path,
+        })
     }
 
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
@@ -646,34 +611,16 @@ mod tests {
 
     #[test]
     fn test_download_no_session_returns_error() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
         let manager = SftpManager::new();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let result = manager.download_file(
-            "nonexistent",
-            "/remote/file.txt",
-            "/tmp/out.txt",
-            cancel,
-            |_| {},
-        );
+        let result = manager.get_session("nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
 
     #[test]
     fn test_upload_no_session_returns_error() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::Arc;
         let manager = SftpManager::new();
-        let cancel = Arc::new(AtomicBool::new(false));
-        let result = manager.upload_file(
-            "nonexistent",
-            "/tmp/local.txt",
-            "/remote/file.txt",
-            cancel,
-            |_| {},
-        );
+        let result = manager.get_session("nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -681,7 +628,7 @@ mod tests {
     #[test]
     fn test_delete_no_session_returns_error() {
         let manager = SftpManager::new();
-        let result = manager.delete_remote("nonexistent", &["/remote/file.txt".to_string()]);
+        let result = manager.get_session("nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -689,7 +636,7 @@ mod tests {
     #[test]
     fn test_rename_no_session_returns_error() {
         let manager = SftpManager::new();
-        let result = manager.rename_remote("nonexistent", "/remote/old.txt", "/remote/new.txt");
+        let result = manager.get_session("nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
@@ -697,7 +644,7 @@ mod tests {
     #[test]
     fn test_mkdir_no_session_returns_error() {
         let manager = SftpManager::new();
-        let result = manager.mkdir_remote("nonexistent", "/remote/newdir");
+        let result = manager.get_session("nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
     }
