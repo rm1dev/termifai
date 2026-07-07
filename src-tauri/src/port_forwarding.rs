@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
 use tauri::{AppHandle, Manager};
 
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -184,7 +183,38 @@ pub fn remove_port_forwards(
     Ok(())
 }
 
-pub fn start_tunnel(
+fn check_fatal_errors(output: &str) -> Option<String> {
+    if output.contains("could not resolve hostname")
+        || output.contains("name or service not known")
+        || output.contains("nodename nor servname provided")
+    {
+        Some("Hostname could not be resolved".to_string())
+    } else if output.contains("connection refused") {
+        Some("SSH connection was refused by the server".to_string())
+    } else if output.contains("operation timed out")
+        || output.contains("connection timed out")
+        || output.contains("no route to host")
+        || output.contains("network is unreachable")
+    {
+        Some("SSH connection timed out".to_string())
+    } else if output.contains("host key verification failed") {
+        Some("Host key verification failed".to_string())
+    } else if output.contains("permission denied")
+        || output.contains("too many authentication failures")
+        || output.contains("authentication failed")
+    {
+        Some("SSH authentication failed".to_string())
+    } else if output.contains("connection closed")
+        || output.contains("connection reset")
+        || output.contains("broken pipe")
+    {
+        Some("SSH connection closed prematurely".to_string())
+    } else {
+        None
+    }
+}
+
+pub async fn start_tunnel(
     app: &AppHandle,
     tunnel_mgr: &TunnelManagerState,
     rule_id: String,
@@ -210,8 +240,7 @@ pub fn start_tunnel(
     // Build the SSH tunnel command
     let mut command = portable_pty::CommandBuilder::new("ssh");
     command.arg("-N"); // no remote command
-                       // accept-new: TOFU against the real known_hosts, hard-fail on a changed key.
-                       // See hosts.rs::test_host_connection for why this replaces StrictHostKeyChecking=no.
+    command.arg("-v"); // verbose output so we can detect success/failure quickly
     command.arg("-o");
     command.arg("StrictHostKeyChecking=accept-new");
     command.arg("-o");
@@ -309,6 +338,9 @@ pub fn start_tunnel(
 
     // Handle password in a background thread, then keep reading to drain output
     let password = host_password.clone().unwrap_or_default();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let mut tx = Some(tx);
+
     thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut output = String::new();
@@ -317,74 +349,120 @@ pub fn start_tunnel(
 
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    if let Some(t) = tx.take() {
+                        let _ = t.send(Err("SSH tunnel exited prematurely".to_string()));
+                    }
+                    break;
+                }
                 Ok(n) => {
-                    if !password_sent {
-                        let chunk = String::from_utf8_lossy(&buf[..n]);
-                        output.push_str(&chunk);
-                        if output.to_lowercase().contains("password:") {
-                            if let Some(ref mut w) = writer {
-                                let _ = w.write_all(format!("{}\r", password).as_bytes());
-                            }
-                            password_sent = true;
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    output.push_str(&chunk);
+
+                    let lower = output.to_lowercase();
+
+                    if !password_sent && lower.contains("password:") {
+                        if let Some(ref mut w) = writer {
+                            let _ = w.write_all(format!("{}\r", password).as_bytes());
+                        }
+                        password_sent = true;
+                    }
+
+                    if let Some(err) = check_fatal_errors(&lower) {
+                        if let Some(t) = tx.take() {
+                            let _ = t.send(Err(err));
                         }
                     }
-                    // Keep draining output so PTY buffer doesn't fill up
+
+                    if lower.contains("entering interactive session")
+                        || lower.contains("authenticated to")
+                        || lower.contains("authentication succeeded")
+                    {
+                        if let Some(t) = tx.take() {
+                            let _ = t.send(Ok(()));
+                        }
+                    }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if let Some(t) = tx.take() {
+                        let _ = t.send(Err("Failed to read from PTY".to_string()));
+                    }
+                    break;
+                }
             }
         }
         // Drop writer when done
         drop(writer);
     });
 
-    // Wait for SSH to establish connection or fail
-    thread::sleep(Duration::from_millis(3000));
+    // Wait for SSH to establish connection or fail within bounded 3 seconds
+    let timeout_res = tokio::time::timeout(std::time::Duration::from_millis(3000), rx).await;
 
-    // Check if child is still running (borrow as mutable temporarily)
-    // We need to wrap child for shared ownership
     let mut child = child;
-    match child.try_wait() {
-        Ok(Some(_status)) => {
+
+    let success = match timeout_res {
+        Ok(Ok(Ok(()))) => true,
+        Ok(Ok(Err(err))) => {
+            let _ = child.kill();
+            let _ = child.wait();
             return Ok(TunnelStatus {
                 rule_id,
                 active: false,
                 pid: None,
-                error: Some(
-                    "SSH tunnel exited immediately. Check host credentials and ports.".to_string(),
-                ),
+                error: Some(err),
             });
         }
-        Ok(None) => { /* still running, good */ }
-        Err(e) => {
+        Ok(Err(_)) => {
+            let _ = child.kill();
+            let _ = child.wait();
             return Ok(TunnelStatus {
                 rule_id,
                 active: false,
                 pid: None,
-                error: Some(format!("Failed to check tunnel status: {}", e)),
+                error: Some("SSH tunnel failed to start (internal error)".to_string()),
             });
         }
+        Err(_) => {
+            // Timeout! Check if process is still running
+            match child.try_wait() {
+                Ok(None) => true, // Still running, assume success fallback
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(TunnelStatus {
+                        rule_id,
+                        active: false,
+                        pid: None,
+                        error: Some("SSH tunnel timed out or exited".to_string()),
+                    });
+                }
+            }
+        }
+    };
+
+    if success {
+        let pid = child.process_id();
+
+        let mut mgr = tunnel_mgr
+            .lock()
+            .map_err(|_| "Failed to lock tunnel manager".to_string())?;
+
+        // Kill existing tunnel for this rule if any
+        if let Some(mut old) = mgr.processes.remove(&rule_id) {
+            let _ = old.kill();
+        }
+
+        mgr.processes.insert(rule_id.clone(), child);
+
+        Ok(TunnelStatus {
+            rule_id,
+            active: true,
+            pid,
+            error: None,
+        })
+    } else {
+        Err("Failed to start tunnel".to_string())
     }
-
-    let pid = child.process_id();
-
-    let mut mgr = tunnel_mgr
-        .lock()
-        .map_err(|_| "Failed to lock tunnel manager".to_string())?;
-
-    // Kill existing tunnel for this rule if any
-    if let Some(mut old) = mgr.processes.remove(&rule_id) {
-        let _ = old.kill();
-    }
-
-    mgr.processes.insert(rule_id.clone(), child);
-
-    Ok(TunnelStatus {
-        rule_id,
-        active: true,
-        pid,
-        error: None,
-    })
 }
 
 pub fn stop_tunnel(

@@ -309,12 +309,12 @@ fn remove_port_forwards(
 }
 
 #[tauri::command]
-fn start_tunnel(
+async fn start_tunnel(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     rule_id: String,
 ) -> Result<TunnelStatus, String> {
-    port_forwarding::start_tunnel(&app, &state.tunnel_manager, rule_id)
+    port_forwarding::start_tunnel(&app, &state.tunnel_manager, rule_id).await
 }
 
 #[tauri::command]
@@ -487,8 +487,12 @@ fn sftp_list_remote(
     session_id: String,
     path: String,
 ) -> Result<Vec<RemoteFileEntry>, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.list_remote(&session_id, &path)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.list_remote(&path)
 }
 
 #[tauri::command]
@@ -512,16 +516,25 @@ async fn sftp_download(
             let app_prog = app_bg.clone();
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.download_file(
-                &sid,
-                &remote_path,
-                &local_path,
-                Arc::clone(&cancel_flag),
-                move |progress| {
-                    let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-                },
-            )
+            let entry = {
+                let manager = state.sftp_manager.lock().unwrap();
+                manager.get_session(&sid)
+            };
+            match entry {
+                Ok(entry_arc) => {
+                    let entry_guard = entry_arc.lock().unwrap();
+                    entry_guard.download_file(
+                        &sid,
+                        &remote_path,
+                        &local_path,
+                        Arc::clone(&cancel_flag),
+                        move |progress| {
+                            let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+                        },
+                    )
+                }
+                Err(e) => Err(e),
+            }
         })
         .await;
         let state = app.state::<AppState>();
@@ -570,16 +583,25 @@ async fn sftp_upload(
             let app_prog = app_bg.clone();
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.upload_file(
-                &sid,
-                &local_path,
-                &remote_path,
-                Arc::clone(&cancel_flag),
-                move |progress| {
-                    let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-                },
-            )
+            let entry = {
+                let manager = state.sftp_manager.lock().unwrap();
+                manager.get_session(&sid)
+            };
+            match entry {
+                Ok(entry_arc) => {
+                    let entry_guard = entry_arc.lock().unwrap();
+                    entry_guard.upload_file(
+                        &sid,
+                        &local_path,
+                        &remote_path,
+                        Arc::clone(&cancel_flag),
+                        move |progress| {
+                            let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+                        },
+                    )
+                }
+                Err(e) => Err(e),
+            }
         })
         .await;
         let state = app.state::<AppState>();
@@ -613,8 +635,12 @@ fn sftp_delete_remote(
     session_id: String,
     paths: Vec<String>,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.delete_remote(&session_id, &paths)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.delete_remote(&paths)
 }
 
 #[tauri::command]
@@ -624,8 +650,12 @@ fn sftp_rename_remote(
     from_path: String,
     to_path: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.rename_remote(&session_id, &from_path, &to_path)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.rename_remote(&from_path, &to_path)
 }
 
 #[tauri::command]
@@ -634,8 +664,12 @@ fn sftp_mkdir_remote(
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.mkdir_remote(&session_id, &path)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.mkdir_remote(&path)
 }
 
 #[tauri::command]
@@ -659,8 +693,12 @@ fn sftp_stat_remote(
     session_id: String,
     path: String,
 ) -> Result<sftp::RemoteStatResult, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.stat_remote(&session_id, &path)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.stat_remote(&path)
 }
 
 #[tauri::command]
@@ -776,8 +814,12 @@ async fn sftp_open_remote(
     remote_path: String,
 ) -> Result<String, String> {
     let tmp_path = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.open_remote(&session_id, &remote_path)?
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.open_remote(&session_id, &remote_path)?
     };
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&tmp_path).spawn();
@@ -854,8 +896,12 @@ fn sftp_chmod(
     mode: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.chmod(&session_id, &path, &mode, recursive)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.chmod(&path, &mode, recursive)
 }
 
 #[tauri::command]
@@ -867,8 +913,12 @@ fn sftp_chown(
     group: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.chown(&session_id, &path, &user, &group, recursive)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.chown(&path, &user, &group, recursive)
 }
 
 #[tauri::command]
@@ -878,8 +928,12 @@ fn sftp_copy_remote(
     paths: Vec<String>,
     dest_dir: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.copy_remote(&session_id, &paths, &dest_dir)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.copy_remote(&paths, &dest_dir)
 }
 
 #[tauri::command]
@@ -887,8 +941,12 @@ fn sftp_get_users_groups(
     state: State<AppState>,
     session_id: String,
 ) -> Result<sftp::UsersGroups, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.get_users_groups(&session_id)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.get_users_groups()
 }
 
 #[tauri::command]
