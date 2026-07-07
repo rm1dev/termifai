@@ -33,6 +33,8 @@ rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 base64 = "0.22"
 keyring = "3"
+hmac = "0.12"
+sha1 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri = { version = "2", features = ["macos-private-api"] }

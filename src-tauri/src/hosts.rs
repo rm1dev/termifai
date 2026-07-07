@@ -1,8 +1,8 @@
+use crate::vault::CryptoMeta;
+use crate::AppState;
 use serde::{Deserialize, Serialize};
-use std::fs;
 use std::io::{Read, Write};
 use std::net::ToSocketAddrs;
-use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
@@ -39,19 +39,6 @@ pub struct Host {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CryptoMeta {
-    /// Key-derivation function id; currently always "argon2id".
-    pub kdf: String,
-    /// base64(no-pad) per-vault Argon2 salt.
-    pub salt: String,
-    /// Envelope-wrapped DEK as a "v1:nonce:ciphertext" token.
-    pub wrapped_key: String,
-    /// Verifier token used to detect a wrong master password.
-    pub verifier: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OsKind {
     Ubuntu,
@@ -78,9 +65,15 @@ pub struct HostGroup {
     pub parent_id: Option<String>,
 }
 
+fn default_version() -> u32 {
+    1
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct HostsVault {
+    #[serde(default = "default_version")]
+    pub version: u32,
     pub hosts: Vec<Host>,
     pub groups: Vec<HostGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -133,8 +126,53 @@ pub struct TestHostConnectionResult {
     pub message: String,
 }
 
+fn migrate_hosts_vault(value: &mut serde_json::Value) {
+    if value.get("version").is_none() {
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("version".to_string(), serde_json::Value::from(1u32));
+        }
+    }
+}
+
 pub fn list_hosts(app: &AppHandle) -> Result<HostsVault, String> {
-    read_vault(app)
+    let state = app.state::<AppState>();
+    let vault = state
+        .hosts_store
+        .load_with_migration(migrate_hosts_vault)
+        .map_err(|e| e.to_string())?;
+
+    if vault.crypto.is_none() {
+        return Ok(vault);
+    }
+
+    // Rare, one-time path: legacy hosts.json still has the crypto meta embedded.
+    // Re-check and strip it atomically under the store's lock (a single
+    // update_with_migration call) instead of a separate load + save, so a
+    // concurrent save_host/remove_hosts write can't be silently clobbered by the
+    // stale snapshot read above. The vault_crypto_store write happens *inside*
+    // the critical section, before the strip is persisted, so a crash mid-migration
+    // (or a failed write) leaves the crypto meta present in both places rather
+    // than lost from both.
+    let mut migrate_err = None;
+    let vault = state
+        .hosts_store
+        .update_with_migration(migrate_hosts_vault, |v| {
+            if let Some(crypto_meta) = v.crypto.take() {
+                if let Err(e) =
+                    crate::vault::migrate_crypto_meta_from_hosts(app, crypto_meta.clone())
+                {
+                    migrate_err = Some(e);
+                    v.crypto = Some(crypto_meta);
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Some(e) = migrate_err {
+        return Err(e);
+    }
+
+    Ok(vault)
 }
 
 /// Returns the plaintext password for a host:
@@ -151,16 +189,6 @@ pub fn decrypt_host_password(host: &Host) -> Option<String> {
     crate::crypto::decrypt_field(key, stored).ok()
 }
 
-pub fn read_crypto_meta(app: &AppHandle) -> Result<Option<CryptoMeta>, String> {
-    Ok(read_vault(app)?.crypto)
-}
-
-pub fn write_crypto_meta(app: &AppHandle, meta: CryptoMeta) -> Result<(), String> {
-    let mut vault = read_vault(app)?;
-    vault.crypto = Some(meta);
-    write_vault(app, &vault)
-}
-
 /// Re-encrypt any legacy plaintext password fields using the unlocked vault key.
 /// Returns how many hosts were migrated. No-op if the vault is locked.
 pub fn migrate_plaintext_passwords(app: &AppHandle) -> Result<usize, String> {
@@ -169,77 +197,105 @@ pub fn migrate_plaintext_passwords(app: &AppHandle) -> Result<usize, String> {
         Some(k) => k,
         None => return Ok(0),
     };
-    let mut vault = read_vault(app)?;
+
+    let state = app.state::<AppState>();
     let mut migrated = 0usize;
-    for host in vault.hosts.iter_mut() {
-        if let Some(pw) = host.password.as_ref() {
-            if !pw.is_empty() && !pw.starts_with("v1:") {
-                let token = crate::crypto::encrypt_field(key, pw)
-                    .map_err(|_| "Failed to encrypt during migration".to_string())?;
-                host.password = Some(token);
-                migrated += 1;
+
+    state
+        .hosts_store
+        .update_with_migration(migrate_hosts_vault, |vault| {
+            for host in vault.hosts.iter_mut() {
+                if let Some(pw) = host.password.as_ref() {
+                    if !pw.is_empty() && !pw.starts_with("v1:") {
+                        if let Ok(token) = crate::crypto::encrypt_field(key, pw) {
+                            host.password = Some(token);
+                            migrated += 1;
+                        }
+                    }
+                }
             }
-        }
-    }
-    if migrated > 0 {
-        write_vault(app, &vault)?;
-    }
+        })
+        .map_err(|e| e.to_string())?;
+
     Ok(migrated)
 }
 
 pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, String> {
     validate_host(&request)?;
-    let mut vault = read_vault(app)?;
-    validate_group_exists(&vault, request.group_id.as_deref())?;
 
     let id = request
         .id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("h-{}", uuid::Uuid::new_v4()));
     let now = now_iso();
-    // `now` is reused for both last_used and updated_at below.
-    let existing_last_used = vault
-        .hosts
-        .iter()
-        .find(|host| host.id == id)
-        .and_then(|host| host.last_used.clone());
-    let host = Host {
-        id: id.clone(),
-        name: request.name.trim().to_string(),
-        user: request.user.trim().to_string(),
-        hostname: request.hostname.trim().to_string(),
-        port: request.port,
-        os: request.os,
-        tags: request
-            .tags
-            .into_iter()
-            .map(|tag| tag.trim().to_string())
-            .filter(|tag| !tag.is_empty())
-            .collect(),
-        last_used: existing_last_used.or(Some(now.clone())),
-        group_id: request.group_id.filter(|value| !value.trim().is_empty()),
-        auth_method: request.auth_method,
-        password: encrypt_password_for_save(request.password),
-        ssh_key_id: request.ssh_key_id.filter(|value| !value.trim().is_empty()),
-        show_status_in_dashboard: request.show_status_in_dashboard,
-        working_directory: request
-            .working_directory
-            .filter(|value| !value.trim().is_empty()),
-        default_sftp_path: request
-            .default_sftp_path
-            .filter(|value| !value.trim().is_empty()),
-        updated_at: Some(now),
-    };
+    let encrypted_password = encrypt_password_for_save(request.password)?;
 
-    upsert_by_id(&mut vault.hosts, host.clone(), |item| &item.id);
-    write_vault(app, &vault)?;
-    Ok(host)
+    let state = app.state::<AppState>();
+    let mut error = None;
+    let mut saved_host = None;
+
+    state
+        .hosts_store
+        .update_with_migration(migrate_hosts_vault, |vault| {
+            if let Err(e) = validate_group_exists(vault, request.group_id.as_deref()) {
+                error = Some(e);
+                return;
+            }
+
+            let existing_last_used = vault
+                .hosts
+                .iter()
+                .find(|host| host.id == id)
+                .and_then(|host| host.last_used.clone());
+            let host = Host {
+                id: id.clone(),
+                name: request.name.trim().to_string(),
+                user: request.user.trim().to_string(),
+                hostname: request.hostname.trim().to_string(),
+                port: request.port,
+                os: request.os,
+                tags: request
+                    .tags
+                    .into_iter()
+                    .map(|tag| tag.trim().to_string())
+                    .filter(|tag| !tag.is_empty())
+                    .collect(),
+                last_used: existing_last_used.or(Some(now.clone())),
+                group_id: request.group_id.filter(|value| !value.trim().is_empty()),
+                auth_method: request.auth_method,
+                password: encrypted_password,
+                ssh_key_id: request.ssh_key_id.filter(|value| !value.trim().is_empty()),
+                show_status_in_dashboard: request.show_status_in_dashboard,
+                working_directory: request
+                    .working_directory
+                    .filter(|value| !value.trim().is_empty()),
+                default_sftp_path: request
+                    .default_sftp_path
+                    .filter(|value| !value.trim().is_empty()),
+                updated_at: Some(now),
+            };
+
+            upsert_by_id(&mut vault.hosts, host.clone(), |item| &item.id);
+            saved_host = Some(host);
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Some(err_msg) = error {
+        return Err(err_msg);
+    }
+
+    saved_host.ok_or_else(|| "Failed to save host".to_string())
 }
 
 pub fn remove_hosts(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
-    let mut vault = read_vault(app)?;
-    vault.hosts.retain(|host| !ids.contains(&host.id));
-    write_vault(app, &vault)
+    let state = app.state::<AppState>();
+    state
+        .hosts_store
+        .update_with_migration(migrate_hosts_vault, |vault| {
+            vault.hosts.retain(|host| !ids.contains(&host.id));
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub fn save_host_group(
@@ -251,8 +307,6 @@ pub fn save_host_group(
         return Err("Group name is required".to_string());
     }
 
-    let mut vault = read_vault(app)?;
-    validate_group_exists(&vault, request.parent_id.as_deref())?;
     let id = request
         .id
         .filter(|value| !value.trim().is_empty())
@@ -262,30 +316,57 @@ pub fn save_host_group(
         return Err("Group cannot be its own parent".to_string());
     }
 
+    let parent_id = request
+        .parent_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+
     let group = HostGroup {
         id: id.clone(),
         name: name.to_string(),
-        parent_id: request.parent_id.filter(|value| !value.trim().is_empty()),
+        parent_id: parent_id.clone(),
     };
 
-    upsert_by_id(&mut vault.groups, group.clone(), |item| &item.id);
-    write_vault(app, &vault)?;
+    let state = app.state::<AppState>();
+    let mut error = None;
+
+    state
+        .hosts_store
+        .update_with_migration(migrate_hosts_vault, |vault| {
+            if let Err(e) = validate_group_exists(vault, parent_id.as_deref()) {
+                error = Some(e);
+                return;
+            }
+            upsert_by_id(&mut vault.groups, group.clone(), |item| &item.id);
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Some(err_msg) = error {
+        return Err(err_msg);
+    }
+
     Ok(group)
 }
 
 pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
-    let mut vault = read_vault(app)?;
-    let descendants = descendant_group_ids(&vault.groups, &id);
-    vault
-        .groups
-        .retain(|group| group.id != id && !descendants.contains(&group.id));
-    vault.hosts.retain(|host| {
-        host.group_id
-            .as_ref()
-            .map(|group_id| group_id != &id && !descendants.contains(group_id))
-            .unwrap_or(true)
-    });
-    write_vault(app, &vault)
+    let state = app.state::<AppState>();
+    state
+        .hosts_store
+        .update_with_migration(migrate_hosts_vault, |vault| {
+            let descendants = descendant_group_ids(&vault.groups, &id);
+            vault
+                .groups
+                .retain(|group| group.id != id && !descendants.contains(&group.id));
+            vault.hosts.retain(|host| {
+                host.group_id
+                    .as_ref()
+                    .map(|group_id| group_id != &id && !descendants.contains(group_id))
+                    .unwrap_or(true)
+            });
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 pub fn test_host_connection(
@@ -313,16 +394,22 @@ pub fn test_host_connection(
     let mut command = portable_pty::CommandBuilder::new("ssh");
     command.arg("-o");
     command.arg("BatchMode=no");
+    // accept-new: trust a host's key on first contact (TOFU) and record it in the
+    // user's known_hosts, but hard-fail if a previously recorded key changes —
+    // unlike StrictHostKeyChecking=no + /dev/null known_hosts, which trusted every
+    // connection unconditionally and made this test blind to MITM.
     command.arg("-o");
-    command.arg("StrictHostKeyChecking=no");
-    command.arg("-o");
-    command.arg("UserKnownHostsFile=/dev/null");
+    command.arg("StrictHostKeyChecking=accept-new");
     command.arg("-o");
     command.arg(format!("ConnectTimeout={}", timeout_secs));
     command.arg("-p");
     command.arg(request.port.to_string());
 
-    if let Some(ssh_key_id) = request.ssh_key_id.as_deref().filter(|id| !id.trim().is_empty()) {
+    if let Some(ssh_key_id) = request
+        .ssh_key_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
         let key_path = crate::ssh_keys::private_key_path(app, ssh_key_id)?;
         command.arg("-i");
         command.arg(key_path);
@@ -332,17 +419,6 @@ pub fn test_host_connection(
     command.arg("echo");
     command.arg("termifai-ssh-ok");
     run_ssh_test(command, request.password.unwrap_or_default(), timeout_secs)
-}
-
-fn read_vault(app: &AppHandle) -> Result<HostsVault, String> {
-    let path = vault_path(app)?;
-    if !path.exists() {
-        return Ok(HostsVault::default());
-    }
-
-    let contents =
-        fs::read_to_string(path).map_err(|e| format!("Failed to read hosts vault: {}", e))?;
-    serde_json::from_str(&contents).map_err(|e| format!("Failed to parse hosts vault: {}", e))
 }
 
 fn run_ssh_test(
@@ -410,7 +486,10 @@ fn run_ssh_test(
                             }));
                             return;
                         }
-                        if writer.write_all(format!("{}\r", password).as_bytes()).is_err() {
+                        if writer
+                            .write_all(format!("{}\r", password).as_bytes())
+                            .is_err()
+                        {
                             break;
                         }
                         password_sent = true;
@@ -452,25 +531,15 @@ fn ssh_failure_message(output: &str) -> String {
         "SSH connection refused".to_string()
     } else if lower.contains("operation timed out") || lower.contains("connection timed out") {
         "SSH connection timed out".to_string()
-    } else if lower.contains("could not resolve hostname") || lower.contains("name or service not known") {
+    } else if lower.contains("could not resolve hostname")
+        || lower.contains("name or service not known")
+    {
         "SSH hostname could not be resolved".to_string()
     } else if lower.contains("no route to host") {
         "No route to SSH host".to_string()
     } else {
         "SSH test failed".to_string()
     }
-}
-
-fn write_vault(app: &AppHandle, vault: &HostsVault) -> Result<(), String> {
-    let path = vault_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create hosts vault directory: {}", e))?;
-    }
-
-    let json = serde_json::to_string_pretty(vault)
-        .map_err(|e| format!("Failed to serialize hosts vault: {}", e))?;
-    fs::write(path, json).map_err(|e| format!("Failed to save hosts vault: {}", e))
 }
 
 fn validate_host(request: &SaveHostRequest) -> Result<(), String> {
@@ -530,23 +599,19 @@ fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
 }
 
 /// Encrypt a to-be-saved password with the unlocked vault key. If the value is
-/// empty it becomes None. If the vault is locked, the value is stored as-is
-/// (legacy plaintext) — the UI must require an unlock before saving secrets.
-fn encrypt_password_for_save(password: Option<String>) -> Option<String> {
-    let pw = password.filter(|value| !value.is_empty())?;
+/// empty it becomes None. If the vault is locked, we return an error.
+fn encrypt_password_for_save(password: Option<String>) -> Result<Option<String>, String> {
+    let pw = match password.filter(|value| !value.is_empty()) {
+        Some(pw) => pw,
+        None => return Ok(None),
+    };
     let guard = crate::vault::current_key();
     match guard.as_ref() {
-        Some(key) => crate::crypto::encrypt_field(key, &pw).ok(),
-        None => Some(pw),
+        Some(key) => crate::crypto::encrypt_field(key, &pw)
+            .map(Some)
+            .map_err(|e| format!("Encryption failed: {:?}", e)),
+        None => Err("Vault is locked — unlock it to save a password".to_string()),
     }
-}
-
-fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?
-        .join("hosts.json"))
 }
 
 fn now_iso() -> String {
@@ -583,11 +648,22 @@ mod tests {
     #[test]
     fn decrypt_host_password_passes_through_legacy_plaintext() {
         let host = Host {
-            id: "h1".into(), name: "n".into(), user: "u".into(), hostname: "h".into(),
-            port: 22, os: OsKind::Other, tags: vec![], last_used: None, group_id: None,
-            auth_method: None, password: Some("plainpw".into()), ssh_key_id: None,
-            show_status_in_dashboard: None, working_directory: None,
-            default_sftp_path: None, updated_at: None,
+            id: "h1".into(),
+            name: "n".into(),
+            user: "u".into(),
+            hostname: "h".into(),
+            port: 22,
+            os: OsKind::Other,
+            tags: vec![],
+            last_used: None,
+            group_id: None,
+            auth_method: None,
+            password: Some("plainpw".into()),
+            ssh_key_id: None,
+            show_status_in_dashboard: None,
+            working_directory: None,
+            default_sftp_path: None,
+            updated_at: None,
         };
         assert_eq!(decrypt_host_password(&host), Some("plainpw".to_string()));
     }
@@ -595,12 +671,45 @@ mod tests {
     #[test]
     fn decrypt_host_password_none_when_no_password() {
         let host = Host {
-            id: "h1".into(), name: "n".into(), user: "u".into(), hostname: "h".into(),
-            port: 22, os: OsKind::Other, tags: vec![], last_used: None, group_id: None,
-            auth_method: None, password: None, ssh_key_id: None,
-            show_status_in_dashboard: None, working_directory: None,
-            default_sftp_path: None, updated_at: None,
+            id: "h1".into(),
+            name: "n".into(),
+            user: "u".into(),
+            hostname: "h".into(),
+            port: 22,
+            os: OsKind::Other,
+            tags: vec![],
+            last_used: None,
+            group_id: None,
+            auth_method: None,
+            password: None,
+            ssh_key_id: None,
+            show_status_in_dashboard: None,
+            working_directory: None,
+            default_sftp_path: None,
+            updated_at: None,
         };
         assert_eq!(decrypt_host_password(&host), None);
+    }
+
+    #[test]
+    fn encrypt_password_fails_when_locked_but_succeeds_when_none() {
+        // Vault is locked by default in test environment
+        let res = encrypt_password_for_save(Some("secret".to_string()));
+        assert!(res.is_err(), "Expected error when vault is locked");
+        assert_eq!(
+            res.unwrap_err(),
+            "Vault is locked — unlock it to save a password"
+        );
+
+        let res_none = encrypt_password_for_save(None);
+        assert!(res_none.is_ok(), "Expected Ok(None) when password is None");
+        assert_eq!(res_none.unwrap(), None);
+
+        let res_empty = encrypt_password_for_save(Some("".to_string()));
+        assert!(
+            res_empty.is_ok(),
+            "Expected Ok(None) when password is empty"
+        );
+        assert_eq!(res_empty.unwrap(), None);
     }
 }
