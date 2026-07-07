@@ -235,7 +235,16 @@ struct KeyMetadataRequest {
 }
 
 fn build_key_metadata(req: KeyMetadataRequest) -> Result<SshKey, String> {
-    let KeyMetadataRequest { id, name, key_type, size, remark, has_passphrase, private_key_path, public_key_path } = req;
+    let KeyMetadataRequest {
+        id,
+        name,
+        key_type,
+        size,
+        remark,
+        has_passphrase,
+        private_key_path,
+        public_key_path,
+    } = req;
     let public_key = fs::read_to_string(&public_key_path)
         .map_err(|e| format!("Failed to read public key: {}", e))?;
     let fingerprint = fingerprint(&public_key_path)?;
