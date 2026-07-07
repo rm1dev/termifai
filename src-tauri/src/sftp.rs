@@ -140,10 +140,7 @@ impl std::fmt::Debug for SftpEntry {
 }
 
 impl SftpEntry {
-    pub fn list_remote(
-        &self,
-        path: &str,
-    ) -> Result<Vec<RemoteFileEntry>, String> {
+    pub fn list_remote(&self, path: &str) -> Result<Vec<RemoteFileEntry>, String> {
         let sftp = self
             .session
             .sftp()
@@ -347,11 +344,7 @@ impl SftpEntry {
         Ok(())
     }
 
-    pub fn rename_remote(
-        &self,
-        from_path: &str,
-        to_path: &str,
-    ) -> Result<(), String> {
+    pub fn rename_remote(&self, from_path: &str, to_path: &str) -> Result<(), String> {
         let sftp = self
             .session
             .sftp()
@@ -408,12 +401,10 @@ impl SftpEntry {
             .map_err(|e| format!("stat '{}': {}", path, e))?;
         let permissions = stat.perm.unwrap_or(0) & 0o7777;
         // get owner/group via SSH exec since libssh2 stat doesn't return names
-        let owner_out = self.exec_command(
-            &format!(
-                "stat -c '%U %G' {} 2>/dev/null || echo 'root root'",
-                shell_escape(path)
-            ),
-        )?;
+        let owner_out = self.exec_command(&format!(
+            "stat -c '%U %G' {} 2>/dev/null || echo 'root root'",
+            shell_escape(path)
+        ))?;
         let parts: Vec<&str> = owner_out.trim().splitn(2, ' ').collect();
         let owner = parts.first().unwrap_or(&"root").to_string();
         let group = parts.get(1).unwrap_or(&"root").to_string();
@@ -424,12 +415,7 @@ impl SftpEntry {
         })
     }
 
-    pub fn chmod(
-        &self,
-        path: &str,
-        mode: &str,
-        recursive: bool,
-    ) -> Result<(), String> {
+    pub fn chmod(&self, path: &str, mode: &str, recursive: bool) -> Result<(), String> {
         if !mode.chars().all(|c| c.is_ascii_digit()) || mode.is_empty() || mode.len() > 4 {
             return Err(format!("Invalid chmod mode: '{}'", mode));
         }
@@ -464,11 +450,7 @@ impl SftpEntry {
         Ok(())
     }
 
-    pub fn copy_remote(
-        &self,
-        paths: &[String],
-        dest_dir: &str,
-    ) -> Result<(), String> {
+    pub fn copy_remote(&self, paths: &[String], dest_dir: &str) -> Result<(), String> {
         for path in paths {
             let cmd = format!("cp -a {} {}/", shell_escape(path), shell_escape(dest_dir));
             self.exec_command(&cmd)?;
@@ -477,12 +459,10 @@ impl SftpEntry {
     }
 
     pub fn get_users_groups(&self) -> Result<UsersGroups, String> {
-        let users_out = self.exec_command(
-            "getent passwd | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/passwd",
-        )?;
-        let groups_out = self.exec_command(
-            "getent group | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/group",
-        )?;
+        let users_out = self
+            .exec_command("getent passwd | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/passwd")?;
+        let groups_out =
+            self.exec_command("getent group | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/group")?;
         let users = users_out
             .lines()
             .map(|s| s.trim().to_string())
@@ -563,8 +543,10 @@ impl SftpManager {
             .default_remote_path
             .clone()
             .unwrap_or_else(|| "/".to_string());
-        self.sessions
-            .insert(req.session_id.clone(), Arc::new(Mutex::new(SftpEntry { session })));
+        self.sessions.insert(
+            req.session_id.clone(),
+            Arc::new(Mutex::new(SftpEntry { session })),
+        );
 
         log(
             "ready",

@@ -274,8 +274,6 @@ fn set_vault_lock_policy(app: tauri::AppHandle, policy: String) -> Result<(), St
     vault::set_lock_policy(&app, p)
 }
 
-
-
 #[tauri::command]
 async fn test_host_connection(
     app: tauri::AppHandle,
@@ -1131,7 +1129,6 @@ pub fn run() {
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
                 .build(),
         )
-
         .invoke_handler(tauri::generate_handler![
             create_session,
             write_to_session,
@@ -1156,7 +1153,6 @@ pub fn run() {
             vault_change_master_password,
             get_vault_lock_policy,
             set_vault_lock_policy,
-
             test_host_connection,
             list_port_forwards,
             save_port_forward,
@@ -1211,7 +1207,9 @@ pub fn run() {
             let _ = (window, event);
         })
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir()
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
                 .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
 
             app.manage(AppState {
@@ -1224,7 +1222,9 @@ pub fn run() {
                 hosts_store: store::JsonStore::new(app_data_dir.join("hosts.json")),
                 port_forward_store: store::JsonStore::new(app_data_dir.join("port_forwards.json")),
                 snippets_store: store::JsonStore::new(app_data_dir.join("snippets.json")),
-                vault_settings_store: store::JsonStore::new(app_data_dir.join("vault_settings.json")),
+                vault_settings_store: store::JsonStore::new(
+                    app_data_dir.join("vault_settings.json"),
+                ),
                 vault_crypto_store: store::JsonStore::new(app_data_dir.join("vault.json")),
             });
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
