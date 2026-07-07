@@ -5,7 +5,9 @@ mod port_forwarding;
 mod pty_manager;
 mod sftp;
 mod snippets;
+mod ssh;
 mod ssh_keys;
+mod store;
 mod vault;
 use dashboard::DashboardManager;
 
@@ -54,6 +56,11 @@ struct AppState {
     watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
     dashboard_manager: Mutex<DashboardManager>,
+    hosts_store: store::JsonStore<hosts::HostsVault>,
+    port_forward_store: store::JsonStore<port_forwarding::PortForwardVault>,
+    snippets_store: store::JsonStore<snippets::SnippetsVault>,
+    vault_settings_store: store::JsonStore<vault::VaultSettings>,
+    vault_crypto_store: store::JsonStore<vault::CryptoVault>,
 }
 
 #[tauri::command]
@@ -62,15 +69,27 @@ fn create_session(
     state: State<AppState>,
     cwd: String,
     initial_command: Option<String>,
-    initial_password: Option<String>,
+    host_id: Option<String>,
     ready_marker: Option<String>,
 ) -> Result<TabInfo, String> {
+    let password = if let Some(ref h_id) = host_id {
+        let vault = hosts::list_hosts(&app)?;
+        let host = vault
+            .hosts
+            .iter()
+            .find(|h| h.id == *h_id)
+            .ok_or_else(|| "Host not found".to_string())?;
+        hosts::decrypt_host_password(host)
+    } else {
+        None
+    };
+
     let manager = state.pty_manager.lock().unwrap();
     manager.create_session(
         &app,
         &cwd,
         initial_command.as_deref(),
-        initial_password.as_deref(),
+        password.as_deref(),
         ready_marker.as_deref(),
     )
 }
@@ -211,12 +230,16 @@ fn vault_status(app: tauri::AppHandle) -> Result<vault::VaultStatus, String> {
 
 #[tauri::command]
 fn vault_init(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
-    vault::op_init(&app, &master_password)
+    vault::op_init(&app, &master_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
 fn vault_unlock(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
-    vault::op_unlock(&app, &master_password)
+    vault::op_unlock(&app, &master_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -231,7 +254,9 @@ fn vault_change_master_password(
     old_password: String,
     new_password: String,
 ) -> Result<(), String> {
-    vault::op_change_master_password(&app, &old_password, &new_password)
+    vault::op_change_master_password(&app, &old_password, &new_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -247,17 +272,6 @@ fn set_vault_lock_policy(app: tauri::AppHandle, policy: String) -> Result<(), St
     let p: vault::LockPolicy = serde_json::from_str(&format!("\"{}\"", policy))
         .map_err(|_| format!("Unknown lock policy: {policy}"))?;
     vault::set_lock_policy(&app, p)
-}
-
-#[tauri::command]
-fn get_host_password(app: tauri::AppHandle, host_id: String) -> Result<Option<String>, String> {
-    let vault = hosts::list_hosts(&app)?;
-    let host = vault
-        .hosts
-        .iter()
-        .find(|h| h.id == host_id)
-        .ok_or_else(|| "Host not found".to_string())?;
-    Ok(hosts::decrypt_host_password(host))
 }
 
 #[tauri::command]
@@ -293,12 +307,12 @@ fn remove_port_forwards(
 }
 
 #[tauri::command]
-fn start_tunnel(
+async fn start_tunnel(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     rule_id: String,
 ) -> Result<TunnelStatus, String> {
-    port_forwarding::start_tunnel(&app, &state.tunnel_manager, rule_id)
+    port_forwarding::start_tunnel(&app, &state.tunnel_manager, rule_id).await
 }
 
 #[tauri::command]
@@ -347,26 +361,29 @@ fn run_snippet_script(
     // Instead we use heredoc via PTY to write the script to /tmp on the target machine,
     // then execute it. The heredoc content is NOT echoed by the shell (only the cat command is).
     // A wrapper script erases the visible command line with ANSI escapes.
-    //
     // The full sequence sent to PTY:
-    //   printf '\033[1A\033[2K\r' && cat > /tmp/termifai_s_ID.sh << 'TERMIFAI_SNIPPET_EOF'
+    //   printf '\033[1A\033[2K\r' && f=$(mktemp /tmp/termifai_XXXXXXXX) && cat > "$f" << 'TERMIFAI_EOF_random'
     //   [script content - not echoed by shell]
-    //   TERMIFAI_SNIPPET_EOF
-    //   chmod +x /tmp/termifai_s_ID.sh && bash /tmp/termifai_s_ID.sh; rm -f /tmp/termifai_s_ID.sh
+    //   TERMIFAI_EOF_random
+    //   chmod +x "$f" && bash "$f"; rm -f "$f"
+    //
+    // The X's must be the trailing characters of the template with nothing after them —
+    // BSD/macOS mktemp and busybox mktemp (used on Alpine, a supported host OS) only
+    // substitute a trailing run of X's and either leave a literal "XXXXXXXX" in the
+    // filename (macOS) or fail outright (busybox) if a suffix like ".sh" follows it.
+    // No extension is needed since the file is executed explicitly via `bash "$f"`.
 
-    let script_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let script_id = &script_id[..8];
-    let tmp_path = format!("/tmp/termifai_s_{}.sh", script_id);
-    let eof_marker = "TERMIFAI_SNIPPET_EOF";
+    let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let rand_id = &rand_id[..8];
+    let eof_marker = format!("TERMIFAI_EOF_{}", rand_id);
 
     // Build the full payload to send to PTY
-    // Line 1: erase the echoed command + write script via heredoc
+    // Line 1: erase the echoed command + create temp file + write script via heredoc
     // Line 2..N: script content (shell does NOT echo heredoc body)
     // Last line: EOF marker
     // Then: chmod + execute + cleanup
     let payload = format!(
-        " printf '\\033[1A\\033[2K\\r' && cat > {path} << '{eof}'\r{script}\r{eof}\rchmod +x {path} && bash {path}; rm -f {path}\r",
-        path = tmp_path,
+        " printf '\\033[1A\\033[2K\\r' && f=$(mktemp /tmp/termifai_XXXXXXXX) && cat > \"$f\" << '{eof}'\r{script}\r{eof}\rchmod +x \"$f\" && bash \"$f\"; rm -f \"$f\"\r",
         eof = eof_marker,
         script = script.replace('\r', ""),
     );
@@ -474,8 +491,12 @@ fn sftp_list_remote(
     session_id: String,
     path: String,
 ) -> Result<Vec<RemoteFileEntry>, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.list_remote(&session_id, &path)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.list_remote(&path)
 }
 
 #[tauri::command]
@@ -499,16 +520,25 @@ async fn sftp_download(
             let app_prog = app_bg.clone();
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.download_file(
-                &sid,
-                &remote_path,
-                &local_path,
-                Arc::clone(&cancel_flag),
-                move |progress| {
-                    let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-                },
-            )
+            let entry = {
+                let manager = state.sftp_manager.lock().unwrap();
+                manager.get_session(&sid)
+            };
+            match entry {
+                Ok(entry_arc) => {
+                    let entry_guard = entry_arc.lock().unwrap();
+                    entry_guard.download_file(
+                        &sid,
+                        &remote_path,
+                        &local_path,
+                        Arc::clone(&cancel_flag),
+                        move |progress| {
+                            let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+                        },
+                    )
+                }
+                Err(e) => Err(e),
+            }
         })
         .await;
         let state = app.state::<AppState>();
@@ -557,16 +587,25 @@ async fn sftp_upload(
             let app_prog = app_bg.clone();
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.upload_file(
-                &sid,
-                &local_path,
-                &remote_path,
-                Arc::clone(&cancel_flag),
-                move |progress| {
-                    let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-                },
-            )
+            let entry = {
+                let manager = state.sftp_manager.lock().unwrap();
+                manager.get_session(&sid)
+            };
+            match entry {
+                Ok(entry_arc) => {
+                    let entry_guard = entry_arc.lock().unwrap();
+                    entry_guard.upload_file(
+                        &sid,
+                        &local_path,
+                        &remote_path,
+                        Arc::clone(&cancel_flag),
+                        move |progress| {
+                            let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+                        },
+                    )
+                }
+                Err(e) => Err(e),
+            }
         })
         .await;
         let state = app.state::<AppState>();
@@ -600,8 +639,12 @@ fn sftp_delete_remote(
     session_id: String,
     paths: Vec<String>,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.delete_remote(&session_id, &paths)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.delete_remote(&paths)
 }
 
 #[tauri::command]
@@ -611,8 +654,12 @@ fn sftp_rename_remote(
     from_path: String,
     to_path: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.rename_remote(&session_id, &from_path, &to_path)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.rename_remote(&from_path, &to_path)
 }
 
 #[tauri::command]
@@ -621,8 +668,12 @@ fn sftp_mkdir_remote(
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.mkdir_remote(&session_id, &path)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.mkdir_remote(&path)
 }
 
 #[tauri::command]
@@ -646,8 +697,12 @@ fn sftp_stat_remote(
     session_id: String,
     path: String,
 ) -> Result<sftp::RemoteStatResult, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.stat_remote(&session_id, &path)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.stat_remote(&path)
 }
 
 #[tauri::command]
@@ -763,8 +818,12 @@ async fn sftp_open_remote(
     remote_path: String,
 ) -> Result<String, String> {
     let tmp_path = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.open_remote(&session_id, &remote_path)?
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.open_remote(&session_id, &remote_path)?
     };
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&tmp_path).spawn();
@@ -841,8 +900,12 @@ fn sftp_chmod(
     mode: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.chmod(&session_id, &path, &mode, recursive)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.chmod(&path, &mode, recursive)
 }
 
 #[tauri::command]
@@ -854,8 +917,12 @@ fn sftp_chown(
     group: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.chown(&session_id, &path, &user, &group, recursive)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.chown(&path, &user, &group, recursive)
 }
 
 #[tauri::command]
@@ -865,8 +932,12 @@ fn sftp_copy_remote(
     paths: Vec<String>,
     dest_dir: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.copy_remote(&session_id, &paths, &dest_dir)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.copy_remote(&paths, &dest_dir)
 }
 
 #[tauri::command]
@@ -874,8 +945,12 @@ fn sftp_get_users_groups(
     state: State<AppState>,
     session_id: String,
 ) -> Result<sftp::UsersGroups, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.get_users_groups(&session_id)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.get_users_groups()
 }
 
 #[tauri::command]
@@ -1060,14 +1135,6 @@ pub fn run() {
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
                 .build(),
         )
-        .manage(AppState {
-            pty_manager: Mutex::new(PtyManager::new()),
-            tunnel_manager: port_forwarding::new_tunnel_manager(),
-            sftp_manager: Mutex::new(SftpManager::new()),
-            watch_handles: Mutex::new(std::collections::HashMap::new()),
-            transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
-            dashboard_manager: Mutex::new(DashboardManager::new()),
-        })
         .invoke_handler(tauri::generate_handler![
             create_session,
             write_to_session,
@@ -1092,7 +1159,6 @@ pub fn run() {
             vault_change_master_password,
             get_vault_lock_policy,
             set_vault_lock_policy,
-            get_host_password,
             test_host_connection,
             list_port_forwards,
             save_port_forward,
@@ -1147,6 +1213,26 @@ pub fn run() {
             let _ = (window, event);
         })
         .setup(|app| {
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+
+            app.manage(AppState {
+                pty_manager: Mutex::new(PtyManager::new()),
+                tunnel_manager: port_forwarding::new_tunnel_manager(),
+                sftp_manager: Mutex::new(SftpManager::new()),
+                watch_handles: Mutex::new(std::collections::HashMap::new()),
+                transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
+                dashboard_manager: Mutex::new(DashboardManager::new()),
+                hosts_store: store::JsonStore::new(app_data_dir.join("hosts.json")),
+                port_forward_store: store::JsonStore::new(app_data_dir.join("port_forwards.json")),
+                snippets_store: store::JsonStore::new(app_data_dir.join("snippets.json")),
+                vault_settings_store: store::JsonStore::new(
+                    app_data_dir.join("vault_settings.json"),
+                ),
+                vault_crypto_store: store::JsonStore::new(app_data_dir.join("vault.json")),
+            });
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
             // Also set UTF-8 (codepage 65001) so ConPTY correctly interprets multi-byte
@@ -1266,8 +1352,13 @@ pub fn run() {
                 )?;
             }
             // Try to unlock the vault silently using the keychain-cached master password,
-            // so a returning user on this device isn't prompted again.
-            let _ = vault::op_try_cached_unlock(app.handle());
+            // so a returning user on this device isn't prompted again. This bypasses the
+            // vault_unlock command, so — same as that command — it must also trigger the
+            // legacy-plaintext-password migration; otherwise a user whose vault always
+            // auto-unlocks (the default OnRestart policy) would never get migrated.
+            if let Ok(true) = vault::op_try_cached_unlock(app.handle()) {
+                let _ = hosts::migrate_plaintext_passwords(app.handle());
+            }
 
             // Start background screen-lock monitor (macOS only).
             #[cfg(target_os = "macos")]

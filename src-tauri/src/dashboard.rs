@@ -1,8 +1,6 @@
 use serde::Serialize;
 use ssh2::Session;
 use std::collections::HashMap;
-use std::io::Read as IoRead;
-use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -620,51 +618,18 @@ fn ssh_connect(
     password: Option<&str>,
     key_path: Option<&std::path::Path>,
 ) -> Result<Session, String> {
-    let addr = format!("{}:{}", hostname, port);
-    let tcp = TcpStream::connect(&addr).map_err(|e| format!("TCP connect to {}: {}", addr, e))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(15))).ok();
-    tcp.set_write_timeout(Some(Duration::from_secs(15))).ok();
-
-    let mut session = Session::new().map_err(|e| format!("SSH session init: {}", e))?;
-    session.set_tcp_stream(tcp);
-    session
-        .handshake()
-        .map_err(|e| format!("SSH handshake: {}", e))?;
-
-    if let Some(key) = key_path {
-        session
-            .userauth_pubkey_file(user, None, key, None)
-            .map_err(|e| format!("Key auth: {}", e))?;
-    } else if let Some(pw) = password {
-        session
-            .userauth_password(user, pw)
-            .map_err(|e| format!("Password auth: {}", e))?;
-    } else {
-        session
-            .userauth_agent(user)
-            .map_err(|e| format!("Agent auth: {}", e))?;
-    }
-
-    if !session.authenticated() {
-        return Err("Authentication failed".to_string());
-    }
-
-    // keepalive every 15s — prevents NAT timeout
-    session.set_keepalive(true, 15);
-    Ok(session)
+    let cfg = crate::ssh::SshConfig {
+        hostname,
+        port,
+        username: user,
+        password,
+        key_path,
+    };
+    crate::ssh::connect(&cfg, |_stage, _msg| {}).map_err(String::from)
 }
 
 fn exec_cmd(session: &Session, cmd: &str) -> Result<String, String> {
-    let mut ch = session
-        .channel_session()
-        .map_err(|e| format!("Channel open: {}", e))?;
-    ch.exec(cmd)
-        .map_err(|e| format!("Exec '{}': {}", &cmd[..cmd.len().min(40)], e))?;
-    let mut out = String::new();
-    ch.read_to_string(&mut out)
-        .map_err(|e| format!("Read channel: {}", e))?;
-    ch.wait_close().ok();
-    Ok(out)
+    crate::ssh::exec(session, cmd)
 }
 
 // ─── Actor internals ──────────────────────────────────────────────────────────

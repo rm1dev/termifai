@@ -31,9 +31,6 @@ export function vaultChangeMasterPassword(
   return invoke<void>("vault_change_master_password", { oldPassword, newPassword });
 }
 
-export function getHostPassword(hostId: string): Promise<string | null> {
-  return invoke<string | null>("get_host_password", { hostId });
-}
 
 export function getLockPolicy(): Promise<LockPolicy> {
   return invoke<LockPolicy>("get_vault_lock_policy");
