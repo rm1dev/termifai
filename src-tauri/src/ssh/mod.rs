@@ -9,12 +9,17 @@
 //! binary instead and is unaffected by this module — its host key handling
 //! comes from the user's real `ssh` client.
 
+use base64::engine::general_purpose::STANDARD as B64_PADDED;
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
 use base64::Engine;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 use ssh2::{CheckResult, HashType, KnownHostFileKind, MethodType, Session};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+type HmacSha1 = Hmac<Sha1>;
 
 pub struct SshConfig<'a> {
     pub hostname: &'a str,
@@ -172,9 +177,17 @@ fn algorithms_pref_from_known_hosts_text(
         let Some(host_field) = fields.next() else {
             continue;
         };
-        let matches_host = host_field
-            .split(',')
-            .any(|h| h == hostname || h == entry_host);
+        let matches_host = if host_field.starts_with("|1|") {
+            // HashKnownHosts format: the hostname isn't stored in plain text,
+            // so literal comparison can never match — it must be verified via
+            // HMAC-SHA1(salt, hostname), same as OpenSSH itself does.
+            hashed_host_matches(host_field, hostname)
+                || hashed_host_matches(host_field, &entry_host)
+        } else {
+            host_field
+                .split(',')
+                .any(|h| h == hostname || h == entry_host)
+        };
         if !matches_host {
             continue;
         }
@@ -216,6 +229,29 @@ fn algorithms_pref_from_known_hosts_text(
     }
 
     Some(prefs.join(","))
+}
+
+/// Checks a candidate hostname against an OpenSSH `HashKnownHosts`-format
+/// field: `|1|<base64 salt>|<base64 HMAC-SHA1(salt, hostname)>`. This is the
+/// same construction OpenSSH itself uses (see `ssh_config(5)` HashKnownHosts).
+fn hashed_host_matches(host_field: &str, candidate: &str) -> bool {
+    let Some(rest) = host_field.strip_prefix("|1|") else {
+        return false;
+    };
+    let Some((salt_b64, hash_b64)) = rest.split_once('|') else {
+        return false;
+    };
+    let Ok(salt) = B64_PADDED.decode(salt_b64) else {
+        return false;
+    };
+    let Ok(expected) = B64_PADDED.decode(hash_b64) else {
+        return false;
+    };
+    let Ok(mut mac) = HmacSha1::new_from_slice(&salt) else {
+        return false;
+    };
+    mac.update(candidate.as_bytes());
+    mac.verify_slice(&expected).is_ok()
 }
 
 fn known_hosts_path() -> Option<PathBuf> {
@@ -308,6 +344,44 @@ mod tests {
         // Fallback set must still be present so a real key-type rotation works.
         assert!(prefs.contains("rsa-sha2-512"));
         assert!(prefs.contains("ssh-rsa"));
+    }
+
+    #[test]
+    fn hashed_host_matches_self_generated_entry() {
+        // Round-trip check of the HMAC-SHA1 construction itself, independent of
+        // any real-world known_hosts sample: generate a hashed entry exactly the
+        // way OpenSSH's HashKnownHosts does, then confirm we can verify it.
+        let salt = b"0123456789abcdefghij"; // 20 bytes, matches SHA1 digest size
+        let mut mac = HmacSha1::new_from_slice(salt).unwrap();
+        mac.update(b"self-test-host".as_slice());
+        let digest = mac.finalize().into_bytes();
+        let field = format!(
+            "|1|{}|{}",
+            B64_PADDED.encode(salt),
+            B64_PADDED.encode(digest)
+        );
+        assert!(hashed_host_matches(&field, "self-test-host"));
+        assert!(!hashed_host_matches(&field, "wrong-host"));
+    }
+
+    #[test]
+    fn hashed_host_matches_real_openssh_hashknownhosts_entry() {
+        // Real HashKnownHosts-format line reported from a user's ~/.ssh/known_hosts
+        // (Ubuntu 24.04, HashKnownHosts yes) that was silently un-matched before
+        // hashed-entry support was added, causing preferred_host_key_algorithms
+        // to always return None and libssh2 to negotiate the wrong key type.
+        let line = "|1|6BS5bhOa51c43ob788+AeJFWXgQ=|3aeVyKbmK1iIxVUsP0efXmiBWDg=";
+        assert!(hashed_host_matches(line, "185.252.30.210"));
+        assert!(!hashed_host_matches(line, "some-other-host.example"));
+    }
+
+    #[test]
+    fn algorithms_pref_matches_hashed_known_hosts_entries() {
+        let known_hosts =
+            "|1|6BS5bhOa51c43ob788+AeJFWXgQ=|3aeVyKbmK1iIxVUsP0efXmiBWDg= ssh-ed25519 AAAAC3...\n";
+        let prefs =
+            algorithms_pref_from_known_hosts_text(known_hosts, "185.252.30.210", 22).unwrap();
+        assert!(prefs.starts_with("ssh-ed25519"));
     }
 
     #[test]
