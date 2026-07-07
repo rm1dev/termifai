@@ -76,25 +76,6 @@ impl<T: Serialize + DeserializeOwned + Default> JsonStore<T> {
         Ok(value)
     }
 
-    pub fn save(&self, value: &T) -> Result<(), StoreError> {
-        let _lock = self.lock.lock().unwrap();
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let tmp_path = self.path.with_extension("json.tmp");
-
-        {
-            let mut file = File::create(&tmp_path)?;
-            let json = serde_json::to_string_pretty(value)?;
-            file.write_all(json.as_bytes())?;
-            file.sync_all()?;
-        }
-
-        fs::rename(&tmp_path, &self.path)?;
-        Ok(())
-    }
-
     pub fn update<F>(&self, f: F) -> Result<T, StoreError>
     where
         F: FnOnce(&mut T),

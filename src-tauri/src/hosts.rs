@@ -136,14 +136,40 @@ fn migrate_hosts_vault(value: &mut serde_json::Value) {
 
 pub fn list_hosts(app: &AppHandle) -> Result<HostsVault, String> {
     let state = app.state::<AppState>();
-    let mut vault = state
+    let vault = state
         .hosts_store
         .load_with_migration(migrate_hosts_vault)
         .map_err(|e| e.to_string())?;
 
-    if let Some(crypto_meta) = vault.crypto.take() {
-        crate::vault::migrate_crypto_meta_from_hosts(app, crypto_meta)?;
-        state.hosts_store.save(&vault).map_err(|e| e.to_string())?;
+    if vault.crypto.is_none() {
+        return Ok(vault);
+    }
+
+    // Rare, one-time path: legacy hosts.json still has the crypto meta embedded.
+    // Re-check and strip it atomically under the store's lock (a single
+    // update_with_migration call) instead of a separate load + save, so a
+    // concurrent save_host/remove_hosts write can't be silently clobbered by the
+    // stale snapshot read above. The vault_crypto_store write happens *inside*
+    // the critical section, before the strip is persisted, so a crash mid-migration
+    // (or a failed write) leaves the crypto meta present in both places rather
+    // than lost from both.
+    let mut migrate_err = None;
+    let vault = state
+        .hosts_store
+        .update_with_migration(migrate_hosts_vault, |v| {
+            if let Some(crypto_meta) = v.crypto.take() {
+                if let Err(e) =
+                    crate::vault::migrate_crypto_meta_from_hosts(app, crypto_meta.clone())
+                {
+                    migrate_err = Some(e);
+                    v.crypto = Some(crypto_meta);
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Some(e) = migrate_err {
+        return Err(e);
     }
 
     Ok(vault)
