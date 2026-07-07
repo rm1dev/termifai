@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { sftpCall, sftpTransfer } from "@/lib/api/sftp";
+import { subscribe } from "@/lib/api/transport";
 import {
   File,
   Folder,
@@ -169,7 +169,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
   // Load hosts for picker (only when no host is pre-selected)
   useEffect(() => {
     if (!tab.sftpHostId) {
-      invoke<{ hosts: Host[] }>("list_hosts")
+      sftpCall<{ hosts: Host[] }>("list_hosts")
         .then((v) => setAllHosts(v.hosts))
         .catch(() => {});
     }
@@ -224,7 +224,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
   // Listen for progress events
   useEffect(() => {
     if (!isConnected) return;
-    const unlisten = listen<TransferProgress>(`sftp:${sftpSessionId}:progress`, (event) => {
+    const unlisten = subscribe<TransferProgress>(`sftp:${sftpSessionId}:progress`, (event) => {
       setTransferProgress(event.payload);
     });
     return () => {
@@ -235,7 +235,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
   // Listen for file-changed events (remote watch)
   useEffect(() => {
     if (!sftpSessionId) return;
-    const unlisten = listen<{ tmp_path: string; remote_path: string }>(
+    const unlisten = subscribe<{ tmp_path: string; remote_path: string }>(
       `sftp:${sftpSessionId}:file-changed`,
       (ev) => {
         setWatchedFile({
@@ -296,28 +296,6 @@ export function SftpView({ tab }: { tab: AppTab }) {
     setLastRemoteClick(path);
   };
 
-  const invokeTransfer = async (
-    command: string,
-    args: Record<string, string>,
-  ): Promise<void> => {
-    let unlisten: (() => void) | undefined;
-    try {
-      await new Promise<void>(async (resolve, reject) => {
-        unlisten = await listen<{ ok: boolean; error?: string }>(
-          `sftp:${sftpSessionId}:transfer-done`,
-          (ev) => {
-            unlisten?.();
-            if (ev.payload.ok) resolve();
-            else reject(new Error(ev.payload.error ?? "Transfer failed"));
-          }
-        );
-        invoke(command, args).catch((e: unknown) => { unlisten?.(); reject(e); });
-      });
-    } finally {
-      unlisten?.();
-    }
-  };
-
   const handleDownload = async (paths?: string[]) => {
     const targets = paths ?? [...selectedRemote];
     if (targets.length === 0 || !isConnected) return;
@@ -328,7 +306,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
         const rp = targets[i];
         const fileName = rp.split("/").pop() ?? "file";
         setTransferOverall({ current: i + 1, total: targets.length, fileName });
-        await invokeTransfer("sftp_download", {
+        await sftpTransfer(sftpSessionId, "sftp_download", {
           sessionId: sftpSessionId,
           remotePath: rp,
           localPath: joinLocalPath(localPath, [...getLocalPathParts(localPath), fileName]),
@@ -358,7 +336,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
         const lp = targets[i];
         const fileName = lp.split("/").pop() ?? "file";
         setTransferOverall({ current: i + 1, total: targets.length, fileName });
-        await invokeTransfer("sftp_upload", {
+        await sftpTransfer(sftpSessionId, "sftp_upload", {
           sessionId: sftpSessionId,
           localPath: lp,
           remotePath: `${remotePath}/${fileName}`,
@@ -379,22 +357,22 @@ export function SftpView({ tab }: { tab: AppTab }) {
   };
 
   const handleOpenLocal = (path: string) => {
-    void invoke("sftp_open_local", { path });
+    void sftpCall("sftp_open_local", { path });
   };
 
   const handleOpenWithLocal = (path: string, app: string) => {
-    void invoke("sftp_open_with_local", { path, app });
+    void sftpCall("sftp_open_with_local", { path, app });
   };
 
   const handleOpenRemote = async (path: string) => {
-    const tmpPath = await invoke<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: path });
-    await invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath, remotePath: path });
+    const tmpPath = await sftpCall<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: path });
+    await sftpCall("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath, remotePath: path });
   };
 
   const handleCopyLocal = (paths: string[]) => setLocalClipboard(paths);
   const handlePasteLocal = () => {
     if (!localClipboard.length) return;
-    void invoke("sftp_copy_local", { paths: localClipboard, destDir: localPath })
+    void sftpCall("sftp_copy_local", { paths: localClipboard, destDir: localPath })
       .then(() => loadLocalDir(localPath))
       .catch((e: unknown) => toast.error(String(e)));
   };
@@ -402,13 +380,13 @@ export function SftpView({ tab }: { tab: AppTab }) {
   const handleCopyRemote = (paths: string[]) => setRemoteClipboard(paths);
   const handlePasteRemote = () => {
     if (!remoteClipboard.length || !remotePath) return;
-    void invoke("sftp_copy_remote", { sessionId: sftpSessionId, paths: remoteClipboard, destDir: remotePath })
+    void sftpCall("sftp_copy_remote", { sessionId: sftpSessionId, paths: remoteClipboard, destDir: remotePath })
       .then(() => loadRemoteDir(remotePath))
       .catch((e: unknown) => toast.error(String(e)));
   };
 
   const handleDeleteLocal = (paths: string[]) => {
-    void invoke("sftp_delete_local", { paths })
+    void sftpCall("sftp_delete_local", { paths })
       .then(() => loadLocalDir(localPath))
       .catch((e: unknown) => toast.error(String(e)));
   };
@@ -417,11 +395,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
     if (!renameTarget) return;
     try {
       if (renameTarget.isLocal) {
-        await invoke("sftp_rename_local", { path: renameTarget.path, newName });
+        await sftpCall("sftp_rename_local", { path: renameTarget.path, newName });
         await loadLocalDir(localPath);
       } else {
         const dir = renameTarget.path.substring(0, renameTarget.path.lastIndexOf("/")) || "/";
-        await invoke("sftp_rename_remote", {
+        await sftpCall("sftp_rename_remote", {
           sessionId: sftpSessionId,
           fromPath: renameTarget.path,
           toPath: `${dir}/${newName}`,
@@ -435,12 +413,12 @@ export function SftpView({ tab }: { tab: AppTab }) {
   const connectCleanupRef = useRef<(() => void) | null>(null);
 
   const performDisconnect = () => {
-    void invoke("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
+    void sftpCall("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
     setIsConnected(false);
     setPickedHostId(undefined);
     setConnectError(null);
     setRemoteFiles([]);
-    invoke<{ hosts: Host[] }>("list_hosts").then((v) => setAllHosts(v.hosts)).catch(() => {});
+    sftpCall<{ hosts: Host[] }>("list_hosts").then((v) => setAllHosts(v.hosts)).catch(() => {});
   };
 
   const handleConnect = async (hostId?: string, hostObj?: Host) => {
@@ -459,10 +437,10 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
     // Subscribe to progress + done events before firing the command
     const [unlistenProgress, unlistenDone] = await Promise.all([
-      listen<{ stage: string; message: string }>(`sftp:${sftpSessionId}:connect`, (ev) => {
+      subscribe<{ stage: string; message: string }>(`sftp:${sftpSessionId}:connect`, (ev) => {
         setConnectMessage(ev.payload.message);
       }),
-      listen<{ ok: boolean; remote_path?: string; error?: string }>(`sftp:${sftpSessionId}:done`, async (ev) => {
+      subscribe<{ ok: boolean; remote_path?: string; error?: string }>(`sftp:${sftpSessionId}:done`, async (ev) => {
         connectCleanupRef.current?.();
         connectCleanupRef.current = null;
         if (ev.payload.ok && ev.payload.remote_path) {
@@ -480,7 +458,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
     // Command returns immediately — actual connection runs in Rust background thread
     try {
-      await invoke("sftp_connect_from_host", { hostId: targetHostId, sessionId: sftpSessionId });
+      await sftpCall("sftp_connect_from_host", { hostId: targetHostId, sessionId: sftpSessionId });
     } catch (e) {
       // Only fires if credential resolution fails (before background spawn)
       cleanup();
@@ -494,7 +472,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
     setRemoteLoading(true);
     setRemoteError(null);
     try {
-      const files = await invoke<RemoteFileEntry[]>("sftp_list_remote", {
+      const files = await sftpCall<RemoteFileEntry[]>("sftp_list_remote", {
         sessionId: sftpSessionId,
         path,
       });
@@ -515,7 +493,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
     return () => {
       connectCleanupRef.current?.();
       connectCleanupRef.current = null;
-      void invoke("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
+      void sftpCall("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -523,7 +501,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
     setLocalLoading(true);
     setLocalError(null);
     try {
-      const files = await invoke<LocalFileEntry[]>("sftp_list_local", { path });
+      const files = await sftpCall<LocalFileEntry[]>("sftp_list_local", { path });
       setLocalFiles(files);
       setLocalPath(path);
     } catch (e) {
@@ -534,7 +512,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
   };
 
   useEffect(() => {
-    invoke<string>("get_home_dir")
+    sftpCall<string>("get_home_dir")
       .then((home) => loadLocalDir(home))
       .catch(() => loadLocalDir(localPath));
   }, []); // load on mount
@@ -612,7 +590,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
                 </span>
                 <button
                   className="shrink-0 rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
-                  onClick={() => void invoke("sftp_cancel_transfer", { sessionId: sftpSessionId })}
+                  onClick={() => void sftpCall("sftp_cancel_transfer", { sessionId: sftpSessionId })}
                 >
                   Cancel
                 </button>
@@ -1062,7 +1040,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
               <button
                 className="rounded px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground"
                 onClick={() => {
-                  void invoke("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
+                  void sftpCall("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
                   setWatchedFile(null);
                 }}
               >
@@ -1072,12 +1050,12 @@ export function SftpView({ tab }: { tab: AppTab }) {
                 className="rounded bg-[oklch(0.45_0.12_145)] px-2.5 py-1 text-xs font-medium text-white hover:bg-[oklch(0.5_0.12_145)]"
                 onClick={async () => {
                   try {
-                    await invokeTransfer("sftp_upload", {
+                    await sftpTransfer(sftpSessionId, "sftp_upload", {
                       sessionId: sftpSessionId,
                       localPath: watchedFile.tmpPath,
                       remotePath: watchedFile.remotePath,
                     });
-                    await invoke("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
+                    await sftpCall("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
                     setWatchedFile(null);
                     if (remotePath) await loadRemoteDir(remotePath);
                   } catch (e) { toast.error(String(e)); }
@@ -1121,9 +1099,9 @@ export function SftpView({ tab }: { tab: AppTab }) {
               onKeyDown={(e) => {
                 if (e.key === "Enter" && openWithApp.trim()) {
                   if (openWithTarget.isLocal) handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
-                  else void invoke("sftp_open_remote", { sessionId: sftpSessionId, remotePath: openWithTarget.path })
-                    .then((tmp) => invoke("sftp_open_with_local", { path: tmp as string, app: openWithApp.trim() }).then(() => tmp))
-                    .then((tmp) => invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: openWithTarget.path }))
+                  else void sftpCall("sftp_open_remote", { sessionId: sftpSessionId, remotePath: openWithTarget.path })
+                    .then((tmp) => sftpCall("sftp_open_with_local", { path: tmp as string, app: openWithApp.trim() }).then(() => tmp))
+                    .then((tmp) => sftpCall("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: openWithTarget.path }))
                     .catch((e: unknown) => toast.error(String(e)));
                   setOpenWithTarget(null);
                   setOpenWithApp("");
@@ -1142,9 +1120,9 @@ export function SftpView({ tab }: { tab: AppTab }) {
                     } else {
                       const app = openWithApp.trim();
                       const target = openWithTarget;
-                      invoke<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: target.path })
-                        .then((tmp) => invoke("sftp_open_with_local", { path: tmp, app }).then(() => tmp))
-                        .then((tmp) => invoke("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: target.path }))
+                      sftpCall<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: target.path })
+                        .then((tmp) => sftpCall("sftp_open_with_local", { path: tmp, app }).then(() => tmp))
+                        .then((tmp) => sftpCall("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: target.path }))
                         .catch((e: unknown) => toast.error(String(e)));
                     }
                   }
@@ -1161,11 +1139,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
         open={newFolderTarget !== null}
         onConfirm={(name) => {
           if (newFolderTarget === "local") {
-            void invoke("sftp_mkdir_local", { path: joinLocalPath(localPath, [...getLocalPathParts(localPath), name]) })
+            void sftpCall("sftp_mkdir_local", { path: joinLocalPath(localPath, [...getLocalPathParts(localPath), name]) })
               .then(() => loadLocalDir(localPath))
               .catch((e: unknown) => toast.error(String(e)));
           } else if (newFolderTarget === "remote" && remotePath) {
-            void invoke("sftp_mkdir_remote", { sessionId: sftpSessionId, path: `${remotePath}/${name}` })
+            void sftpCall("sftp_mkdir_remote", { sessionId: sftpSessionId, path: `${remotePath}/${name}` })
               .then(() => loadRemoteDir(remotePath))
               .catch((e: unknown) => toast.error(String(e)));
           }
@@ -1199,7 +1177,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
                     if (deleteConfirm.isLocal) {
                       handleDeleteLocal(deleteConfirm.targets);
                     } else {
-                      void invoke("sftp_delete_remote", { sessionId: sftpSessionId, paths: deleteConfirm.targets })
+                      void sftpCall("sftp_delete_remote", { sessionId: sftpSessionId, paths: deleteConfirm.targets })
                         .then(() => {
                           if (remotePath) loadRemoteDir(remotePath);
                         })
@@ -1234,7 +1212,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
                 <button
                   className="rounded bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-500"
                   onClick={() => {
-                    void invoke("sftp_cancel_transfer", { sessionId: sftpSessionId });
+                    void sftpCall("sftp_cancel_transfer", { sessionId: sftpSessionId });
                     setShowDisconnectConfirm(false);
                     performDisconnect();
                   }}

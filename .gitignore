@@ -26,6 +26,9 @@ Thumbs.db
 .env
 .env.*
 
+# OAuth secrets (see oauth_secrets.example.rs for the template)
+src-tauri/crates/termifai-core/src/sync/oauth_secrets.rs
+
 # Bun
 bun.lock
 bun.lockb

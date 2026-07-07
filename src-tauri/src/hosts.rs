@@ -1,4 +1,3 @@
-use crate::vault::CryptoMeta;
 use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
@@ -6,79 +5,8 @@ use std::net::ToSocketAddrs;
 use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Host {
-    pub id: String,
-    pub name: String,
-    pub user: String,
-    pub hostname: String,
-    pub port: u16,
-    pub os: OsKind,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_used: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub group_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_method: Option<AuthMethod>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_key_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub show_status_in_dashboard: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub working_directory: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_sftp_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<String>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OsKind {
-    Ubuntu,
-    Debian,
-    Centos,
-    Alpine,
-    Macos,
-    Windows,
-    Other,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthMethod {
-    Password,
-    Key,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HostGroup {
-    pub id: String,
-    pub name: String,
-    pub parent_id: Option<String>,
-}
-
-fn default_version() -> u32 {
-    1
-}
-
-#[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct HostsVault {
-    #[serde(default = "default_version")]
-    pub version: u32,
-    pub hosts: Vec<Host>,
-    pub groups: Vec<HostGroup>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub crypto: Option<CryptoMeta>,
-}
+use termifai_core::model::hosts::migrate_hosts_vault;
+pub use termifai_core::model::hosts::{AuthMethod, Host, HostGroup, HostsVault, OsKind};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +26,8 @@ pub struct SaveHostRequest {
     pub show_status_in_dashboard: Option<bool>,
     pub working_directory: Option<String>,
     pub default_sftp_path: Option<String>,
+    #[serde(default)]
+    pub sync_server: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -124,14 +54,6 @@ pub struct TestHostConnectionRequest {
 pub struct TestHostConnectionResult {
     pub ok: bool,
     pub message: String,
-}
-
-fn migrate_hosts_vault(value: &mut serde_json::Value) {
-    if value.get("version").is_none() {
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("version".to_string(), serde_json::Value::from(1u32));
-        }
-    }
 }
 
 pub fn list_hosts(app: &AppHandle) -> Result<HostsVault, String> {
@@ -186,7 +108,37 @@ pub fn decrypt_host_password(host: &Host) -> Option<String> {
     }
     let guard = crate::vault::current_key();
     let key = guard.as_ref()?;
-    crate::crypto::decrypt_field(key, stored).ok()
+    decrypt_token(key, stored)
+}
+
+/// Decrypts a "v1:" token, unwrapping values that were double-encrypted by the
+/// former edit round-trip bug (the token shown in the edit form got re-encrypted
+/// on save). A decrypted value that starts with "v1:" but fails to decrypt again
+/// is treated as the actual password.
+fn decrypt_token(key: &termifai_core::crypto::VaultKey, token: &str) -> Option<String> {
+    let mut value = termifai_core::crypto::decrypt_field(key, token).ok()?;
+    for _ in 0..4 {
+        if !value.starts_with("v1:") {
+            break;
+        }
+        match termifai_core::crypto::decrypt_field(key, &value) {
+            Ok(inner) => value = inner,
+            Err(_) => break,
+        }
+    }
+    Some(value)
+}
+
+/// Plaintext password of a stored host, for display in the edit form.
+/// `None` when the host has no password or the vault is locked.
+pub fn get_host_password(app: &AppHandle, id: &str) -> Result<Option<String>, String> {
+    let vault = list_hosts(app)?;
+    let host = vault
+        .hosts
+        .iter()
+        .find(|h| h.id == id)
+        .ok_or_else(|| format!("Host '{}' not found", id))?;
+    Ok(decrypt_host_password(host))
 }
 
 /// Re-encrypt any legacy plaintext password fields using the unlocked vault key.
@@ -207,7 +159,7 @@ pub fn migrate_plaintext_passwords(app: &AppHandle) -> Result<usize, String> {
             for host in vault.hosts.iter_mut() {
                 if let Some(pw) = host.password.as_ref() {
                     if !pw.is_empty() && !pw.starts_with("v1:") {
-                        if let Ok(token) = crate::crypto::encrypt_field(key, pw) {
+                        if let Ok(token) = termifai_core::crypto::encrypt_field(key, pw) {
                             host.password = Some(token);
                             migrated += 1;
                         }
@@ -242,6 +194,17 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
                 return;
             }
 
+            // Enforce at-most-one sync_server rule: clear the flag on all other hosts
+            // before setting it on this one.
+            let is_sync_server = request.sync_server == Some(true);
+            if is_sync_server {
+                for other in vault.hosts.iter_mut() {
+                    if other.id != id {
+                        other.sync_server = None;
+                    }
+                }
+            }
+
             let existing_last_used = vault
                 .hosts
                 .iter()
@@ -273,6 +236,7 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
                     .default_sftp_path
                     .filter(|value| !value.trim().is_empty()),
                 updated_at: Some(now),
+                sync_server: if is_sync_server { Some(true) } else { None },
             };
 
             upsert_by_id(&mut vault.hosts, host.clone(), |item| &item.id);
@@ -288,6 +252,20 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
 }
 
 pub fn remove_hosts(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
+    // Guard: block removal of a host that is currently configured as the sync server.
+    let sync_state = crate::sync::load_state(app)?;
+    if let Some(termifai_core::model::sync_state::SyncBackendConfig::Sftp { host_id, .. }) =
+        &sync_state.backend
+    {
+        if ids.contains(host_id) {
+            return Err(
+                "Cannot delete this host — it is configured as the sync server. \
+                 Disconnect sync first."
+                    .to_string(),
+            );
+        }
+    }
+
     let state = app.state::<AppState>();
     state
         .hosts_store
@@ -295,6 +273,7 @@ pub fn remove_hosts(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
             vault.hosts.retain(|host| !ids.contains(&host.id));
         })
         .map_err(|e| e.to_string())?;
+    crate::tombstones::record(app, crate::tombstones::EntityKind::Host, &ids)?;
     Ok(())
 }
 
@@ -326,6 +305,7 @@ pub fn save_host_group(
         id: id.clone(),
         name: name.to_string(),
         parent_id: parent_id.clone(),
+        updated_at: Some(now_iso()),
     };
 
     let state = app.state::<AppState>();
@@ -351,10 +331,27 @@ pub fn save_host_group(
 
 pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let mut removed_group_ids: Vec<String> = Vec::new();
+    let mut removed_host_ids: Vec<String> = Vec::new();
     state
         .hosts_store
         .update_with_migration(migrate_hosts_vault, |vault| {
             let descendants = descendant_group_ids(&vault.groups, &id);
+            removed_group_ids = std::iter::once(id.clone())
+                .chain(descendants.iter().cloned())
+                .collect();
+            removed_host_ids = vault
+                .hosts
+                .iter()
+                .filter(|host| {
+                    host.group_id
+                        .as_ref()
+                        .map(|group_id| group_id == &id || descendants.contains(group_id))
+                        .unwrap_or(false)
+                })
+                .map(|host| host.id.clone())
+                .collect();
+
             vault
                 .groups
                 .retain(|group| group.id != id && !descendants.contains(&group.id));
@@ -366,6 +363,12 @@ pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
             });
         })
         .map_err(|e| e.to_string())?;
+    crate::tombstones::record(
+        app,
+        crate::tombstones::EntityKind::Group,
+        &removed_group_ids,
+    )?;
+    crate::tombstones::record(app, crate::tombstones::EntityKind::Host, &removed_host_ids)?;
     Ok(())
 }
 
@@ -418,7 +421,22 @@ pub fn test_host_connection(
     command.arg(target);
     command.arg("echo");
     command.arg("termifai-ssh-ok");
-    run_ssh_test(command, request.password.unwrap_or_default(), timeout_secs)
+
+    // The edit form sends the stored "v1:" token when the user didn't retype the
+    // password — decrypt it before handing it to ssh.
+    let password = match request.password.filter(|p| !p.is_empty()) {
+        Some(pw) if pw.starts_with("v1:") => {
+            let guard = crate::vault::current_key();
+            let key = guard
+                .as_ref()
+                .ok_or("Vault is locked — unlock it to use the saved password")?;
+            decrypt_token(key, &pw)
+                .ok_or("Failed to decrypt the saved password — re-enter it and try again")?
+        }
+        Some(pw) => pw,
+        None => String::new(),
+    };
+    run_ssh_test(command, password, timeout_secs)
 }
 
 fn run_ssh_test(
@@ -600,14 +618,20 @@ fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
 
 /// Encrypt a to-be-saved password with the unlocked vault key. If the value is
 /// empty it becomes None. If the vault is locked, we return an error.
+/// A value that is already a "v1:" token is stored as-is: the edit form round-trips
+/// the stored token when the user leaves the password unchanged, and re-encrypting
+/// it would double-encrypt the password.
 fn encrypt_password_for_save(password: Option<String>) -> Result<Option<String>, String> {
     let pw = match password.filter(|value| !value.is_empty()) {
         Some(pw) => pw,
         None => return Ok(None),
     };
+    if pw.starts_with("v1:") {
+        return Ok(Some(pw));
+    }
     let guard = crate::vault::current_key();
     match guard.as_ref() {
-        Some(key) => crate::crypto::encrypt_field(key, &pw)
+        Some(key) => termifai_core::crypto::encrypt_field(key, &pw)
             .map(Some)
             .map_err(|e| format!("Encryption failed: {:?}", e)),
         None => Err("Vault is locked — unlock it to save a password".to_string()),
@@ -623,27 +647,6 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn crypto_meta_round_trips_through_json() {
-        let meta = CryptoMeta {
-            kdf: "argon2id".to_string(),
-            salt: "c2FsdA".to_string(),
-            wrapped_key: "v1:n:c".to_string(),
-            verifier: "v1:n:c".to_string(),
-        };
-        let json = serde_json::to_string(&meta).unwrap();
-        assert!(json.contains("\"wrappedKey\""));
-        let back: CryptoMeta = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.kdf, "argon2id");
-    }
-
-    #[test]
-    fn empty_vault_serializes_without_crypto_field() {
-        let vault = HostsVault::default();
-        let json = serde_json::to_string(&vault).unwrap();
-        assert!(!json.contains("crypto"), "crypto must be omitted when None");
-    }
 
     #[test]
     fn decrypt_host_password_passes_through_legacy_plaintext() {
@@ -664,6 +667,7 @@ mod tests {
             working_directory: None,
             default_sftp_path: None,
             updated_at: None,
+            sync_server: None,
         };
         assert_eq!(decrypt_host_password(&host), Some("plainpw".to_string()));
     }
@@ -687,6 +691,7 @@ mod tests {
             working_directory: None,
             default_sftp_path: None,
             updated_at: None,
+            sync_server: None,
         };
         assert_eq!(decrypt_host_password(&host), None);
     }

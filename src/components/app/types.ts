@@ -16,6 +16,8 @@ export interface Host {
   showStatusInDashboard?: boolean;
   workingDirectory?: string;
   defaultSftpPath?: string;
+  /** Marks this host as the SFTP sync target (Settings → Sync → My Server). At most one host can have this set. */
+  syncServer?: boolean;
 }
 
 export interface HostGroup {
