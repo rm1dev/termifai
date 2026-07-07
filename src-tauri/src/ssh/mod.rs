@@ -11,7 +11,7 @@
 
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
 use base64::Engine;
-use ssh2::{CheckResult, HashType, KnownHostFileKind, Session};
+use ssh2::{CheckResult, HashType, KnownHostFileKind, MethodType, Session};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -81,6 +81,16 @@ pub fn connect(cfg: &SshConfig, on_stage: impl Fn(&str, &str)) -> Result<Session
     let mut session = Session::new().map_err(|e| SshError::Handshake(e.to_string()))?;
     session.set_tcp_stream(tcp);
 
+    // Nudge libssh2 to negotiate whichever host key type is already recorded
+    // for this host in known_hosts (mirroring what the system `ssh` binary
+    // does). Without this, libssh2's own default algorithm order can pick a
+    // *different* key type than what's on record — e.g. RSA when only an
+    // ED25519 entry exists — and verify_host_key below would then report a
+    // spurious mismatch for a host that hasn't actually changed.
+    if let Some(prefs) = preferred_host_key_algorithms(cfg.hostname, cfg.port) {
+        let _ = session.method_pref(MethodType::HostKey, &prefs);
+    }
+
     on_stage("handshaking", "Starting SSH handshake...");
     session
         .handshake()
@@ -131,6 +141,81 @@ pub fn exec(session: &Session, cmd: &str) -> Result<String, String> {
         .map_err(|e| format!("Read channel: {e}"))?;
     channel.wait_close().ok();
     Ok(output)
+}
+
+/// Reads known_hosts (plain text, OpenSSH format) and builds a libssh2
+/// host-key algorithm preference string that puts whatever type(s) are
+/// already on record for this host first, followed by the standard set as
+/// a fallback so a legitimate key rotation to an unrecorded type still works.
+fn preferred_host_key_algorithms(hostname: &str, port: u16) -> Option<String> {
+    let path = known_hosts_path()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    algorithms_pref_from_known_hosts_text(&contents, hostname, port)
+}
+
+/// Pure parsing logic behind [`preferred_host_key_algorithms`], split out so
+/// it's testable without touching the real `known_hosts` file or `HOME` env var.
+fn algorithms_pref_from_known_hosts_text(
+    contents: &str,
+    hostname: &str,
+    port: u16,
+) -> Option<String> {
+    let entry_host = host_key_entry_name(hostname, port);
+
+    let mut recorded: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let Some(host_field) = fields.next() else {
+            continue;
+        };
+        let matches_host = host_field
+            .split(',')
+            .any(|h| h == hostname || h == entry_host);
+        if !matches_host {
+            continue;
+        }
+        if let Some(alg) = fields.next() {
+            if !recorded.iter().any(|r| r == alg) {
+                recorded.push(alg.to_string());
+            }
+        }
+    }
+
+    if recorded.is_empty() {
+        return None;
+    }
+
+    // "ssh-rsa" in known_hosts describes the key *blob* format, not the
+    // signature algorithm — libssh2/OpenSSH may negotiate the modern SHA-2
+    // signature variants over the same recorded RSA key, so offer those first.
+    let mut prefs: Vec<String> = Vec::new();
+    for alg in &recorded {
+        if alg == "ssh-rsa" {
+            prefs.push("rsa-sha2-512".to_string());
+            prefs.push("rsa-sha2-256".to_string());
+        }
+        prefs.push(alg.clone());
+    }
+
+    for fallback in [
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "rsa-sha2-512",
+        "rsa-sha2-256",
+        "ssh-rsa",
+    ] {
+        if !prefs.iter().any(|p| p == fallback) {
+            prefs.push(fallback.to_string());
+        }
+    }
+
+    Some(prefs.join(","))
 }
 
 fn known_hosts_path() -> Option<PathBuf> {
@@ -206,6 +291,55 @@ mod tests {
     #[test]
     fn host_key_entry_name_bare_for_default_port() {
         assert_eq!(host_key_entry_name("example.com", 22), "example.com");
+    }
+
+    #[test]
+    fn algorithms_pref_prioritizes_recorded_type() {
+        // Reproduces the reported bug: a host recorded only under ED25519 (e.g.
+        // added by the system `ssh` binary) must make libssh2 prefer ED25519
+        // too, or it may negotiate RSA by default and falsely report a mismatch.
+        let known_hosts = "185.252.30.206 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...\n";
+        let prefs = algorithms_pref_from_known_hosts_text(known_hosts, "185.252.30.206", 22)
+            .expect("should find a recorded algorithm");
+        assert!(
+            prefs.starts_with("ssh-ed25519"),
+            "recorded type must be first, got: {prefs}"
+        );
+        // Fallback set must still be present so a real key-type rotation works.
+        assert!(prefs.contains("rsa-sha2-512"));
+        assert!(prefs.contains("ssh-rsa"));
+    }
+
+    #[test]
+    fn algorithms_pref_expands_ssh_rsa_to_sha2_variants_first() {
+        let known_hosts = "example.com ssh-rsa AAAAB3NzaC1yc2EAAAA...\n";
+        let prefs = algorithms_pref_from_known_hosts_text(known_hosts, "example.com", 22).unwrap();
+        let rsa_sha2_512_pos = prefs.find("rsa-sha2-512").unwrap();
+        let ssh_rsa_pos = prefs.find("ssh-rsa").unwrap();
+        assert!(
+            rsa_sha2_512_pos < ssh_rsa_pos,
+            "modern rsa-sha2 variants must be offered before legacy ssh-rsa: {prefs}"
+        );
+    }
+
+    #[test]
+    fn algorithms_pref_matches_bracketed_nonstandard_port_entries() {
+        let known_hosts = "[git.example.com]:2222 ssh-ed25519 AAAAC3...\n";
+        let prefs =
+            algorithms_pref_from_known_hosts_text(known_hosts, "git.example.com", 2222).unwrap();
+        assert!(prefs.starts_with("ssh-ed25519"));
+    }
+
+    #[test]
+    fn algorithms_pref_none_when_host_not_recorded() {
+        let known_hosts = "other-host.com ssh-ed25519 AAAAC3...\n";
+        assert!(algorithms_pref_from_known_hosts_text(known_hosts, "example.com", 22).is_none());
+    }
+
+    #[test]
+    fn algorithms_pref_ignores_comments_and_blank_lines() {
+        let known_hosts = "# comment\n\nexample.com ssh-ed25519 AAAAC3...\n";
+        assert!(algorithms_pref_from_known_hosts_text(known_hosts, "example.com", 22).is_some());
     }
 
     #[test]

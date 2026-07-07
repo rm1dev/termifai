@@ -362,10 +362,16 @@ fn run_snippet_script(
     // then execute it. The heredoc content is NOT echoed by the shell (only the cat command is).
     // A wrapper script erases the visible command line with ANSI escapes.
     // The full sequence sent to PTY:
-    //   printf '\033[1A\033[2K\r' && f=$(mktemp /tmp/termifai_XXXXXXXX.sh) && cat > "$f" << 'TERMIFAI_EOF_random'
+    //   printf '\033[1A\033[2K\r' && f=$(mktemp /tmp/termifai_XXXXXXXX) && cat > "$f" << 'TERMIFAI_EOF_random'
     //   [script content - not echoed by shell]
     //   TERMIFAI_EOF_random
     //   chmod +x "$f" && bash "$f"; rm -f "$f"
+    //
+    // The X's must be the trailing characters of the template with nothing after them —
+    // BSD/macOS mktemp and busybox mktemp (used on Alpine, a supported host OS) only
+    // substitute a trailing run of X's and either leave a literal "XXXXXXXX" in the
+    // filename (macOS) or fail outright (busybox) if a suffix like ".sh" follows it.
+    // No extension is needed since the file is executed explicitly via `bash "$f"`.
 
     let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
     let rand_id = &rand_id[..8];
@@ -377,7 +383,7 @@ fn run_snippet_script(
     // Last line: EOF marker
     // Then: chmod + execute + cleanup
     let payload = format!(
-        " printf '\\033[1A\\033[2K\\r' && f=$(mktemp /tmp/termifai_XXXXXXXX.sh) && cat > \"$f\" << '{eof}'\r{script}\r{eof}\rchmod +x \"$f\" && bash \"$f\"; rm -f \"$f\"\r",
+        " printf '\\033[1A\\033[2K\\r' && f=$(mktemp /tmp/termifai_XXXXXXXX) && cat > \"$f\" << '{eof}'\r{script}\r{eof}\rchmod +x \"$f\" && bash \"$f\"; rm -f \"$f\"\r",
         eof = eof_marker,
         script = script.replace('\r', ""),
     );
@@ -1346,8 +1352,13 @@ pub fn run() {
                 )?;
             }
             // Try to unlock the vault silently using the keychain-cached master password,
-            // so a returning user on this device isn't prompted again.
-            let _ = vault::op_try_cached_unlock(app.handle());
+            // so a returning user on this device isn't prompted again. This bypasses the
+            // vault_unlock command, so — same as that command — it must also trigger the
+            // legacy-plaintext-password migration; otherwise a user whose vault always
+            // auto-unlocks (the default OnRestart policy) would never get migrated.
+            if let Ok(true) = vault::op_try_cached_unlock(app.handle()) {
+                let _ = hosts::migrate_plaintext_passwords(app.handle());
+            }
 
             // Start background screen-lock monitor (macOS only).
             #[cfg(target_os = "macos")]
