@@ -114,25 +114,35 @@ pub fn read_crypto_meta(app: &AppHandle) -> Result<Option<CryptoMeta>, String> {
 
 pub fn write_crypto_meta(app: &AppHandle, meta: CryptoMeta) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.vault_crypto_store.update(|vault| {
-        vault.crypto = Some(meta);
-    }).map_err(|e| e.to_string())?;
+    state
+        .vault_crypto_store
+        .update(|vault| {
+            vault.crypto = Some(meta);
+        })
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
-pub fn migrate_crypto_meta_from_hosts(app: &AppHandle, crypto_meta: CryptoMeta) -> Result<(), String> {
+pub fn migrate_crypto_meta_from_hosts(
+    app: &AppHandle,
+    crypto_meta: CryptoMeta,
+) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.vault_crypto_store.update(|vault| {
-        if vault.crypto.is_none() {
-            vault.crypto = Some(crypto_meta);
-        }
-    }).map_err(|e| e.to_string())?;
+    state
+        .vault_crypto_store
+        .update(|vault| {
+            if vault.crypto.is_none() {
+                vault.crypto = Some(crypto_meta);
+            }
+        })
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
 pub fn get_lock_policy(app: &AppHandle) -> LockPolicy {
     let state = app.state::<AppState>();
-    state.vault_settings_store
+    state
+        .vault_settings_store
         .load_with_migration(migrate_vault_settings)
         .map(|s| s.lock_policy)
         .unwrap_or_default()
@@ -140,7 +150,8 @@ pub fn get_lock_policy(app: &AppHandle) -> LockPolicy {
 
 pub fn set_lock_policy(app: &AppHandle, policy: LockPolicy) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.vault_settings_store
+    state
+        .vault_settings_store
         .update_with_migration(migrate_vault_settings, |s| {
             s.lock_policy = policy;
         })

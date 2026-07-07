@@ -88,7 +88,8 @@ fn migrate_snippets_vault(value: &mut serde_json::Value) {
 
 pub fn list_snippets(app: &AppHandle) -> Result<Vec<Snippet>, String> {
     let state = app.state::<AppState>();
-    let vault = state.snippets_store
+    let vault = state
+        .snippets_store
         .load_with_migration(migrate_snippets_vault)
         .map_err(|e| e.to_string())?;
     Ok(vault.snippets)
@@ -105,36 +106,42 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
     let state = app.state::<AppState>();
     let mut saved_snippet = None;
 
-    state.snippets_store.update_with_migration(migrate_snippets_vault, |vault| {
-        let existing_created_at = vault
-            .snippets
-            .iter()
-            .find(|s| s.id == id)
-            .and_then(|s| s.created_at.clone());
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            let existing_created_at = vault
+                .snippets
+                .iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.created_at.clone());
 
-        let snippet = Snippet {
-            id: id.clone(),
-            kind: request.kind,
-            name: request.name.trim().to_string(),
-            body: request.body.filter(|v| !v.trim().is_empty()),
-            command: request.command.filter(|v| !v.trim().is_empty()),
-            script: request.script.filter(|v| !v.trim().is_empty()),
-            variables: request.variables,
-            created_at: existing_created_at.or_else(|| Some(now_iso())),
-        };
+            let snippet = Snippet {
+                id: id.clone(),
+                kind: request.kind,
+                name: request.name.trim().to_string(),
+                body: request.body.filter(|v| !v.trim().is_empty()),
+                command: request.command.filter(|v| !v.trim().is_empty()),
+                script: request.script.filter(|v| !v.trim().is_empty()),
+                variables: request.variables,
+                created_at: existing_created_at.or_else(|| Some(now_iso())),
+            };
 
-        upsert_by_id(&mut vault.snippets, snippet.clone());
-        saved_snippet = Some(snippet);
-    }).map_err(|e| e.to_string())?;
+            upsert_by_id(&mut vault.snippets, snippet.clone());
+            saved_snippet = Some(snippet);
+        })
+        .map_err(|e| e.to_string())?;
 
     saved_snippet.ok_or_else(|| "Failed to save snippet".to_string())
 }
 
 pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
     let state = app.state::<AppState>();
-    state.snippets_store.update_with_migration(migrate_snippets_vault, |vault| {
-        vault.snippets.retain(|s| !ids.contains(&s.id));
-    }).map_err(|e| e.to_string())?;
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            vault.snippets.retain(|s| !ids.contains(&s.id));
+        })
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -195,8 +202,6 @@ fn validate_snippet(request: &SaveSnippetRequest) -> Result<(), String> {
 
     Ok(())
 }
-
-
 
 fn upsert_by_id(items: &mut Vec<Snippet>, item: Snippet) {
     if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
