@@ -1445,9 +1445,6 @@ pub fn run() {
 
             let app_handle = app.handle().clone();
             if let Some(main_win) = app.get_webview_window("main") {
-                #[cfg(target_os = "macos")]
-                let _ = main_win.set_decorations(true);
-
                 let _ = main_win.set_effects(
                     tauri::window::EffectsBuilder::new()
                         .effect(tauri::window::Effect::HudWindow)
