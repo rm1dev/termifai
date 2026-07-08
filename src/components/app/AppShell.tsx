@@ -386,6 +386,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
         platform={platform}
         variant={variant}
         onRequestClose={onRequestClose}
+        transparentBg={variant === "quick-terminal" || (variant === "main" && mainWindowOpacity < 1.0)}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -467,6 +468,7 @@ function TitleBar({
   platform,
   variant,
   onRequestClose,
+  transparentBg,
 }: {
   tabs: AppTab[];
   activeTab: string;
@@ -478,6 +480,7 @@ function TitleBar({
   platform: string;
   variant: "main" | "quick-terminal";
   onRequestClose?: () => void;
+  transparentBg?: boolean;
 }) {
   const isQuickTerminal = variant === "quick-terminal";
   const dragRegion = isQuickTerminal ? {} : { "data-tauri-drag-region": true };
@@ -508,7 +511,12 @@ function TitleBar({
   const closableTabs = tabs.filter((t) => t.closable);
 
   return (
-    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none" {...dragRegion}>
+    <div
+      className={`flex h-11 shrink-0 items-center border-b border-border select-none ${
+        transparentBg ? "bg-transparent" : "bg-[var(--color-surface)]"
+      }`}
+      {...dragRegion}
+    >
       {/* Space for native macOS traffic lights — collapses in fullscreen, where they hide */}
       {!isQuickTerminal && platform === "macos" && (
         <div
