@@ -23,10 +23,12 @@ serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 oauth2 = "4"
 log = "0.4"
-tauri = { version = "2", features = ["macos-private-api"] }
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-log = "2"
 tauri-plugin-window-state = "2"
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
 portable-pty = "0.8"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }
@@ -50,6 +52,7 @@ keyring = { version = "3", features = ["windows-native"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
 
 [patch.crates-io]
 portable-pty = { path = "../vendor/portable-pty" }
