@@ -19,6 +19,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Switch } from "@/components/ui/switch";
 import {
   clampTerminalFontSize,
   clampTerminalLineHeight,
@@ -65,12 +66,28 @@ import {
   type ShortcutActionId,
   type ShortcutMap,
 } from "@/lib/shortcuts";
+import {
+  bindingToAccelerator,
+  loadGlobalHotkeySettings,
+  saveGlobalHotkeySettings,
+  type GlobalHotkeySettings,
+} from "@/lib/global-hotkey";
+import {
+  disableGlobalHotkey,
+  enableGlobalHotkey,
+  type HotkeyStatus,
+} from "@/lib/api/global-hotkey";
 
 export function SettingsWindow() {
   const [terminalAppearance, setTerminalAppearance] = useState(loadTerminalAppearance);
   const [selectedThemeId, setSelectedThemeId] = useState(loadAppTheme().id);
   const [shortcuts, setShortcuts] = useState(loadShortcuts);
   const [editingShortcutId, setEditingShortcutId] = useState<ShortcutActionId | null>(null);
+  const [globalHotkey, setGlobalHotkey] = useState<GlobalHotkeySettings>(loadGlobalHotkeySettings);
+  const [isEditingGlobalHotkey, setIsEditingGlobalHotkey] = useState(false);
+  const [globalHotkeyBusy, setGlobalHotkeyBusy] = useState(false);
+  const [globalHotkeyError, setGlobalHotkeyError] = useState<string | null>(null);
+  const [globalHotkeyStatus, setGlobalHotkeyStatus] = useState<HotkeyStatus | null>(null);
   const [vaultSt, setVaultSt] = useState<VaultStatus | null>(null);
   const [lockPolicy, setLockPolicyState] = useState<LockPolicy>("on_restart");
   const [oldPw, setOldPw] = useState("");
@@ -348,6 +365,35 @@ export function SettingsWindow() {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [editingShortcutId, shortcuts]);
   useEffect(() => {
+    if (!isEditingGlobalHotkey) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (
+        event.key === "Escape" &&
+        !event.metaKey &&
+        !event.ctrlKey &&
+        !event.altKey &&
+        !event.shiftKey
+      ) {
+        setIsEditingGlobalHotkey(false);
+        return;
+      }
+
+      const binding = eventToShortcutBinding(event);
+      if (!binding) return;
+      if (!bindingToAccelerator(binding)) return; // require at least one modifier
+
+      setIsEditingGlobalHotkey(false);
+      void applyGlobalHotkey({ ...globalHotkey, binding });
+    };
+
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [isEditingGlobalHotkey, globalHotkey]);
+  useEffect(() => {
     const onShortcutChanged = (event: Event) => {
       setShortcuts((event as CustomEvent<ShortcutMap>).detail);
     };
@@ -390,6 +436,30 @@ export function SettingsWindow() {
     const nextShortcuts = resetShortcut(shortcuts, actionId);
     setShortcuts(nextShortcuts);
     saveShortcuts(nextShortcuts);
+  };
+
+  const applyGlobalHotkey = async (next: GlobalHotkeySettings) => {
+    setGlobalHotkeyError(null);
+    setGlobalHotkeyBusy(true);
+    try {
+      if (next.enabled) {
+        const accelerator = bindingToAccelerator(next.binding);
+        if (!accelerator) {
+          throw new Error("Choose a combination that includes a modifier key.");
+        }
+        const status = await enableGlobalHotkey(accelerator);
+        setGlobalHotkeyStatus(status);
+      } else {
+        await disableGlobalHotkey();
+        setGlobalHotkeyStatus(null);
+      }
+      setGlobalHotkey(next);
+      saveGlobalHotkeySettings(next);
+    } catch (error) {
+      setGlobalHotkeyError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setGlobalHotkeyBusy(false);
+    }
   };
 
   const isMac = platform === "macos";
@@ -641,6 +711,77 @@ export function SettingsWindow() {
                     </div>
                   ))}
                 </div>
+              </CardContent>
+            </Card>
+
+            <Card className="mt-4">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Keyboard className="h-4 w-4 text-[var(--color-brand-green)]" />
+                  Global Hotkey
+                </CardTitle>
+                <CardDescription>
+                  Show or hide Termifai from anywhere, even when another app has focus. Off by
+                  default.
+                  {!isMac && (
+                    <>
+                      {" "}On Linux with Wayland, enabling this will show a one-time system
+                      confirmation dialog asking you to approve the shortcut.
+                    </>
+                  )}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">Enable global hotkey</div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Toggle the Termifai window with a system-wide shortcut.
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-2">
+                    <div className="flex min-w-28 justify-end gap-1.5">
+                      {isEditingGlobalHotkey ? (
+                        <span className="rounded-md border border-primary bg-primary/10 px-2 py-1 font-mono text-xs text-primary">
+                          Press keys...
+                        </span>
+                      ) : (
+                        formatShortcut(globalHotkey.binding).map((key, i) => (
+                          <kbd
+                            key={`global-hotkey-${i}`}
+                            className="rounded-md border border-border bg-[var(--color-surface-2)] px-2 py-1 font-mono text-xs text-muted-foreground shadow-sm"
+                          >
+                            {key}
+                          </kbd>
+                        ))
+                      )}
+                    </div>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      disabled={globalHotkeyBusy}
+                      onClick={() => setIsEditingGlobalHotkey(true)}
+                    >
+                      Change
+                    </Button>
+                    <Switch
+                      checked={globalHotkey.enabled}
+                      disabled={globalHotkeyBusy}
+                      onCheckedChange={(checked) =>
+                        void applyGlobalHotkey({ ...globalHotkey, enabled: checked })
+                      }
+                    />
+                  </div>
+                </div>
+                {globalHotkeyStatus?.backend === "portal" && (
+                  <p className="text-xs text-muted-foreground">
+                    Bound via the system's global shortcut portal as{" "}
+                    <span className="font-mono">{globalHotkeyStatus.accelerator}</span>.
+                  </p>
+                )}
+                {globalHotkeyError && (
+                  <p className="text-xs text-destructive">{globalHotkeyError}</p>
+                )}
               </CardContent>
             </Card>
           </TabsContent>
