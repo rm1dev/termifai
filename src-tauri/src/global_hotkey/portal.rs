@@ -16,7 +16,7 @@ use tauri::AppHandle;
 /// `Session` go out of scope releases the compositor-side grab.
 pub struct PortalSession {
     _session: ashpd::desktop::Session<'static, GlobalShortcuts<'static>>,
-    listener: tokio::task::JoinHandle<()>,
+    listener: tauri::async_runtime::JoinHandle<()>,
 }
 
 pub fn close(session: PortalSession) {
@@ -46,14 +46,16 @@ pub async fn bind(
     let shortcut =
         NewShortcut::new(action.as_str(), description).preferred_trigger(trigger.as_str());
 
-    let request = proxy.bind_shortcuts(&session, &[shortcut], None).await?;
+    let request = proxy
+        .bind_shortcuts(&session, &[shortcut], &ashpd::WindowIdentifier::default())
+        .await?;
     let bound = request.response()?;
 
     let effective_accelerator = bound
         .shortcuts()
         .iter()
         .find(|s| s.id() == action)
-        .and_then(|s| s.trigger_description().map(|d| d.to_string()))
+        .map(|s| s.trigger_description().to_string())
         .unwrap_or(accelerator);
 
     // `receive_activated` yields signals for every session this app owns, so
