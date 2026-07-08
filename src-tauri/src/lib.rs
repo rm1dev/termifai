@@ -1,4 +1,5 @@
 pub mod dashboard;
+mod global_hotkey;
 mod hosts;
 mod port_forwarding;
 mod pty_manager;
@@ -45,8 +46,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_window_state::StateFlags;
+use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
 
 static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1196,6 +1200,14 @@ fn start_screen_lock_monitor(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // A second launch (e.g. clicking the app icon again) just surfaces
+            // the existing instance instead of starting a competing process.
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
@@ -1203,6 +1215,11 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(global_hotkey::plugin_handler)
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             create_session,
             write_to_session,
@@ -1276,9 +1293,15 @@ pub fn run() {
             dashboard_poll,
             dashboard_disconnect,
             quit_app,
+            enable_global_hotkey,
+            disable_global_hotkey,
+            get_global_hotkey_status,
         ])
         .on_window_event(|window, event| {
-            #[cfg(target_os = "macos")]
+            // Closing the main/extra windows hides them rather than exiting the
+            // process on every platform: the tray icon + optional global hotkey
+            // only make sense if the app keeps running in the background. The
+            // tray's "Quit" item (or the menu/shortcut equivalent) is the real exit.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let label = window.label();
                 if label == "main" || label.starts_with("window-") {
@@ -1286,8 +1309,6 @@ pub fn run() {
                     api.prevent_close();
                 }
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (window, event);
         })
         .setup(|app| {
             let app_data_dir = app
@@ -1320,6 +1341,7 @@ pub fn run() {
                 tombstones_store: store::JsonStore::new(vault_dir.join("tombstones.json")),
                 sync_state_store: store::JsonStore::new(vault_dir.join("sync_state.json")),
             });
+            app.manage(global_hotkey::HotkeyState::default());
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
             // Also set UTF-8 (codepage 65001) so ConPTY correctly interprets multi-byte
@@ -1370,18 +1392,12 @@ pub fn run() {
             if let Some(main_win) = app.get_webview_window("main") {
                 main_win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { .. } = event {
+                        // Closing "main" now only hides it on every platform (the app
+                        // keeps running via the tray), so the settings window — created
+                        // once at startup — must survive too, or it becomes unopenable
+                        // for the rest of the session.
                         if let Some(settings_win) = app_handle.get_webview_window("settings") {
-                            // On macOS closing "main" only hides it (the app stays in
-                            // the Dock), so the settings window — created once at
-                            // startup — must survive to be reopened later; destroying
-                            // it would make Settings unopenable for the rest of the
-                            // session. Elsewhere closing "main" exits the app, and the
-                            // hidden settings window must be destroyed or it keeps the
-                            // app alive.
-                            #[cfg(target_os = "macos")]
                             let _ = settings_win.hide();
-                            #[cfg(not(target_os = "macos"))]
-                            let _ = settings_win.close();
                         }
                     }
                 });
@@ -1471,6 +1487,31 @@ pub fn run() {
             // Start background screen-lock monitor (macOS only).
             #[cfg(target_os = "macos")]
             start_screen_lock_monitor(app.handle().clone());
+
+            // Tray icon so the app can keep running in the background (required
+            // for the optional global hotkey to mean anything) with an explicit
+            // way to show the window or quit.
+            let show_item = MenuItem::with_id(app, "tray-show", "Show Termifai", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            TrayIconBuilder::new()
+                .icon(app.default_window_icon().cloned().ok_or("Missing default window icon")?)
+                .menu(&tray_menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "tray-show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "tray-quit" => app.exit(0),
+                    _ => {}
+                })
+                .build(app)?;
+
+            // Restore a previously-enabled global hotkey, if any.
+            global_hotkey::restore_on_startup(&app.handle().clone());
 
             Ok(())
         })
