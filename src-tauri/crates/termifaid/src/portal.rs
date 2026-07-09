@@ -11,12 +11,13 @@ pub fn run() {
     let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
     runtime.block_on(async {
         if let Err(e) = run_inner().await {
-            eprintln!("[termifaid] portal backend error: {e}");
+            crate::log_line(&format!("portal backend error: {e}"));
         }
     });
 }
 
 async fn run_inner() -> Result<(), ashpd::Error> {
+    let _ = ashpd::desktop::register_host_app().await;
     let proxy = GlobalShortcuts::new().await?;
 
     // Activation events for every session we own; the shortcut id is the
@@ -57,7 +58,7 @@ async fn run_inner() -> Result<(), ashpd::Error> {
                 Ok(session) => {
                     bound.insert(action.clone(), (accel.clone(), session));
                 }
-                Err(e) => eprintln!("[termifaid] failed to bind '{action}': {e}"),
+                Err(e) => crate::log_line(&format!("failed to bind '{action}': {e}")),
             }
         }
 
