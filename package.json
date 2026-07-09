@@ -8,9 +8,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:tauri": "tauri build",
+    "build:tauri": "bash scripts/build-termifaid.sh && tauri build",
     "build:linux:docker": "bash scripts/build-linux.sh",
-    "build:windows": "tauri build --target x86_64-pc-windows-gnu --bundles nsis",
+    "build:windows": "bash scripts/build-termifaid.sh x86_64-pc-windows-gnu && tauri build --target x86_64-pc-windows-gnu --bundles nsis",
     "build:windows:docker": "bash scripts/build-windows.sh"
   },
   "dependencies": {

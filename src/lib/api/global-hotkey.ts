@@ -1,6 +1,6 @@
 import { call } from "./transport";
 
-export type HotkeyBackend = "plugin" | "portal";
+export type HotkeyBackend = "service";
 export type HotkeyAction = "main-window" | "quick-terminal";
 
 export interface HotkeyStatus {

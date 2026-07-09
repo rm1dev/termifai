@@ -399,6 +399,21 @@ pub fn toggle_quick_terminal(app: AppHandle) {
     toggle(&app);
 }
 
+/// Set when the app was cold-launched by the hotkey daemon with
+/// `--hotkey=quick-terminal`: the panel can only slide in after its webview
+/// has mounted and subscribed to the show/hide events, so the toggle is
+/// deferred until the frontend reports in.
+#[derive(Default)]
+pub struct PendingToggle(pub std::sync::atomic::AtomicBool);
+
+#[tauri::command]
+pub fn quick_terminal_frontend_ready(app: AppHandle) {
+    let pending = app.state::<PendingToggle>();
+    if pending.0.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        toggle(&app);
+    }
+}
+
 /// Slide-out + hide; called by the panel's close (×) button.
 #[tauri::command]
 pub fn hide_quick_terminal(app: AppHandle) {

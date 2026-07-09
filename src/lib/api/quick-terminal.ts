@@ -41,6 +41,14 @@ export function toggleQuickTerminal(): Promise<void> {
   return call<void>("toggle_quick_terminal");
 }
 
+/**
+ * Tells the backend the panel webview has mounted and subscribed to events —
+ * needed for the cold-launch path where the hotkey daemon starts the app.
+ */
+export function quickTerminalFrontendReady(): Promise<void> {
+  return call<void>("quick_terminal_frontend_ready");
+}
+
 /** Called by the Quick Terminal window after its slide-out animation ends. */
 export function hideQuickTerminal(): Promise<void> {
   return call<void>("hide_quick_terminal");
