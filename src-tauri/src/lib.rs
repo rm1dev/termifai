@@ -1121,6 +1121,77 @@ fn dashboard_disconnect(
     Ok(())
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneralSettings {
+    pub run_in_background: bool,
+}
+
+impl Default for GeneralSettings {
+    fn default() -> Self {
+        Self {
+            run_in_background: true,
+        }
+    }
+}
+
+fn general_settings_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("general_settings.json"))
+}
+
+fn load_general_settings(app: &tauri::AppHandle) -> GeneralSettings {
+    general_settings_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<GeneralSettings>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_general_settings(app: &tauri::AppHandle, settings: &GeneralSettings) {
+    if let Some(path) = general_settings_path(app) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+#[tauri::command]
+fn get_general_settings(app: tauri::AppHandle) -> GeneralSettings {
+    load_general_settings(&app)
+}
+
+#[tauri::command]
+fn set_general_settings(app: tauri::AppHandle, settings: GeneralSettings) {
+    save_general_settings(&app, &settings);
+}
+
+#[tauri::command]
+fn is_autostart_enabled(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    if enabled {
+        app.autolaunch().enable().map_err(|e| e.to_string())
+    } else {
+        app.autolaunch().disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn force_quit_app(app: tauri::AppHandle) {
+    global_hotkey::kill_daemon();
+    app.exit(0);
+}
+
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
@@ -1301,6 +1372,11 @@ pub fn run() {
             dashboard_poll,
             dashboard_disconnect,
             quit_app,
+            get_general_settings,
+            set_general_settings,
+            is_autostart_enabled,
+            set_autostart_enabled,
+            force_quit_app,
             enable_global_hotkey,
             disable_global_hotkey,
             get_global_hotkey_status,
@@ -1324,8 +1400,12 @@ pub fn run() {
                     || label.starts_with("window-")
                     || label == quick_terminal::WINDOW_LABEL
                 {
-                    let _ = window.hide();
-                    api.prevent_close();
+                    let app = window.app_handle();
+                    let settings = load_general_settings(app);
+                    if settings.run_in_background {
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
                 }
             }
         })
@@ -1524,6 +1604,9 @@ pub fn run() {
                 let custom_quit = MenuItemBuilder::with_id("custom-quit", "Quit Termifai")
                     .accelerator("CmdOrCtrl+Q")
                     .build(app)?;
+                let custom_force_quit = MenuItemBuilder::with_id("custom-force-quit", "Force Quit")
+                    .accelerator("CmdOrCtrl+Shift+Q")
+                    .build(app)?;
 
                 let file_menu = SubmenuBuilder::new(app, "File")
                     .item(&new_terminal)
@@ -1534,6 +1617,7 @@ pub fn run() {
                     .item(&PredefinedMenuItem::close_window(app, None)?)
                     .separator()
                     .item(&custom_quit)
+                    .item(&custom_force_quit)
                     .build()?;
 
                 let edit_menu = SubmenuBuilder::new(app, "Edit")
@@ -1579,6 +1663,10 @@ pub fn run() {
                         }
                         global_hotkey::set_dock_visible(&handle, false);
                     }
+                    "custom-force-quit" => {
+                        global_hotkey::kill_daemon();
+                        handle.exit(0);
+                    }
                     _ => {}
                 });
             }
@@ -1613,7 +1701,8 @@ pub fn run() {
             let show_item =
                 MenuItem::with_id(app, "tray-show", "Show Termifai", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let force_quit_item = MenuItem::with_id(app, "tray-force-quit", "Force Quit", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item, &force_quit_item])?;
             TrayIconBuilder::new()
                 .icon(
                     app.default_window_icon()
@@ -1633,6 +1722,11 @@ pub fn run() {
                     "tray-quit" => {
                         SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
                         global_hotkey::clean_quit(app);
+                        app.exit(0);
+                    }
+                    "tray-force-quit" => {
+                        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        global_hotkey::kill_daemon();
                         app.exit(0);
                     }
                     _ => {}
@@ -1674,7 +1768,10 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app_handle, event| match event {
             tauri::RunEvent::ExitRequested { api, .. } => {
-                if !SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+                let run_in_background = load_general_settings(app_handle).run_in_background;
+                if !run_in_background {
+                    global_hotkey::kill_daemon();
+                } else if !SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
                     api.prevent_exit();
                     for window in app_handle.webview_windows().values() {
                         let _ = window.hide();
