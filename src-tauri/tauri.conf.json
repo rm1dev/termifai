@@ -11,24 +11,7 @@
   },
   "app": {
     "macOSPrivateApi": true,
-    "windows": [
-      {
-        "label": "main",
-        "title": "Termifai",
-        "width": 900,
-        "height": 600,
-        "minWidth": 900,
-        "minHeight": 600,
-        "resizable": true,
-        "fullscreen": false,
-        "decorations": true,
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
-        "transparent": false,
-        "backgroundColor": "#1c1d2b",
-        "trafficLightPosition": { "x": 12, "y": 25 }
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

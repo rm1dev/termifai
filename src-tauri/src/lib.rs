@@ -3,6 +3,7 @@ mod global_hotkey;
 mod hosts;
 mod port_forwarding;
 mod pty_manager;
+mod quick_terminal;
 mod sftp;
 mod snippets;
 mod ssh;
@@ -40,17 +41,21 @@ struct SftpTransferDone {
     ok: bool,
     error: Option<String>,
 }
+use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
+use quick_terminal::{
+    get_quick_terminal_info, hide_quick_terminal, resize_quick_terminal, set_quick_terminal_edge,
+    set_quick_terminal_enabled, set_quick_terminal_opacity, toggle_quick_terminal,
+};
 use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::menu::{Menu, MenuItem};
 #[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
-use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_window_state::StateFlags;
-use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
 
 static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1211,7 +1216,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
-                .with_filter(|label| label != "settings")
+                .with_filter(|label| label != "settings" && label != quick_terminal::WINDOW_LABEL)
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
@@ -1296,6 +1301,13 @@ pub fn run() {
             enable_global_hotkey,
             disable_global_hotkey,
             get_global_hotkey_status,
+            toggle_quick_terminal,
+            hide_quick_terminal,
+            resize_quick_terminal,
+            get_quick_terminal_info,
+            set_quick_terminal_edge,
+            set_quick_terminal_enabled,
+            set_quick_terminal_opacity,
         ])
         .on_window_event(|window, event| {
             // Closing the main/extra windows hides them rather than exiting the
@@ -1304,7 +1316,10 @@ pub fn run() {
             // tray's "Quit" item (or the menu/shortcut equivalent) is the real exit.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let label = window.label();
-                if label == "main" || label.starts_with("window-") {
+                if label == "main"
+                    || label.starts_with("window-")
+                    || label == quick_terminal::WINDOW_LABEL
+                {
                     let _ = window.hide();
                     api.prevent_close();
                 }
@@ -1362,12 +1377,32 @@ pub fn run() {
             }
 
             // On Linux and Windows, remove native decorations so the custom frontend titlebar takes over
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            // Build the main window programmatically.
+            // On macOS: with decorations and Overlay title bar style for traffic lights.
+            // On Windows/Linux: without decorations to avoid two-toned title bar.
+            let mut main_builder =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("Termifai")
+                    .inner_size(900.0, 600.0)
+                    .min_inner_size(900.0, 600.0)
+                    .resizable(true)
+                    .transparent(true);
+
+            #[cfg(target_os = "macos")]
             {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_decorations(false);
-                }
+                main_builder = main_builder
+                    .decorations(true)
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .hidden_title(true)
+                    .traffic_light_position(tauri::LogicalPosition::new(12.0, 25.0));
             }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                main_builder = main_builder.decorations(false);
+            }
+
+            let _main_win = main_builder.build()?;
 
             // Create the settings window hidden at startup — creating it dynamically after
             // the event loop starts deadlocks on Windows because WebView2 initialization
@@ -1383,13 +1418,62 @@ pub fn run() {
             .resizable(false)
             .decorations(false)
             .transparent(true)
+            .always_on_top(true)
             .minimizable(false)
             .maximizable(false)
             .visible(false)
             .build()?;
 
+            // Quick Terminal panel — same create-hidden-at-startup pattern as the
+            // settings window (dynamic creation deadlocks WebView2 on Windows).
+            // Not draggable (no drag region in its HTML) and not natively
+            // resizable: sizing happens only via the in-panel drag handle.
+            WebviewWindowBuilder::new(
+                app,
+                quick_terminal::WINDOW_LABEL,
+                WebviewUrl::App("index.html?window=quick-terminal".into()),
+            )
+            .title("Quick Terminal")
+            .decorations(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .minimizable(false)
+            .maximizable(false)
+            // Transparent + shadowless so the native window itself is invisible:
+            // what the user sees sliding in is the panel div inside the webview.
+            .transparent(true)
+            .shadow(false)
+            // Native backdrop blur for the glass look: the first effect the
+            // platform supports is applied (HudWindow → macOS vibrancy,
+            // Acrylic/Blur → Windows; no-op on Linux). Only visible where the
+            // frontend makes its backgrounds translucent (panel transparency
+            // setting below 100%).
+            .effects(
+                tauri::window::EffectsBuilder::new()
+                    .effect(tauri::window::Effect::HudWindow)
+                    .effect(tauri::window::Effect::Acrylic)
+                    .effect(tauri::window::Effect::Blur)
+                    // Pin the effect to its active look — by default macOS
+                    // vibrancy follows window focus and dims when the panel
+                    // loses key status, which reads as the panel "darkening".
+                    .state(tauri::window::EffectState::Active)
+                    .build(),
+            )
+            .visible(false)
+            .build()?;
+
             let app_handle = app.handle().clone();
             if let Some(main_win) = app.get_webview_window("main") {
+                let _ = main_win.set_effects(
+                    tauri::window::EffectsBuilder::new()
+                        .effect(tauri::window::Effect::HudWindow)
+                        .effect(tauri::window::Effect::Acrylic)
+                        .effect(tauri::window::Effect::Blur)
+                        .state(tauri::window::EffectState::Active)
+                        .build(),
+                );
+
                 main_win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { .. } = event {
                         // Closing "main" now only hides it on every platform (the app
@@ -1491,11 +1575,16 @@ pub fn run() {
             // Tray icon so the app can keep running in the background (required
             // for the optional global hotkey to mean anything) with an explicit
             // way to show the window or quit.
-            let show_item = MenuItem::with_id(app, "tray-show", "Show Termifai", true, None::<&str>)?;
+            let show_item =
+                MenuItem::with_id(app, "tray-show", "Show Termifai", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().cloned().ok_or("Missing default window icon")?)
+                .icon(
+                    app.default_window_icon()
+                        .cloned()
+                        .ok_or("Missing default window icon")?,
+                )
                 .menu(&tray_menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
@@ -1559,9 +1648,8 @@ fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
                 let main_size = main_size.to_logical::<f64>(scale_factor);
                 let x = main_pos.x + (main_size.width - 800.0) / 2.0;
                 let y = main_pos.y + (main_size.height - 600.0) / 2.0;
-                let _ = window.set_position(tauri::Position::Logical(
-                    tauri::LogicalPosition::new(x, y),
-                ));
+                let _ = window
+                    .set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
             }
         }
     };
