@@ -349,3 +349,43 @@
 :root {
   --window-controls-inset: 0px;
 }
+
+/* Quick Terminal glass mode: surfaces become translucent (revealing the
+   native backdrop blur applied to the quick-terminal window) while text
+   stays fully opaque. --qt-alpha (0.3–1) is set inline by
+   QuickTerminalWindow from the transparency setting.
+
+   The theme uses `@theme inline`, so Tailwind utilities compile to the BASE
+   tokens (e.g. `bg-background` → `var(--background)`), which means the base
+   tokens themselves must be overridden here. A base token can't reference
+   itself in its own override (var() cycle), so an outer "capture" layer
+   snapshots the opaque values first and the inner layer mixes from those.
+   The --color-* aliases are also re-declared for the `bg-[var(--color-*)]`
+   arbitrary-value usages, which resolve at the use site.
+   Popovers/menus intentionally stay opaque for readability. */
+:root {
+  --qt-solid-background: var(--background);
+  --qt-solid-surface: var(--surface);
+  --qt-solid-surface-2: var(--surface-2);
+  --qt-solid-sidebar: var(--sidebar);
+  --qt-solid-card: var(--card);
+  --qt-solid-tab-active: var(--tab-active);
+  --qt-solid-tab-inactive: var(--tab-inactive);
+}
+.qt-glass {
+  --background: color-mix(in oklab, var(--qt-solid-background) calc(var(--qt-alpha, 1) * 100%), transparent);
+  --surface: color-mix(in oklab, var(--qt-solid-surface) calc(var(--qt-alpha, 1) * 100%), transparent);
+  --surface-2: color-mix(in oklab, var(--qt-solid-surface-2) calc(var(--qt-alpha, 1) * 100%), transparent);
+  --sidebar: color-mix(in oklab, var(--qt-solid-sidebar) calc(var(--qt-alpha, 1) * 100%), transparent);
+  --card: color-mix(in oklab, var(--qt-solid-card) calc(var(--qt-alpha, 1) * 100%), transparent);
+  --tab-active: color-mix(in oklab, var(--qt-solid-tab-active) calc(var(--qt-alpha, 1) * 100%), transparent);
+  --tab-inactive: color-mix(in oklab, var(--qt-solid-tab-inactive) calc(var(--qt-alpha, 1) * 100%), transparent);
+
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-sidebar: var(--sidebar);
+  --color-card: var(--card);
+  --color-tab-active: var(--tab-active);
+  --color-tab-inactive: var(--tab-inactive);
+}

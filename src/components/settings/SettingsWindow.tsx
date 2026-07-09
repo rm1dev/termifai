@@ -1,7 +1,8 @@
-import { X, Palette, Keyboard, Minus, Plus, Check, Shield, RefreshCw } from "lucide-react";
+import { X, Palette, Keyboard, Minus, Plus, Check, Shield, RefreshCw, PanelTop } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
+import { publish } from "@/lib/api/transport";
 import { platform } from "@/lib/platform";
 import { Button } from "@/components/ui/button";
 import {
@@ -75,19 +76,45 @@ import {
 import {
   disableGlobalHotkey,
   enableGlobalHotkey,
+  type HotkeyAction,
   type HotkeyStatus,
 } from "@/lib/api/global-hotkey";
+import {
+  getQuickTerminalInfo,
+  setQuickTerminalEdge,
+  setQuickTerminalEnabled,
+  setQuickTerminalOpacity,
+  type QuickTerminalEdge,
+} from "@/lib/api/quick-terminal";
+import { Slider } from "@/components/ui/slider";
 
 export function SettingsWindow() {
   const [terminalAppearance, setTerminalAppearance] = useState(loadTerminalAppearance);
   const [selectedThemeId, setSelectedThemeId] = useState(loadAppTheme().id);
+  const [mainWindowOpacity, setMainWindowOpacity] = useState(() => {
+    try {
+      const stored = localStorage.getItem("termifai:main-window-opacity");
+      return stored ? parseFloat(stored) : 0.7;
+    } catch {
+      return 0.7;
+    }
+  });
   const [shortcuts, setShortcuts] = useState(loadShortcuts);
   const [editingShortcutId, setEditingShortcutId] = useState<ShortcutActionId | null>(null);
-  const [globalHotkey, setGlobalHotkey] = useState<GlobalHotkeySettings>(loadGlobalHotkeySettings);
-  const [isEditingGlobalHotkey, setIsEditingGlobalHotkey] = useState(false);
-  const [globalHotkeyBusy, setGlobalHotkeyBusy] = useState(false);
-  const [globalHotkeyError, setGlobalHotkeyError] = useState<string | null>(null);
-  const [globalHotkeyStatus, setGlobalHotkeyStatus] = useState<HotkeyStatus | null>(null);
+  const [hotkeys, setHotkeys] = useState<Record<HotkeyAction, GlobalHotkeySettings>>(() => ({
+    "main-window": loadGlobalHotkeySettings("main-window"),
+    "quick-terminal": loadGlobalHotkeySettings("quick-terminal"),
+  }));
+  const [editingHotkeyAction, setEditingHotkeyAction] = useState<HotkeyAction | null>(null);
+  const [hotkeyBusy, setHotkeyBusy] = useState(false);
+  const [hotkeyErrors, setHotkeyErrors] = useState<Partial<Record<HotkeyAction, string>>>({});
+  const [hotkeyStatus, setHotkeyStatus] = useState<Partial<Record<HotkeyAction, HotkeyStatus>>>({});
+  const [quickTerminal, setQuickTerminal] = useState<{
+    enabled: boolean;
+    edge: QuickTerminalEdge;
+    opacity: number;
+    wayland: boolean;
+  }>({ enabled: false, edge: "top", opacity: 1, wayland: false });
   const [vaultSt, setVaultSt] = useState<VaultStatus | null>(null);
   const [lockPolicy, setLockPolicyState] = useState<LockPolicy>("on_restart");
   const [oldPw, setOldPw] = useState("");
@@ -365,7 +392,7 @@ export function SettingsWindow() {
     return () => window.removeEventListener("keydown", onKeyDown, true);
   }, [editingShortcutId, shortcuts]);
   useEffect(() => {
-    if (!isEditingGlobalHotkey) return;
+    if (!editingHotkeyAction) return;
 
     const onKeyDown = (event: KeyboardEvent) => {
       event.preventDefault();
@@ -378,21 +405,52 @@ export function SettingsWindow() {
         !event.altKey &&
         !event.shiftKey
       ) {
-        setIsEditingGlobalHotkey(false);
+        setEditingHotkeyAction(null);
         return;
       }
 
       const binding = eventToShortcutBinding(event);
       if (!binding) return;
-      if (!bindingToAccelerator(binding)) return; // require at least one modifier
+      const accelerator = bindingToAccelerator(binding);
+      if (!accelerator) return; // require at least one modifier
 
-      setIsEditingGlobalHotkey(false);
-      void applyGlobalHotkey({ ...globalHotkey, binding });
+      const action = editingHotkeyAction;
+      const otherAction: HotkeyAction =
+        action === "main-window" ? "quick-terminal" : "main-window";
+      if (accelerator === bindingToAccelerator(hotkeys[otherAction].binding)) {
+        setEditingHotkeyAction(null);
+        setHotkeyErrors((errors) => ({
+          ...errors,
+          [action]:
+            "This combination is already used by the other global hotkey — choose a different one.",
+        }));
+        return;
+      }
+
+      setEditingHotkeyAction(null);
+      void applyHotkey(action, { ...hotkeys[action], binding });
     };
 
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [isEditingGlobalHotkey, globalHotkey]);
+  }, [editingHotkeyAction, hotkeys]);
+  useEffect(() => {
+    getQuickTerminalInfo()
+      .then((info) => {
+        setQuickTerminal({
+          enabled: info.settings.enabled,
+          edge: info.settings.edge,
+          opacity: info.settings.opacity,
+          wayland: info.wayland,
+        });
+        // The panel switch also owns the hotkey's enabled state.
+        setHotkeys((all) => ({
+          ...all,
+          "quick-terminal": { ...all["quick-terminal"], enabled: info.settings.enabled },
+        }));
+      })
+      .catch(() => {});
+  }, []);
   useEffect(() => {
     const onShortcutChanged = (event: Event) => {
       setShortcuts((event as CustomEvent<ShortcutMap>).detail);
@@ -432,37 +490,171 @@ export function SettingsWindow() {
     setSelectedThemeId(themeId);
     saveAppTheme(themeId);
   };
+  const applyMainWindowOpacity = (opacity: number) => {
+    const clamped = Math.min(1.0, Math.max(0.3, opacity));
+    setMainWindowOpacity(clamped);
+    try {
+      localStorage.setItem("termifai:main-window-opacity", clamped.toString());
+      window.dispatchEvent(new Event("storage"));
+      void publish("main-window:opacity-changed", clamped).catch(() => {});
+    } catch {}
+  };
   const resetShortcutToDefault = (actionId: ShortcutActionId) => {
     const nextShortcuts = resetShortcut(shortcuts, actionId);
     setShortcuts(nextShortcuts);
     saveShortcuts(nextShortcuts);
   };
 
-  const applyGlobalHotkey = async (next: GlobalHotkeySettings) => {
-    setGlobalHotkeyError(null);
-    setGlobalHotkeyBusy(true);
+  const applyHotkey = async (action: HotkeyAction, next: GlobalHotkeySettings) => {
+    setHotkeyErrors((errors) => ({ ...errors, [action]: undefined }));
+    setHotkeyBusy(true);
     try {
       if (next.enabled) {
         const accelerator = bindingToAccelerator(next.binding);
         if (!accelerator) {
           throw new Error("Choose a combination that includes a modifier key.");
         }
-        const status = await enableGlobalHotkey(accelerator);
-        setGlobalHotkeyStatus(status);
+        const status = await enableGlobalHotkey(action, accelerator);
+        setHotkeyStatus((statuses) => ({ ...statuses, [action]: status }));
       } else {
-        await disableGlobalHotkey();
-        setGlobalHotkeyStatus(null);
+        await disableGlobalHotkey(action);
+        setHotkeyStatus((statuses) => ({ ...statuses, [action]: undefined }));
       }
-      setGlobalHotkey(next);
-      saveGlobalHotkeySettings(next);
+      setHotkeys((all) => ({ ...all, [action]: next }));
+      saveGlobalHotkeySettings(action, next);
     } catch (error) {
-      setGlobalHotkeyError(error instanceof Error ? error.message : String(error));
+      setHotkeyErrors((errors) => ({
+        ...errors,
+        [action]: error instanceof Error ? error.message : String(error),
+      }));
     } finally {
-      setGlobalHotkeyBusy(false);
+      setHotkeyBusy(false);
+    }
+  };
+
+  // Single switch for the whole feature: it enables the panel AND registers
+  // its global hotkey in one go (there is no separate hotkey switch).
+  const applyQuickTerminalEnabled = async (enabled: boolean) => {
+    if (enabled && quickTerminal.wayland) {
+      // The compositor silently ignores toplevel positioning on most Wayland
+      // desktops (notably GNOME), so make the user opt in explicitly.
+      const confirmed = await askDialog(
+        "On your Wayland desktop this feature is known to be unreliable: " +
+          "GNOME does not let apps position their own windows, so the panel may " +
+          "not appear attached to the screen edge (KDE and wlroots-based " +
+          "compositors usually work). Enable anyway?",
+        { title: "Quick Terminal on Wayland", kind: "warning" },
+      );
+      if (!confirmed) return;
+    }
+    setHotkeyErrors((errors) => ({ ...errors, "quick-terminal": undefined }));
+    setHotkeyBusy(true);
+    try {
+      if (enabled) {
+        const binding = hotkeys["quick-terminal"].binding;
+        const accelerator = bindingToAccelerator(binding);
+        if (!accelerator) {
+          throw new Error("Set a hotkey combination that includes a modifier key first.");
+        }
+        const status = await enableGlobalHotkey("quick-terminal", accelerator);
+        setHotkeyStatus((statuses) => ({ ...statuses, "quick-terminal": status }));
+      } else {
+        await disableGlobalHotkey("quick-terminal");
+        setHotkeyStatus((statuses) => ({ ...statuses, "quick-terminal": undefined }));
+      }
+      await setQuickTerminalEnabled(enabled);
+      setQuickTerminal((qt) => ({ ...qt, enabled }));
+      const nextHotkey = { ...hotkeys["quick-terminal"], enabled };
+      setHotkeys((all) => ({ ...all, "quick-terminal": nextHotkey }));
+      saveGlobalHotkeySettings("quick-terminal", nextHotkey);
+    } catch (error) {
+      setHotkeyErrors((errors) => ({
+        ...errors,
+        "quick-terminal": error instanceof Error ? error.message : String(error),
+      }));
+    } finally {
+      setHotkeyBusy(false);
+    }
+  };
+
+  const applyQuickTerminalOpacity = (opacity: number) => {
+    setQuickTerminal((qt) => ({ ...qt, opacity }));
+    void setQuickTerminalOpacity(opacity).catch(() => {});
+  };
+
+  const applyQuickTerminalEdge = async (edge: QuickTerminalEdge) => {
+    try {
+      await setQuickTerminalEdge(edge);
+      setQuickTerminal((qt) => ({ ...qt, edge }));
+    } catch {
+      /* leave state unchanged */
     }
   };
 
   const isMac = platform === "macos";
+
+  const renderHotkeyRow = (
+    action: HotkeyAction,
+    title: string,
+    description: string,
+    { showSwitch = true }: { showSwitch?: boolean } = {},
+  ) => {
+    const settings = hotkeys[action];
+    const status = hotkeyStatus[action];
+    const error = hotkeyErrors[action];
+    return (
+      <>
+        <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium">{title}</div>
+            <div className="mt-1 text-xs text-muted-foreground">{description}</div>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <div className="flex min-w-28 justify-end gap-1.5">
+              {editingHotkeyAction === action ? (
+                <span className="rounded-md border border-primary bg-primary/10 px-2 py-1 font-mono text-xs text-primary">
+                  Press keys...
+                </span>
+              ) : (
+                formatShortcut(settings.binding).map((key, i) => (
+                  <kbd
+                    key={`${action}-${i}`}
+                    className="rounded-md border border-border bg-[var(--color-surface-2)] px-2 py-1 font-mono text-xs text-muted-foreground shadow-sm"
+                  >
+                    {key}
+                  </kbd>
+                ))
+              )}
+            </div>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={hotkeyBusy}
+              onClick={() => setEditingHotkeyAction(action)}
+            >
+              Change
+            </Button>
+            {showSwitch && (
+              <Switch
+                checked={settings.enabled}
+                disabled={hotkeyBusy}
+                onCheckedChange={(checked) =>
+                  void applyHotkey(action, { ...settings, enabled: checked })
+                }
+              />
+            )}
+          </div>
+        </div>
+        {status?.backend === "portal" && (
+          <p className="text-xs text-muted-foreground">
+            Bound via the system's global shortcut portal as{" "}
+            <span className="font-mono">{status.accelerator}</span>.
+          </p>
+        )}
+        {error && <p className="text-xs text-destructive">{error}</p>}
+      </>
+    );
+  };
 
   return (
     <div className={`flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground ${isMac ? "rounded-lg" : ""}`}>
@@ -493,7 +685,7 @@ export function SettingsWindow() {
 
       <main className="min-h-0 flex-1 overflow-auto p-5">
         <Tabs defaultValue="theme" className="mx-auto max-w-3xl">
-          <TabsList className="grid w-full grid-cols-4">
+          <TabsList className="grid w-full grid-cols-5">
             <TabsTrigger value="theme" className="gap-2">
               <Palette className="h-4 w-4" />
               Theme
@@ -501,6 +693,10 @@ export function SettingsWindow() {
             <TabsTrigger value="shortcuts" className="gap-2">
               <Keyboard className="h-4 w-4" />
               Shortcuts
+            </TabsTrigger>
+            <TabsTrigger value="quick-terminal" className="gap-2">
+              <PanelTop className="h-4 w-4" />
+              Quick Terminal
             </TabsTrigger>
             <TabsTrigger value="security" className="gap-2">
               <Shield className="h-4 w-4" />
@@ -650,9 +846,62 @@ export function SettingsWindow() {
               </div>
             </div>
 
+            {/* Window Transparency */}
+            <div className="rounded-xl bg-[var(--color-card)] p-5">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-base font-medium text-foreground">Window transparency</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    How see-through the main Termifai window is. 100% is fully opaque.
+                  </div>
+                </div>
+                <div className="flex w-48 shrink-0 items-center gap-3">
+                  <Slider
+                    min={30}
+                    max={100}
+                    step={5}
+                    value={[Math.round(mainWindowOpacity * 100)]}
+                    onValueChange={([value]) => applyMainWindowOpacity(value / 100)}
+                  />
+                  <span className="w-10 text-right font-mono text-xs text-muted-foreground">
+                    {Math.round(mainWindowOpacity * 100)}%
+                  </span>
+                </div>
+              </div>
+            </div>
           </TabsContent>
 
-          <TabsContent value="shortcuts" className="mt-4">
+          <TabsContent value="shortcuts" className="mt-4 space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Keyboard className="h-4 w-4 text-[var(--color-brand-green)]" />
+                  Global Hotkeys
+                </CardTitle>
+                <CardDescription>
+                  Configure system-wide shortcuts to toggle Termifai windows from anywhere, even when other applications have focus.
+                  {!isMac && (
+                    <span className="block mt-1">
+                      On Linux with Wayland, enabling these will show a system confirmation dialog asking you to approve the shortcut.
+                    </span>
+                  )}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {renderHotkeyRow(
+                  "main-window",
+                  "Toggle Main Window",
+                  "Toggle the visibility of the primary Termifai shell window.",
+                )}
+                {renderHotkeyRow(
+                  "quick-terminal",
+                  "Toggle Quick Terminal",
+                  "Slide the Quick Terminal panel in or out.",
+                  { showSwitch: false },
+                )}
+              </CardContent>
+            </Card>
+
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2 text-base">
@@ -713,74 +962,103 @@ export function SettingsWindow() {
                 </div>
               </CardContent>
             </Card>
+          </TabsContent>
 
-            <Card className="mt-4">
+          <TabsContent value="quick-terminal" className="mt-4">
+            <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2 text-base">
-                  <Keyboard className="h-4 w-4 text-[var(--color-brand-green)]" />
-                  Global Hotkey
+                  <PanelTop
+                    className={`h-4 w-4 ${quickTerminal.wayland ? "text-red-500" : "text-[var(--color-brand-green)]"}`}
+                  />
+                  Quick Terminal
                 </CardTitle>
                 <CardDescription>
-                  Show or hide Termifai from anywhere, even when another app has focus. Off by
-                  default.
-                  {!isMac && (
-                    <>
-                      {" "}On Linux with Wayland, enabling this will show a one-time system
-                      confirmation dialog asking you to approve the shortcut.
-                    </>
+                  A slide-in terminal panel anchored to a screen edge, summoned from anywhere
+                  with its own global hotkey. Off by default.
+                  {quickTerminal.wayland && (
+                    <span className="mt-1 block text-red-500">
+                      Your system is running Wayland: most Wayland desktops (notably GNOME) do
+                      not let apps position their own windows, so the panel may not attach to
+                      the screen edge correctly.
+                    </span>
                   )}
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
+                <div
+                  className={`flex items-center justify-between gap-4 rounded-lg border px-4 py-3 ${
+                    quickTerminal.wayland ? "border-red-500/50" : "border-border"
+                  }`}
+                >
+                  <div className="min-w-0">
+                    <div
+                      className={`text-sm font-medium ${quickTerminal.wayland ? "text-red-500" : ""}`}
+                    >
+                      Enable Quick Terminal
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      Turns the panel on and registers its global hotkey.
+                    </div>
+                  </div>
+                  <Switch
+                    checked={quickTerminal.enabled}
+                    disabled={hotkeyBusy}
+                    onCheckedChange={(checked) => void applyQuickTerminalEnabled(checked)}
+                  />
+                </div>
+
                 <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
                   <div className="min-w-0">
-                    <div className="text-sm font-medium">Enable global hotkey</div>
+                    <div className="text-sm font-medium">Screen edge</div>
                     <div className="mt-1 text-xs text-muted-foreground">
-                      Toggle the Termifai window with a system-wide shortcut.
+                      Where the panel slides in from. Left/right default to ⅓ of the screen
+                      width, top/bottom to ½ of the height; drag the panel's inner edge to
+                      resize.
                     </div>
                   </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    <div className="flex min-w-28 justify-end gap-1.5">
-                      {isEditingGlobalHotkey ? (
-                        <span className="rounded-md border border-primary bg-primary/10 px-2 py-1 font-mono text-xs text-primary">
-                          Press keys...
-                        </span>
-                      ) : (
-                        formatShortcut(globalHotkey.binding).map((key, i) => (
-                          <kbd
-                            key={`global-hotkey-${i}`}
-                            className="rounded-md border border-border bg-[var(--color-surface-2)] px-2 py-1 font-mono text-xs text-muted-foreground shadow-sm"
-                          >
-                            {key}
-                          </kbd>
-                        ))
-                      )}
+                  <Select
+                    value={quickTerminal.edge}
+                    onValueChange={(edge) => void applyQuickTerminalEdge(edge as QuickTerminalEdge)}
+                  >
+                    <SelectTrigger className="w-28 shrink-0">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="top">Top</SelectItem>
+                      <SelectItem value="bottom">Bottom</SelectItem>
+                      <SelectItem value="left">Left</SelectItem>
+                      <SelectItem value="right">Right</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="flex items-center justify-between gap-4 rounded-lg border border-border px-4 py-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium">Panel transparency</div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      How see-through the panel is. 100% is fully opaque.
                     </div>
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      disabled={globalHotkeyBusy}
-                      onClick={() => setIsEditingGlobalHotkey(true)}
-                    >
-                      Change
-                    </Button>
-                    <Switch
-                      checked={globalHotkey.enabled}
-                      disabled={globalHotkeyBusy}
-                      onCheckedChange={(checked) =>
-                        void applyGlobalHotkey({ ...globalHotkey, enabled: checked })
-                      }
+                  </div>
+                  <div className="flex w-48 shrink-0 items-center gap-3">
+                    <Slider
+                      min={30}
+                      max={100}
+                      step={5}
+                      value={[Math.round(quickTerminal.opacity * 100)]}
+                      onValueChange={([value]) => applyQuickTerminalOpacity(value / 100)}
                     />
+                    <span className="w-10 text-right font-mono text-xs text-muted-foreground">
+                      {Math.round(quickTerminal.opacity * 100)}%
+                    </span>
                   </div>
                 </div>
-                {globalHotkeyStatus?.backend === "portal" && (
-                  <p className="text-xs text-muted-foreground">
-                    Bound via the system's global shortcut portal as{" "}
-                    <span className="font-mono">{globalHotkeyStatus.accelerator}</span>.
-                  </p>
-                )}
-                {globalHotkeyError && (
-                  <p className="text-xs text-destructive">{globalHotkeyError}</p>
+
+                {renderHotkeyRow(
+                  "quick-terminal",
+                  "Quick Terminal hotkey",
+                  "The system-wide shortcut that opens or closes the panel.",
+                  { showSwitch: false },
                 )}
               </CardContent>
             </Card>

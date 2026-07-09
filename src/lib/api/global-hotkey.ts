@@ -1,6 +1,7 @@
 import { call } from "./transport";
 
 export type HotkeyBackend = "plugin" | "portal";
+export type HotkeyAction = "main-window" | "quick-terminal";
 
 export interface HotkeyStatus {
   enabled: boolean;
@@ -8,14 +9,17 @@ export interface HotkeyStatus {
   backend: HotkeyBackend;
 }
 
-export function enableGlobalHotkey(accelerator: string): Promise<HotkeyStatus> {
-  return call<HotkeyStatus>("enable_global_hotkey", { accelerator });
+export function enableGlobalHotkey(
+  action: HotkeyAction,
+  accelerator: string,
+): Promise<HotkeyStatus> {
+  return call<HotkeyStatus>("enable_global_hotkey", { action, accelerator });
 }
 
-export function disableGlobalHotkey(): Promise<void> {
-  return call<void>("disable_global_hotkey");
+export function disableGlobalHotkey(action: HotkeyAction): Promise<void> {
+  return call<void>("disable_global_hotkey", { action });
 }
 
-export function getGlobalHotkeyStatus(): Promise<HotkeyStatus | null> {
-  return call<HotkeyStatus | null>("get_global_hotkey_status");
+export function getGlobalHotkeyStatus(): Promise<Partial<Record<HotkeyAction, HotkeyStatus>>> {
+  return call<Partial<Record<HotkeyAction, HotkeyStatus>>>("get_global_hotkey_status");
 }
