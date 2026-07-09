@@ -4,6 +4,7 @@ import { subscribe, type UnlistenFn } from "@/lib/api/transport";
 import {
   getQuickTerminalInfo,
   hideQuickTerminal,
+  quickTerminalFrontendReady,
   resizeQuickTerminal,
   type QuickTerminalEdge,
 } from "@/lib/api/quick-terminal";
@@ -47,20 +48,42 @@ export function QuickTerminalWindow() {
 
   useEffect(() => {
     const unlisteners: UnlistenFn[] = [];
-    void subscribe<{ edge: QuickTerminalEdge }>("quick-terminal:show", (event) => {
-      setEdge(event.payload.edge);
-      setHasOpened(true);
-    }).then((unlisten) => unlisteners.push(unlisten));
-    void subscribe<number>("quick-terminal:opacity-changed", (event) => {
-      setOpacity(event.payload);
-    }).then((unlisten) => unlisteners.push(unlisten));
-    void getQuickTerminalInfo()
-      .then((info) => {
+    let cancelled = false;
+    const push = (unlisten: UnlistenFn) => {
+      if (cancelled) unlisten();
+      else unlisteners.push(unlisten);
+    };
+    const setup = async () => {
+      // The subscriptions MUST be registered before signalling readiness:
+      // on a cold hotkey launch the backend fires "quick-terminal:show" the
+      // moment we report ready, and a show event that races past an
+      // unregistered listener leaves the panel visible but empty (hasOpened
+      // never flips, so AppShell never mounts).
+      push(
+        await subscribe<{ edge: QuickTerminalEdge }>("quick-terminal:show", (event) => {
+          setEdge(event.payload.edge);
+          setHasOpened(true);
+        }),
+      );
+      push(
+        await subscribe<number>("quick-terminal:opacity-changed", (event) => {
+          setOpacity(event.payload);
+        }),
+      );
+      try {
+        const info = await getQuickTerminalInfo();
         setEdge(info.settings.edge);
         setOpacity(info.settings.opacity);
-      })
-      .catch(() => {});
-    return () => unlisteners.forEach((unlisten) => unlisten());
+      } catch {
+        /* keep defaults */
+      }
+      await quickTerminalFrontendReady().catch(() => {});
+    };
+    void setup();
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
   }, []);
 
   const close = () => {
