@@ -1,4 +1,4 @@
-import { X, Palette, Keyboard, Minus, Plus, Check, Shield, RefreshCw, PanelTop } from "lucide-react";
+import { X, Palette, Keyboard, Minus, Plus, Check, Shield, RefreshCw, PanelTop, Settings } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
@@ -87,6 +87,12 @@ import {
   type QuickTerminalEdge,
 } from "@/lib/api/quick-terminal";
 import { Slider } from "@/components/ui/slider";
+import {
+  getGeneralSettings,
+  setGeneralSettings,
+  isAutostartEnabled,
+  setAutostartEnabled as setAutostartEnabledApi,
+} from "@/lib/api/terminal";
 
 export function SettingsWindow() {
   const [terminalAppearance, setTerminalAppearance] = useState(loadTerminalAppearance);
@@ -135,6 +141,36 @@ export function SettingsWindow() {
   const [syncError, setSyncError] = useState<string | null>(null);
   const [syncNeedsPassword, setSyncNeedsPassword] = useState(false);
   const [syncPassword, setSyncPassword] = useState("");
+
+  const [runInBackground, setRunInBackground] = useState(true);
+  const [autostartEnabled, setAutostartEnabled] = useState(true);
+
+  useEffect(() => {
+    void getGeneralSettings().then((s) => setRunInBackground(s.runInBackground));
+    void isAutostartEnabled().then((enabled) => setAutostartEnabled(enabled));
+  }, []);
+
+  const handleRunInBackgroundChange = (checked: boolean) => {
+    setRunInBackground(checked);
+    void setGeneralSettings({ runInBackground: checked }).then(() => {
+      toast.success(
+        checked
+          ? "App will continue running in the background"
+          : "App will exit completely when closed"
+      );
+    });
+  };
+
+  const handleAutostartChange = (checked: boolean) => {
+    setAutostartEnabled(checked);
+    void setAutostartEnabledApi(checked).then(() => {
+      toast.success(
+        checked
+          ? "Startup autostart enabled"
+          : "Startup autostart disabled"
+      );
+    });
+  };
 
   const refreshSyncStatus = () => {
     syncGetConfig()
@@ -677,8 +713,12 @@ export function SettingsWindow() {
       </header>
 
       <main className="min-h-0 flex-1 overflow-auto p-5">
-        <Tabs defaultValue="theme" className="mx-auto max-w-3xl">
-          <TabsList className="grid w-full grid-cols-5">
+        <Tabs defaultValue="general" className="mx-auto max-w-3xl">
+          <TabsList className="grid w-full grid-cols-6">
+            <TabsTrigger value="general" className="gap-2">
+              <Settings className="h-4 w-4" />
+              General
+            </TabsTrigger>
             <TabsTrigger value="theme" className="gap-2">
               <Palette className="h-4 w-4" />
               Theme
@@ -700,6 +740,51 @@ export function SettingsWindow() {
               Sync
             </TabsTrigger>
           </TabsList>
+
+          <TabsContent value="general" className="mt-4 space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Settings className="h-4 w-4 text-[var(--color-brand-green)]" />
+                  General Settings
+                </CardTitle>
+                <CardDescription>
+                  Configure app behavior on launch and exit.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="flex items-start justify-between gap-4 rounded-lg border border-border px-4 py-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-foreground">
+                      Run at Startup
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                      Start the application automatically when you log into your system. This is required for your global hotkeys and Quick Terminal to function seamlessly in the background without needing to launch the app manually.
+                    </div>
+                  </div>
+                  <Switch
+                    checked={autostartEnabled}
+                    onCheckedChange={handleAutostartChange}
+                  />
+                </div>
+
+                <div className="flex items-start justify-between gap-4 rounded-lg border border-border px-4 py-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-medium text-foreground">
+                      Run in Background
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                      Closing the main window will hide it and keep the application running in the system tray. This allows the hotkey daemon to remain active and respond to your shortcuts. If disabled, closing the window will completely exit the application and its background services.
+                    </div>
+                  </div>
+                  <Switch
+                    checked={runInBackground}
+                    onCheckedChange={handleRunInBackgroundChange}
+                  />
+                </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
 
           <TabsContent value="theme" className="mt-4 space-y-6 pb-10">
             {/* Font and Size Settings */}

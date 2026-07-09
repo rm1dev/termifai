@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, forwardRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
 import { subscribe } from "@/lib/api/transport";
-import { openSettingsWindow, quitApp } from "@/lib/api/terminal";
+import { forceQuitApp, openSettingsWindow, quitApp } from "@/lib/api/terminal";
 import { listSshKeys } from "@/lib/api/ssh-keys";
 import {
   Server,
@@ -646,6 +646,9 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
         <DropdownMenuItem onSelect={() => void quitApp()}>
           Quit
           <span className="ml-auto text-xs text-muted-foreground">Alt+F4</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void forceQuitApp()}>
+          Force Quit
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
