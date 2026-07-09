@@ -600,7 +600,6 @@ export function SettingsWindow() {
     { showSwitch = true }: { showSwitch?: boolean } = {},
   ) => {
     const settings = hotkeys[action];
-    const status = hotkeyStatus[action];
     const error = hotkeyErrors[action];
     return (
       <>
@@ -645,12 +644,6 @@ export function SettingsWindow() {
             )}
           </div>
         </div>
-        {status?.backend === "portal" && (
-          <p className="text-xs text-muted-foreground">
-            Bound via the system's global shortcut portal as{" "}
-            <span className="font-mono">{status.accelerator}</span>.
-          </p>
-        )}
         {error && <p className="text-xs text-destructive">{error}</p>}
       </>
     );

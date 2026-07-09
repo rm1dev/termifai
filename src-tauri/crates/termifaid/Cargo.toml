@@ -1,0 +1,27 @@
+[package]
+name = "termifaid"
+version = "0.1.0"
+description = "Termifai hotkey service: listens for global hotkeys and launches/toggles the app, surviving app quit"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+dirs = "5"
+single-instance = "0.3"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+global-hotkey = "0.8"
+tao = "0.35"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+global-hotkey = "0.8"
+tao = "0.35"
+ashpd = { version = "0.9", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3"
+
+[build-dependencies]
+embed-resource = "2.4"
+

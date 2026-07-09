@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Start as an agent (no Dock icon at process launch). This kills the
+	     Dock-icon flash when the termifaid hotkey service cold-launches the
+	     app just for the Quick Terminal. For normal launches, setup()
+	     immediately switches the activation policy to Regular, which brings
+	     the Dock icon up. -->
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>
