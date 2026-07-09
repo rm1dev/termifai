@@ -1377,12 +1377,32 @@ pub fn run() {
             }
 
             // On Linux and Windows, remove native decorations so the custom frontend titlebar takes over
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            // Build the main window programmatically.
+            // On macOS: with decorations and Overlay title bar style for traffic lights.
+            // On Windows/Linux: without decorations to avoid two-toned title bar.
+            let mut main_builder =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("Termifai")
+                    .inner_size(900.0, 600.0)
+                    .min_inner_size(900.0, 600.0)
+                    .resizable(true)
+                    .transparent(true);
+
+            #[cfg(target_os = "macos")]
             {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_decorations(false);
-                }
+                main_builder = main_builder
+                    .decorations(true)
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .hidden_title(true)
+                    .traffic_light_position(tauri::LogicalPosition::new(12.0, 25.0));
             }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                main_builder = main_builder.decorations(false);
+            }
+
+            let _main_win = main_builder.build()?;
 
             // Create the settings window hidden at startup — creating it dynamically after
             // the event loop starts deadlocks on Windows because WebView2 initialization
