@@ -1418,7 +1418,6 @@ pub fn run() {
             .resizable(false)
             .decorations(false)
             .transparent(true)
-            .always_on_top(true)
             .minimizable(false)
             .maximizable(false)
             .visible(false)
@@ -1631,6 +1630,16 @@ fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("settings")
         .ok_or_else(|| "Settings window not found".to_string())?;
+
+    // The settings window is a normal window (not always-on-top), so it would
+    // end up *behind* the always-on-top Quick Terminal panel. Collapse the
+    // panel instead — it's a transient overlay, and this keeps the settings
+    // window from having to sit above other apps' windows.
+    if let Some(quick) = app.get_webview_window(quick_terminal::WINDOW_LABEL) {
+        if quick.is_visible().unwrap_or(false) {
+            let _ = app.emit("quick-terminal:hide", ());
+        }
+    }
 
     // Center on the main window using *logical* coordinates: physical
     // coordinates are interpreted with the scale factor of the monitor the
