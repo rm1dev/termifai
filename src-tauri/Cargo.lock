@@ -3,6 +3,22 @@
 version = 3
 
 [[package]]
+name = "Termifaid"
+version = "0.1.0"
+dependencies = [
+ "ashpd",
+ "dirs 5.0.1",
+ "embed-resource 2.5.2",
+ "futures",
+ "global-hotkey",
+ "serde",
+ "serde_json",
+ "single-instance",
+ "tao",
+ "tokio",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5193,22 +5209,6 @@ dependencies = [
  "sha2",
  "time",
  "zeroize",
-]
-
-[[package]]
-name = "termifaid"
-version = "0.1.0"
-dependencies = [
- "ashpd",
- "dirs 5.0.1",
- "embed-resource 2.5.2",
- "futures",
- "global-hotkey",
- "serde",
- "serde_json",
- "single-instance",
- "tao",
- "tokio",
 ]
 
 [[package]]
