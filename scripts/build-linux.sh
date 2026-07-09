@@ -35,6 +35,7 @@ build_for_arch() {
         sh -c "
             set -e
             npm install
+            bash scripts/build-termifaid.sh
             npx tauri build --bundles deb
         "
 

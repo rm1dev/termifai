@@ -15,7 +15,7 @@ use tauri_plugin_autostart::ManagerExt;
 pub const ACTION_MAIN_WINDOW: &str = "main-window";
 pub const ACTION_QUICK_TERMINAL: &str = "quick-terminal";
 
-const DAEMON_BIN: &str = "Termifaid";
+const DAEMON_BIN: &str = "com.termifai";
 /// Loopback port of this process's IPC listener (set once at startup).
 #[allow(dead_code)]
 static IPC_PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
