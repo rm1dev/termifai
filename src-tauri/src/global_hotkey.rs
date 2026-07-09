@@ -469,6 +469,27 @@ pub fn clean_quit(app: &AppHandle) {
     }
 }
 
+pub fn kill_daemon() {
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "com.termifai"])
+            .status();
+        let _ = std::process::Command::new("pkill")
+            .args(["-f", "Termifaid"])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "com.termifai.exe", "/F"])
+            .status();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/IM", "Termifaid.exe", "/F"])
+            .status();
+    }
+}
+
 /// Removes the pre-rename daemon ("termifai-hotkeyd"): kill a running copy
 /// and delete its installed binary so only `termifaid` remains.
 fn cleanup_legacy_daemon(app: &AppHandle) {
