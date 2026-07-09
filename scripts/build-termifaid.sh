@@ -23,5 +23,5 @@ case "$TRIPLE" in
 esac
 
 mkdir -p binaries
-cp "${BUILT}${EXT}" "binaries/Termifaid-${TRIPLE}${EXT}"
-echo "sidecar ready: binaries/Termifaid-${TRIPLE}${EXT}"
+cp "${BUILT}${EXT}" "binaries/com.termifai-${TRIPLE}${EXT}"
+echo "sidecar ready: binaries/com.termifai-${TRIPLE}${EXT}"
