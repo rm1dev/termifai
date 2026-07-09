@@ -57,7 +57,7 @@ fn app_data_dir() -> Option<PathBuf> {
 /// runs headless (spawned by the app or by login autostart), so a log file is
 /// the only way to see what it did.
 pub fn log_line(message: &str) {
-    let Some(path) = app_data_dir().map(|d| d.join("termifaid.log")) else {
+    let Some(path) = app_data_dir().map(|d| d.join("Termifaid.log")) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -208,13 +208,13 @@ fn is_wayland() -> bool {
 fn instance_lock_name() -> String {
     #[cfg(windows)]
     {
-        "termifaid".to_string()
+        "Termifaid".to_string()
     }
     #[cfg(not(windows))]
     {
         let dir = app_data_dir().unwrap_or_else(std::env::temp_dir);
         let _ = std::fs::create_dir_all(&dir);
-        dir.join("termifaid.lock").to_string_lossy().into_owned()
+        dir.join("Termifaid.lock").to_string_lossy().into_owned()
     }
 }
 
