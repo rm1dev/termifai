@@ -19,7 +19,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "externalBin": ["binaries/termifaid"],
+    "externalBin": ["binaries/Termifaid"],
     "icon": [
       "icons/128x128.png",
       "icons/128x128@2x.png",
