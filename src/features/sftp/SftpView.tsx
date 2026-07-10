@@ -11,6 +11,7 @@ import {
   Search,
   Server,
   Upload,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
@@ -96,16 +97,19 @@ function SftpConnectingOverlay({
   );
 }
 
-function SftpDropOverlay({ label, accent, icon: Icon }: {
+function SftpDropOverlay({ label, accent, icon: Icon, domRef }: {
   label: string;
   accent: string;
   icon: typeof Download;
+  domRef?: React.RefObject<HTMLDivElement | null>;
 }) {
   return (
     <div
-      className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center p-4 backdrop-blur-md transition-all duration-300"
+      ref={domRef}
+      className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center p-4 backdrop-blur-[2px] transition-all duration-300 opacity-0"
       style={{
-        background: `color-mix(in oklab, ${accent} 12%, rgba(15, 23, 42, 0.45))`,
+        background: `color-mix(in oklab, ${accent} 6%, rgba(15, 23, 42, 0.25))`,
+        transform: "scale(0.95)",
       }}
     >
       {/* Outer dashed border container */}
@@ -153,6 +157,52 @@ function SftpDropOverlay({ label, accent, icon: Icon }: {
             Release to transfer
           </span>
         </div>
+      </div>
+    </div>
+  );
+}
+
+function SftpCancelOverlay({ domRef }: { domRef?: React.RefObject<HTMLDivElement | null> }) {
+  const accent = "oklch(0.65 0.02 240)"; // Premium neutral slate gray
+  return (
+    <div
+      ref={domRef}
+      className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center p-4 backdrop-blur-[2px] transition-all duration-300 opacity-0"
+      style={{
+        background: "rgba(15, 23, 42, 0.15)",
+      }}
+    >
+      {/* Outer dashed border container */}
+      <div
+        className="cancel-border absolute inset-4 rounded-xl border-2 border-dashed transition-all duration-300"
+        style={{
+          borderColor: "rgba(156, 163, 175, 0.25)",
+        }}
+      />
+
+      {/* Central Box */}
+      <div
+        className="cancel-box relative flex flex-col items-center gap-3 rounded-2xl border px-8 py-5 shadow-2xl transition-all duration-300"
+        style={{
+          opacity: 0,
+          transform: "scale(0.95)",
+          borderColor: `color-mix(in oklab, ${accent} 30%, rgba(255, 255, 255, 0.08))`,
+          background: "rgba(30, 41, 59, 0.85)",
+          boxShadow: `0 20px 50px rgba(0, 0, 0, 0.5), 0 0 30px color-mix(in oklab, ${accent} 10%, transparent)`,
+        }}
+      >
+        <div
+          className="flex h-10 w-10 items-center justify-center rounded-full"
+          style={{
+            background: `color-mix(in oklab, ${accent} 15%, rgba(255,255,255,0.03))`,
+            border: `1px solid color-mix(in oklab, ${accent} 35%, transparent)`,
+          }}
+        >
+          <X className="h-5 w-5" style={{ color: accent }} />
+        </div>
+        <span className="text-xs font-semibold tracking-wide text-foreground uppercase">
+          Drop to cancel
+        </span>
       </div>
     </div>
   );
@@ -270,13 +320,6 @@ export function SftpView({ tab }: { tab: AppTab }) {
   // paneDrag: pointer-based drag between panes. HTML5 drag & drop is unusable
   // here — Tauri's native drag handler consumes drops before WKWebView/WebView2
   // ever dispatches DOM "drop" events — so we implement dragging ourselves.
-  const [paneDrag, setPaneDrag] = useState<{
-    source: "local" | "remote";
-    count: number;
-    x: number;
-    y: number;
-    over: "local" | "remote" | null;
-  } | null>(null);
   const paneDragRef = useRef<{
     source: "local" | "remote";
     paths: string[];
@@ -284,7 +327,13 @@ export function SftpView({ tab }: { tab: AppTab }) {
     startY: number;
     active: boolean;
   } | null>(null);
+  const paneRectsRef = useRef<{ local: DOMRect; remote: DOMRect } | null>(null);
   const suppressClickRef = useRef(false);
+  const dragGhostRef = useRef<HTMLDivElement | null>(null);
+  const localDropOverlayRef = useRef<HTMLDivElement | null>(null);
+  const localCancelOverlayRef = useRef<HTMLDivElement | null>(null);
+  const remoteDropOverlayRef = useRef<HTMLDivElement | null>(null);
+  const remoteCancelOverlayRef = useRef<HTMLDivElement | null>(null);
   const [showHiddenLocal, setShowHiddenLocal] = useState(false);
   const [showHiddenRemote, setShowHiddenRemote] = useState(false);
   const [localMenuOpen, setLocalMenuOpen] = useState(false);
@@ -369,6 +418,16 @@ export function SftpView({ tab }: { tab: AppTab }) {
   // Which pane (if any) contains the given CLIENT (CSS px) coordinates.
   // Hidden panes (inactive tab, display:none) report a zero-size rect.
   const hitTestPane = (x: number, y: number): "local" | "remote" | null => {
+    if (paneRectsRef.current) {
+      const { local, remote } = paneRectsRef.current;
+      if (x >= local.left && x <= local.right && y >= local.top && y <= local.bottom) {
+        return "local";
+      }
+      if (x >= remote.left && x <= remote.right && y >= remote.top && y <= remote.bottom) {
+        return "remote";
+      }
+      return null;
+    }
     const panes = [
       ["local", localPaneRef.current],
       ["remote", remotePaneRef.current],
@@ -417,47 +476,172 @@ export function SftpView({ tab }: { tab: AppTab }) {
     const selected = source === "local" ? selectedLocal : selectedRemote;
     const paths = selected.has(path) ? [...selected] : [path];
     paneDragRef.current = { source, paths, startX: e.clientX, startY: e.clientY, active: false };
+    if (localPaneRef.current && remotePaneRef.current) {
+      paneRectsRef.current = {
+        local: localPaneRef.current.getBoundingClientRect(),
+        remote: remotePaneRef.current.getBoundingClientRect(),
+      };
+    }
   };
 
   useEffect(() => {
+    const updateDragUI = (source: "local" | "remote", over: "local" | "remote" | null) => {
+      // Reset defaults
+      if (localDropOverlayRef.current) {
+        localDropOverlayRef.current.style.opacity = "0";
+        localDropOverlayRef.current.style.transform = "scale(0.95)";
+      }
+      if (remoteDropOverlayRef.current) {
+        remoteDropOverlayRef.current.style.opacity = "0";
+        remoteDropOverlayRef.current.style.transform = "scale(0.95)";
+      }
+      if (localCancelOverlayRef.current) {
+        localCancelOverlayRef.current.style.opacity = "0";
+        const box = localCancelOverlayRef.current.querySelector<HTMLDivElement>(".cancel-box");
+        const border = localCancelOverlayRef.current.querySelector<HTMLDivElement>(".cancel-border");
+        if (box) { box.style.opacity = "0"; box.style.transform = "scale(0.95)"; }
+        if (border) border.style.borderColor = "rgba(156, 163, 175, 0.25)";
+        localCancelOverlayRef.current.style.background = "rgba(15, 23, 42, 0.15)";
+      }
+      if (remoteCancelOverlayRef.current) {
+        remoteCancelOverlayRef.current.style.opacity = "0";
+        const box = remoteCancelOverlayRef.current.querySelector<HTMLDivElement>(".cancel-box");
+        const border = remoteCancelOverlayRef.current.querySelector<HTMLDivElement>(".cancel-border");
+        if (box) { box.style.opacity = "0"; box.style.transform = "scale(0.95)"; }
+        if (border) border.style.borderColor = "rgba(156, 163, 175, 0.25)";
+        remoteCancelOverlayRef.current.style.background = "rgba(15, 23, 42, 0.15)";
+      }
+      if (localPaneRef.current) localPaneRef.current.style.background = "";
+      if (remotePaneRef.current) remotePaneRef.current.style.background = "";
+
+      // Apply active styles
+      const cancelAccent = "oklch(0.65 0.02 240)";
+      if (source === "local") {
+        if (localCancelOverlayRef.current) {
+          localCancelOverlayRef.current.style.opacity = "1";
+          if (over === "local") {
+            const box = localCancelOverlayRef.current.querySelector<HTMLDivElement>(".cancel-box");
+            const border = localCancelOverlayRef.current.querySelector<HTMLDivElement>(".cancel-border");
+            if (box) { box.style.opacity = "1"; box.style.transform = "scale(1)"; }
+            if (border) border.style.borderColor = cancelAccent;
+            localCancelOverlayRef.current.style.background = `color-mix(in oklab, ${cancelAccent} 12%, rgba(15, 23, 42, 0.45))`;
+          }
+        }
+        if (over === "remote") {
+          if (remoteDropOverlayRef.current) {
+            remoteDropOverlayRef.current.style.opacity = "1";
+            remoteDropOverlayRef.current.style.transform = "scale(1)";
+          }
+          if (remotePaneRef.current) {
+            remotePaneRef.current.style.background = "color-mix(in oklab, oklch(0.45 0.12 145) 5%, transparent)";
+          }
+        }
+      } else if (source === "remote") {
+        if (remoteCancelOverlayRef.current) {
+          remoteCancelOverlayRef.current.style.opacity = "1";
+          if (over === "remote") {
+            const box = remoteCancelOverlayRef.current.querySelector<HTMLDivElement>(".cancel-box");
+            const border = remoteCancelOverlayRef.current.querySelector<HTMLDivElement>(".cancel-border");
+            if (box) { box.style.opacity = "1"; box.style.transform = "scale(1)"; }
+            if (border) border.style.borderColor = cancelAccent;
+            remoteCancelOverlayRef.current.style.background = `color-mix(in oklab, ${cancelAccent} 12%, rgba(15, 23, 42, 0.45))`;
+          }
+        }
+        if (over === "local") {
+          if (localDropOverlayRef.current) {
+            localDropOverlayRef.current.style.opacity = "1";
+            localDropOverlayRef.current.style.transform = "scale(1)";
+          }
+          if (localPaneRef.current) {
+            localPaneRef.current.style.background = "color-mix(in oklab, oklch(0.55 0.18 230) 5%, transparent)";
+          }
+        }
+      }
+    };
+
     const onMove = (e: MouseEvent) => {
       const d = paneDragRef.current;
       if (!d) return;
       if (!d.active) {
         if (Math.abs(e.clientX - d.startX) + Math.abs(e.clientY - d.startY) < 8) return;
         d.active = true;
+        
+        // Drag starts: setup initial ghost and overlays
+        if (dragGhostRef.current) {
+          dragGhostRef.current.textContent = d.paths.length === 1 ? "1 item" : `${d.paths.length} items`;
+          dragGhostRef.current.style.opacity = "1";
+          dragGhostRef.current.style.transform = `translate3d(${e.clientX + 14}px, ${e.clientY + 14}px, 0)`;
+        }
+        if (paneContainerRef.current) {
+          paneContainerRef.current.style.userSelect = "none";
+          paneContainerRef.current.style.cursor = "copy";
+        }
       }
-      e.preventDefault(); // suppress text selection while dragging
-      setPaneDrag({
-        source: d.source,
-        count: d.paths.length,
-        x: e.clientX,
-        y: e.clientY,
-        over: hitTestPaneRef.current(e.clientX, e.clientY),
-      });
+      e.preventDefault();
+
+      if (dragGhostRef.current) {
+        dragGhostRef.current.style.transform = `translate3d(${e.clientX + 14}px, ${e.clientY + 14}px, 0)`;
+      }
+
+      const target = hitTestPaneRef.current(e.clientX, e.clientY);
+      updateDragUI(d.source, target);
     };
+
     const cancelDrag = () => {
       paneDragRef.current = null;
-      setPaneDrag(null);
+      paneRectsRef.current = null;
+      
+      // Reset everything directly in DOM
+      if (dragGhostRef.current) dragGhostRef.current.style.opacity = "0";
+      if (localDropOverlayRef.current) {
+        localDropOverlayRef.current.style.opacity = "0";
+        localDropOverlayRef.current.style.transform = "scale(0.95)";
+      }
+      if (remoteDropOverlayRef.current) {
+        remoteDropOverlayRef.current.style.opacity = "0";
+        remoteDropOverlayRef.current.style.transform = "scale(0.95)";
+      }
+      if (localCancelOverlayRef.current) localCancelOverlayRef.current.style.opacity = "0";
+      if (remoteCancelOverlayRef.current) remoteCancelOverlayRef.current.style.opacity = "0";
+      if (localPaneRef.current) localPaneRef.current.style.background = "";
+      if (remotePaneRef.current) remotePaneRef.current.style.background = "";
+      if (paneContainerRef.current) {
+        paneContainerRef.current.style.userSelect = "";
+        paneContainerRef.current.style.cursor = "";
+      }
     };
+
     const onUp = (e: MouseEvent) => {
       const d = paneDragRef.current;
+      const target = hitTestPaneRef.current(e.clientX, e.clientY);
       cancelDrag();
       if (!d?.active) return;
-      // The click event that follows this mouseup must not toggle selection.
+      
       suppressClickRef.current = true;
       setTimeout(() => { suppressClickRef.current = false; }, 0);
-      const target = hitTestPaneRef.current(e.clientX, e.clientY);
+      
       if (d.source === "local" && target === "remote") transferRef.current.upload(d.paths);
       else if (d.source === "remote" && target === "local") transferRef.current.download(d.paths);
     };
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        const d = paneDragRef.current;
+        if (d && d.active) {
+          cancelDrag();
+        }
+      }
+    };
+
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
     window.addEventListener("blur", cancelDrag);
+    window.addEventListener("keydown", onKeyDown);
     return () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
       window.removeEventListener("blur", cancelDrag);
+      window.removeEventListener("keydown", onKeyDown);
     };
   }, []);
 
@@ -788,26 +972,23 @@ export function SftpView({ tab }: { tab: AppTab }) {
     if (remoteHeaderRef.current) remoteHeaderRef.current.scrollLeft = 0;
   }, [remotePath]);
 
-  // Pane highlights: internal pointer drag hovering the OPPOSITE pane, or
-  // (remote only) an OS file drag hovering the remote pane.
-  const localDropTarget = paneDrag?.source === "remote" && paneDrag.over === "local";
-  const remoteDropTarget =
-    remoteDragOver || (isConnected && paneDrag?.source === "local" && paneDrag.over === "remote");
+  // Pane highlights: (remote only) an OS file drag hovering the remote pane.
+  const remoteDropTarget = remoteDragOver;
 
   return (
     <div
-      className="flex h-full min-h-0 flex-1 flex-col"
-      style={paneDrag ? { userSelect: "none", cursor: "copy" } : undefined}
+      className="flex h-full min-h-0 flex-1 flex-col transition-colors"
     >
       {/* Drag ghost for pointer-based pane-to-pane drags */}
-      {paneDrag && (
-        <div
-          className="pointer-events-none fixed z-50 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-medium text-foreground shadow-lg"
-          style={{ left: paneDrag.x + 14, top: paneDrag.y + 14 }}
-        >
-          {paneDrag.count === 1 ? "1 item" : `${paneDrag.count} items`}
-        </div>
-      )}
+      <div
+        ref={dragGhostRef}
+        className="pointer-events-none fixed z-50 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-medium text-foreground shadow-lg opacity-0 transition-opacity duration-150"
+        style={{
+          left: 0,
+          top: 0,
+          willChange: "transform",
+        }}
+      />
       {/* Transfer progress — fixed bottom sheet, does not affect layout */}
       {(transferOverall || transferError) && (
         <div className="fixed bottom-0 left-0 right-0 z-40 flex h-12 items-center gap-3 border-t border-border bg-[var(--color-surface-2)] px-4 text-xs shadow-[0_-4px_24px_rgba(0,0,0,0.3)]">
@@ -852,12 +1033,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
       {/* Local pane */}
       <div
         ref={localPaneRef}
-        className={`relative flex flex-col border-r border-border overflow-hidden transition-colors ${localDropTarget ? "bg-[var(--color-brand-cyan)]/5" : ""}`}
+        className="relative flex flex-col border-r border-border overflow-hidden transition-colors"
         style={{ width: `${localWidthPct}%` }}
       >
-        {localDropTarget && (
-          <SftpDropOverlay label="Drop to download here" accent="oklch(0.55 0.18 230)" icon={Download} />
-        )}
+        <SftpDropOverlay label="Drop to download here" accent="oklch(0.55 0.18 230)" icon={Download} domRef={localDropOverlayRef} />
+        <SftpCancelOverlay domRef={localCancelOverlayRef} />
         <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4">
           <div className="flex items-center gap-2 text-sm font-medium">
             <span className="flex h-5 w-5 items-center justify-center rounded bg-[oklch(0.55_0.18_230)]">
@@ -1024,9 +1204,13 @@ export function SftpView({ tab }: { tab: AppTab }) {
         className={`relative flex flex-col overflow-hidden transition-colors ${remoteDropTarget ? "bg-[oklch(0.45_0.12_145)]/5" : ""}`}
         style={{ width: `calc(100% - ${localWidthPct}% - 24px)` }}
       >
-        {remoteDropTarget && (
-          <SftpDropOverlay label="Drop to upload here" accent="oklch(0.45 0.12 145)" icon={Upload} />
+        {remoteDragOver && (
+          <div className="pointer-events-none absolute inset-0 z-30">
+            <SftpDropOverlay label="Drop to upload here" accent="oklch(0.45 0.12 145)" icon={Upload} />
+          </div>
         )}
+        <SftpDropOverlay label="Drop to upload here" accent="oklch(0.45 0.12 145)" icon={Upload} domRef={remoteDropOverlayRef} />
+        <SftpCancelOverlay domRef={remoteCancelOverlayRef} />
         <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4">
           <div className="flex items-center gap-2 text-sm font-medium">
             <span className="flex h-5 w-5 items-center justify-center rounded bg-[oklch(0.45_0.12_145)]">

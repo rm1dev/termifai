@@ -186,6 +186,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const notifiedSessionRef = useRef<string | null>(sessionId ?? null);
   const appearanceRequestRef = useRef(0);
 
+
   // Constant per window (the quick-terminal window always passes true).
   const xtermTheme = (theme: AppTheme) =>
     transparentBackground ? { ...theme.xterm, background: "#00000000" } : theme.xterm;
