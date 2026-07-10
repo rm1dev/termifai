@@ -521,14 +521,14 @@ fn run_snippet_script(
     }
 }
 
-#[tauri::command]
-async fn sftp_connect_from_host(
-    app: tauri::AppHandle,
-    host_id: String,
-    session_id: String,
-) -> Result<(), String> {
-    // Resolve credentials synchronously (fast local file reads) before spawning
-    let vault = hosts::list_hosts(&app)?;
+/// Resolve a host from the vault into a ready-to-use SFTP connect request
+/// (host lookup, ssh-key path resolution, password decryption).
+fn build_sftp_request_from_host(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    host_id: &str,
+) -> Result<SftpConnectRequest, String> {
+    let vault = hosts::list_hosts(app)?;
     let host = vault
         .hosts
         .into_iter()
@@ -536,7 +536,7 @@ async fn sftp_connect_from_host(
         .ok_or_else(|| format!("Host '{}' not found", host_id))?;
 
     let private_key_path = if let Some(key_id) = &host.ssh_key_id {
-        let keys = ssh_keys::list_ssh_keys(&app)?;
+        let keys = ssh_keys::list_ssh_keys(app)?;
         keys.into_iter()
             .find(|k| &k.id == key_id)
             .map(|k| k.private_key_path)
@@ -544,15 +544,25 @@ async fn sftp_connect_from_host(
         None
     };
 
-    let request = SftpConnectRequest {
-        session_id: session_id.clone(),
+    Ok(SftpConnectRequest {
+        session_id: session_id.to_string(),
         hostname: host.hostname.clone(),
         port: host.port,
         username: host.user.clone(),
         password: hosts::decrypt_host_password(&host),
         private_key_path,
         default_remote_path: host.default_sftp_path.clone(),
-    };
+    })
+}
+
+#[tauri::command]
+async fn sftp_connect_from_host(
+    app: tauri::AppHandle,
+    host_id: String,
+    session_id: String,
+) -> Result<(), String> {
+    // Resolve credentials synchronously (fast local file reads) before spawning
+    let request = build_sftp_request_from_host(&app, &session_id, &host_id)?;
 
     // Spawn blocking work in background — command returns immediately so the
     // loading screen appears before any network round-trips begin.
