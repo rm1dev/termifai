@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, forwardRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
 import { subscribe } from "@/lib/api/transport";
-import { openSettingsWindow, quitApp } from "@/lib/api/terminal";
+import { forceQuitApp, openSettingsWindow, quitApp } from "@/lib/api/terminal";
 import { listSshKeys } from "@/lib/api/ssh-keys";
 import {
   Server,
@@ -73,7 +73,18 @@ const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = 
   // { key: "logs", label: "Logs", icon: ClipboardList },
 ];
 
-export function AppShell() {
+export interface AppShellProps {
+  /**
+   * "main" (default): standard window with window controls and drag region.
+   * "quick-terminal": Quake-style drop-down panel with glassmorphism,
+   * no window dragging, no window controls, and a close (×) button in the tab
+   * bar that collapses the panel via `onRequestClose`.
+   */
+  variant?: "main" | "quick-terminal";
+  onRequestClose?: () => void;
+}
+
+export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {}) {
   const [tabs, setTabs] = useState<AppTab[]>([
     { id: "t-vaults", kind: "vaults", title: "Hosts", closable: false },
     { id: "t-term", kind: "terminal", title: "Local Terminal", closable: true },
@@ -223,6 +234,38 @@ export function AppShell() {
     };
   }, []);
 
+  const [mainWindowOpacity, setMainWindowOpacity] = useState(0.7);
+
+  useEffect(() => {
+    if (variant === "main") {
+      const loadOpacity = () => {
+        try {
+          const stored = localStorage.getItem("termifai:main-window-opacity");
+          setMainWindowOpacity(stored ? parseFloat(stored) : 0.7);
+        } catch {
+          setMainWindowOpacity(0.7);
+        }
+      };
+      loadOpacity();
+
+      const unlistenPromise = subscribe<number>("main-window:opacity-changed", (event) => {
+        setMainWindowOpacity(event.payload);
+      });
+
+      const targets = [
+        document.documentElement,
+        document.body,
+        document.getElementById("root"),
+      ].filter((el): el is HTMLElement => el !== null);
+      const previous = targets.map((el) => el.style.backgroundColor);
+      targets.forEach((el) => (el.style.backgroundColor = "transparent"));
+
+      return () => {
+        void unlistenPromise.then((un) => un());
+        targets.forEach((el, i) => (el.style.backgroundColor = previous[i]));
+      };
+    }
+  }, [variant]);
 
   useEffect(() => {
     newTabRef.current = newTab;
@@ -299,14 +342,18 @@ export function AppShell() {
       })
       .catch(() => {});
 
-    subscribe("menu-new-terminal", () => {
-      newTabRef.current("terminal");
-    })
-      .then((unlisten) => {
-        if (destroyed) { unlisten(); return; }
-        unlistenMenuNewTerminal = unlisten;
+    // The macOS menu event broadcasts to every window; only the main shell
+    // should react, or a quick-terminal shell would also grow a tab.
+    if (variant === "main") {
+      subscribe("menu-new-terminal", () => {
+        newTabRef.current("terminal");
       })
-      .catch(() => {});
+        .then((unlisten) => {
+          if (destroyed) { unlisten(); return; }
+          unlistenMenuNewTerminal = unlisten;
+        })
+        .catch(() => {});
+    }
 
     return () => {
       destroyed = true;
@@ -318,9 +365,16 @@ export function AppShell() {
   }, []);
 
   const tab = tabs.find((t) => t.id === activeTab);
+  const glassClasses = variant === "main" ? "qt-glass" : "";
+  const alphaStyle = variant === "main" ? { ["--qt-alpha" as string]: mainWindowOpacity } : {};
 
   return (
-    <div className="flex h-screen w-screen flex-col bg-background text-foreground">
+    <div
+      className={`flex flex-col bg-background text-foreground ${glassClasses} ${
+        variant === "quick-terminal" ? "h-full w-full" : "h-screen w-screen"
+      }`}
+      style={alphaStyle}
+    >
       <TitleBar
         tabs={tabs}
         activeTab={activeTab}
@@ -330,6 +384,9 @@ export function AppShell() {
         onRename={renameTab}
         onReorder={reorderTab}
         platform={platform}
+        variant={variant}
+        onRequestClose={onRequestClose}
+        transparentBg={variant === "quick-terminal" || (variant === "main" && mainWindowOpacity < 1.0)}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -351,6 +408,7 @@ export function AppShell() {
                 isActive={t.id === activeTab}
                 onClose={() => closeTab(t.id)}
                 onSessionCreated={(sid) => updateTabSession(t.id, sid)}
+                transparentBackground={variant === "quick-terminal" || (variant === "main" && mainWindowOpacity < 1.0)}
               />
             </div>
           ) : null
@@ -408,6 +466,9 @@ function TitleBar({
   onRename,
   onReorder,
   platform,
+  variant,
+  onRequestClose,
+  transparentBg,
 }: {
   tabs: AppTab[];
   activeTab: string;
@@ -417,7 +478,13 @@ function TitleBar({
   onRename: (id: string, title: string) => void;
   onReorder: (fromId: string, toId: string) => void;
   platform: string;
+  variant: "main" | "quick-terminal";
+  onRequestClose?: () => void;
+  transparentBg?: boolean;
 }) {
+  const isQuickTerminal = variant === "quick-terminal";
+  const dragRegion = isQuickTerminal ? {} : { "data-tauri-drag-region": true };
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   );
@@ -444,17 +511,22 @@ function TitleBar({
   const closableTabs = tabs.filter((t) => t.closable);
 
   return (
-    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none" data-tauri-drag-region>
+    <div
+      className={`flex h-11 shrink-0 items-center border-b border-border select-none ${
+        transparentBg ? "bg-transparent" : "bg-[var(--color-surface)]"
+      }`}
+      {...dragRegion}
+    >
       {/* Space for native macOS traffic lights — collapses in fullscreen, where they hide */}
-      {platform === "macos" && (
+      {!isQuickTerminal && platform === "macos" && (
         <div
           className="h-full shrink-0 flex items-center overflow-hidden transition-[width] duration-200"
           style={{ width: isFullscreen ? 0 : 80 }}
         />
       )}
-      {platform !== "macos" && <div className="w-3 h-full shrink-0" />}
+      {(isQuickTerminal || platform !== "macos") && <div className="w-3 h-full shrink-0" />}
 
-      <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" data-tauri-drag-region>
+      <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" {...dragRegion}>
         {/* Pinned tabs (Hosts) — outside DnD, immovable */}
         {pinnedTabs.map((t) => (
           <BaseTabChip
@@ -468,7 +540,7 @@ function TitleBar({
         ))}
 
         {/* Closable tabs — inside DnD, cannot pass Hosts */}
-        <div className="flex flex-1 items-end gap-1" data-tauri-drag-region>
+        <div className="flex flex-1 items-end gap-1" {...dragRegion}>
           <DndContext
             sensors={sensors}
             collisionDetection={closestCenter}
@@ -500,11 +572,22 @@ function TitleBar({
       </div>
 
       {/* Linux/Windows: hamburger app menu + window controls */}
-      {platform !== "macos" && (
-        <>
-          <AppHamburgerMenu onNew={onNew} />
-          <WindowControls />
-        </>
+      {isQuickTerminal ? (
+        <button
+          onClick={() => onRequestClose?.()}
+          title="Close Quick Terminal"
+          className="mr-2 flex h-8 w-8 shrink-0 items-center justify-center self-center rounded-md text-muted-foreground outline-none hover:bg-[var(--color-surface-2)] hover:text-foreground focus:outline-none transition-colors"
+          aria-label="Close Quick Terminal"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      ) : (
+        platform !== "macos" && (
+          <>
+            <AppHamburgerMenu onNew={onNew} />
+            <WindowControls />
+          </>
+        )
       )}
     </div>
   );
@@ -563,6 +646,9 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
         <DropdownMenuItem onSelect={() => void quitApp()}>
           Quit
           <span className="ml-auto text-xs text-muted-foreground">Alt+F4</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void forceQuitApp()}>
+          Force Quit
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
