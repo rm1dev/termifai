@@ -16,6 +16,14 @@ export function createSession(request: CreateSessionRequest): Promise<SessionInf
   return call<SessionInfo>("create_session", { ...request });
 }
 
+/**
+ * Drains folder paths queued by the macOS FinderSync extension ("Open in
+ * Termifai"). Called on mount and whenever `open-folder-pending` fires.
+ */
+export function takePendingOpenFolders(): Promise<string[]> {
+  return call<string[]>("take_pending_open_folders");
+}
+
 export function writeToSession(sessionId: string, data: string): Promise<void> {
   return call<void>("write_to_session", { sessionId, data });
 }
@@ -65,6 +73,7 @@ export function quitApp(): Promise<void> {
 
 export interface GeneralSettings {
   runInBackground: boolean;
+  openInContextMenu?: boolean;
 }
 
 export function getGeneralSettings(): Promise<GeneralSettings> {
