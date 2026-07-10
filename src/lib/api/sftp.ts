@@ -13,7 +13,7 @@ export function sftpCall<T>(cmd: string, args?: Record<string, unknown>): Promis
 export async function sftpTransfer(
   sessionId: string,
   command: string,
-  args: Record<string, string>,
+  args: Record<string, unknown>,
 ): Promise<void> {
   let unlisten: (() => void) | undefined;
   try {

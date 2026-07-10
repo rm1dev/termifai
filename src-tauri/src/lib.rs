@@ -68,6 +68,9 @@ struct AppState {
     sftp_manager: Mutex<SftpManager>,
     watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+    transfer_conflict_tx: Mutex<
+        std::collections::HashMap<String, std::sync::mpsc::Sender<sftp::ConflictDecision>>,
+    >,
     dashboard_manager: Mutex<DashboardManager>,
     hosts_store: store::JsonStore<hosts::HostsVault>,
     port_forward_store: store::JsonStore<port_forwarding::PortForwardVault>,
@@ -604,12 +607,47 @@ async fn sftp_download(
             };
             match entry {
                 Ok(entry_arc) => {
+                    let app_conflict = app_bg.clone();
+                    let sid_conflict = sid.clone();
+                    let cancel_conflict = Arc::clone(&cancel_flag);
+                    let prompt = move |info: &sftp::ConflictInfo| -> sftp::ConflictDecision {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        app_conflict
+                            .state::<AppState>()
+                            .transfer_conflict_tx
+                            .lock()
+                            .unwrap()
+                            .insert(sid_conflict.clone(), tx);
+                        let _ = app_conflict.emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
+                        let decision = loop {
+                            if cancel_conflict.load(Ordering::Relaxed) {
+                                break sftp::ConflictDecision::Cancel;
+                            }
+                            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                                Ok(d) => break d,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    break sftp::ConflictDecision::Cancel
+                                }
+                            }
+                        };
+                        app_conflict
+                            .state::<AppState>()
+                            .transfer_conflict_tx
+                            .lock()
+                            .unwrap()
+                            .remove(&sid_conflict);
+                        decision
+                    };
+                    let mut conflicts = sftp::ConflictHandler::new(sftp::ConflictMode::Ask, prompt);
+
                     let entry_guard = entry_arc.lock().unwrap();
-                    entry_guard.download_file(
+                    entry_guard.download_path(
                         &sid,
                         &remote_path,
                         &local_path,
                         Arc::clone(&cancel_flag),
+                        &mut conflicts,
                         move |progress| {
                             let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
                         },
@@ -622,6 +660,11 @@ async fn sftp_download(
         let state = app.state::<AppState>();
         state
             .transfer_cancel_flags
+            .lock()
+            .unwrap()
+            .remove(&session_id);
+        state
+            .transfer_conflict_tx
             .lock()
             .unwrap()
             .remove(&session_id);
@@ -650,6 +693,7 @@ async fn sftp_upload(
     session_id: String,
     local_path: String,
     remote_path: String,
+    overwrite: Option<bool>,
 ) -> Result<(), String> {
     let app_bg = app.clone();
     let sid = session_id.clone();
@@ -671,12 +715,52 @@ async fn sftp_upload(
             };
             match entry {
                 Ok(entry_arc) => {
+                    let app_conflict = app_bg.clone();
+                    let sid_conflict = sid.clone();
+                    let cancel_conflict = Arc::clone(&cancel_flag);
+                    let prompt = move |info: &sftp::ConflictInfo| -> sftp::ConflictDecision {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        app_conflict
+                            .state::<AppState>()
+                            .transfer_conflict_tx
+                            .lock()
+                            .unwrap()
+                            .insert(sid_conflict.clone(), tx);
+                        let _ = app_conflict.emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
+                        let decision = loop {
+                            if cancel_conflict.load(Ordering::Relaxed) {
+                                break sftp::ConflictDecision::Cancel;
+                            }
+                            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                                Ok(d) => break d,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    break sftp::ConflictDecision::Cancel
+                                }
+                            }
+                        };
+                        app_conflict
+                            .state::<AppState>()
+                            .transfer_conflict_tx
+                            .lock()
+                            .unwrap()
+                            .remove(&sid_conflict);
+                        decision
+                    };
+                    let initial_mode = if overwrite.unwrap_or(false) {
+                        sftp::ConflictMode::OverwriteAll
+                    } else {
+                        sftp::ConflictMode::Ask
+                    };
+                    let mut conflicts = sftp::ConflictHandler::new(initial_mode, prompt);
+
                     let entry_guard = entry_arc.lock().unwrap();
-                    entry_guard.upload_file(
+                    entry_guard.upload_path(
                         &sid,
                         &local_path,
                         &remote_path,
                         Arc::clone(&cancel_flag),
+                        &mut conflicts,
                         move |progress| {
                             let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
                         },
@@ -689,6 +773,11 @@ async fn sftp_upload(
         let state = app.state::<AppState>();
         state
             .transfer_cancel_flags
+            .lock()
+            .unwrap()
+            .remove(&session_id);
+        state
+            .transfer_conflict_tx
             .lock()
             .unwrap()
             .remove(&session_id);
@@ -709,6 +798,34 @@ async fn sftp_upload(
         let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
     });
     Ok(())
+}
+
+#[tauri::command]
+fn sftp_resolve_conflict(
+    state: State<AppState>,
+    session_id: String,
+    decision: String,
+) -> Result<(), String> {
+    let decision = match decision.as_str() {
+        "overwrite" => sftp::ConflictDecision::Overwrite,
+        "skip" => sftp::ConflictDecision::Skip,
+        "overwrite_all" => sftp::ConflictDecision::OverwriteAll,
+        "skip_all" => sftp::ConflictDecision::SkipAll,
+        "cancel" => sftp::ConflictDecision::Cancel,
+        other => return Err(format!("Unknown decision '{}'", other)),
+    };
+    let tx = state
+        .transfer_conflict_tx
+        .lock()
+        .unwrap()
+        .remove(&session_id);
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(decision);
+            Ok(())
+        }
+        None => Err("No pending conflict for this session".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -1306,7 +1423,7 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
             .into_owned();
 
         let home = std::env::var("HOME").map(std::path::PathBuf::from).ok();
-        
+
         // 1. KDE Dolphin ServiceMenu
         if let Some(ref h) = home {
             let dir = h.join(".local/share/kservices5/ServiceMenus");
@@ -1619,6 +1736,7 @@ pub fn run() {
             sftp_connect_from_host,
             sftp_disconnect,
             sftp_cancel_transfer,
+            sftp_resolve_conflict,
             sftp_download,
             sftp_upload,
             sftp_list_local,
@@ -1720,6 +1838,7 @@ pub fn run() {
                 sftp_manager: Mutex::new(SftpManager::new()),
                 watch_handles: Mutex::new(std::collections::HashMap::new()),
                 transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
+                transfer_conflict_tx: Mutex::new(std::collections::HashMap::new()),
                 dashboard_manager: Mutex::new(DashboardManager::new()),
                 hosts_store: store::JsonStore::new(vault_dir.join("hosts.json")),
                 port_forward_store: store::JsonStore::new(vault_dir.join("port_forwards.json")),
@@ -1978,7 +2097,8 @@ pub fn run() {
             let show_item =
                 MenuItem::with_id(app, "tray-show", "Show Termifai", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
-            let force_quit_item = MenuItem::with_id(app, "tray-force-quit", "Force Quit", true, None::<&str>)?;
+            let force_quit_item =
+                MenuItem::with_id(app, "tray-force-quit", "Force Quit", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &quit_item, &force_quit_item])?;
             TrayIconBuilder::new()
                 .icon(

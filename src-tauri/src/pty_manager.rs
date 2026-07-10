@@ -609,7 +609,11 @@ mod tests {
             .expect("openpty");
         let _child = pair
             .slave
-            .spawn_command(CommandBuilder::new(if cfg!(windows) { "cmd" } else { "sh" }))
+            .spawn_command(CommandBuilder::new(if cfg!(windows) {
+                "cmd"
+            } else {
+                "sh"
+            }))
             .expect("spawn");
         let writer = pair.master.take_writer().expect("writer");
         mgr.sessions.lock().unwrap().insert(
