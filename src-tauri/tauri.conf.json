@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173",
     "beforeDevCommand": "bun run dev",
-    "beforeBuildCommand": "bun run build"
+    "beforeBuildCommand": "bun run build && bash src-tauri/finder-extension/build.sh"
   },
   "app": {
     "macOSPrivateApi": true,
@@ -20,6 +20,11 @@
     "active": true,
     "targets": "all",
     "externalBin": ["binaries/com.termifai"],
+    "macOS": {
+      "files": {
+        "PlugIns/TermifaiFinder.appex": "finder-extension/build/TermifaiFinder.appex"
+      }
+    },
     "icon": [
       "icons/128x128.png",
       "icons/128x128@2x.png",

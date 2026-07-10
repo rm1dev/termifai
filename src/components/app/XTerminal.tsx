@@ -41,6 +41,7 @@ import { Search } from "lucide-react";
 interface Props {
   sessionId?: string;
   initialCommand?: string;
+  cwd?: string;
   hostId?: string;
   readyMarker?: string;
   connectionLabel?: string;
@@ -162,7 +163,7 @@ function EnumDropdown({
   );
 }
 
-export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated, transparentBackground }: Props) {
+export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated, transparentBackground }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [isConnecting, setIsConnecting] = useState(Boolean(readyMarker && !sessionId));
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
@@ -379,7 +380,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
         let sid = sessionRef.current;
         if (!sid) {
           const info = await createSession({
-            cwd: "",
+            cwd: cwd ?? "",
             initialCommand: initialCommand ?? null,
             hostId: hostId ?? null,
             readyMarker: readyMarker ?? null,
