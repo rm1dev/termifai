@@ -44,6 +44,7 @@ export interface AppTab {
   closable: boolean;
   sessionId?: string; // for terminal tabs to preserve session across switches
   initialCommand?: string;
+  cwd?: string; // starting directory for local terminal tabs
 
   readyMarker?: string;
   connectionLabel?: string;
