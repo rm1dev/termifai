@@ -95,16 +95,25 @@ export function QuickTerminalWindow() {
 
   // ── Resize handle (the only way to resize the panel) ─────────────────────
   const sizeFromPointer = (event: PointerEvent | React.PointerEvent) => {
+    let size = 0;
     switch (edge) {
       case "top":
-        return event.clientY;
+        size = event.clientY;
+        break;
       case "bottom":
-        return window.innerHeight - event.clientY;
+        size = window.innerHeight - event.clientY;
+        break;
       case "left":
-        return event.clientX;
+        size = event.clientX;
+        break;
       case "right":
-        return window.innerWidth - event.clientX;
+        size = window.innerWidth - event.clientX;
+        break;
     }
+    if ((edge === "left" || edge === "right") && size < 500) {
+      return 500;
+    }
+    return size;
   };
 
   const onHandlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
