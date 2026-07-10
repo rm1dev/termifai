@@ -79,7 +79,12 @@ pub fn connect(cfg: &SshConfig, on_stage: impl Fn(&str, &str)) -> Result<Session
         "connecting",
         &format!("Opening TCP connection to {addr}..."),
     );
-    let tcp = TcpStream::connect(&addr).map_err(|e| SshError::Tcp(e.to_string()))?;
+    let sock_addr = std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+        .map_err(|e| SshError::Tcp(e.to_string()))?
+        .next()
+        .ok_or_else(|| SshError::Tcp(format!("Could not resolve {addr}")))?;
+    let tcp = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(10))
+        .map_err(|e| SshError::Tcp(e.to_string()))?;
     tcp.set_read_timeout(Some(Duration::from_secs(15))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(15))).ok();
 
