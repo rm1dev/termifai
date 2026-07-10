@@ -1188,6 +1188,9 @@ fn set_autostart_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), Str
 
 #[tauri::command]
 fn force_quit_app(app: tauri::AppHandle) {
+    // Without this flag the ExitRequested handler treats the exit as a
+    // window close and hides the app instead of quitting it.
+    SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
     global_hotkey::kill_daemon();
     app.exit(0);
 }
@@ -1664,6 +1667,7 @@ pub fn run() {
                         global_hotkey::set_dock_visible(&handle, false);
                     }
                     "custom-force-quit" => {
+                        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
                         global_hotkey::kill_daemon();
                         handle.exit(0);
                     }
