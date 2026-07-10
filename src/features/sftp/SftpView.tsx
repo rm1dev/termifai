@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { sftpCall, sftpTransfer } from "@/lib/api/sftp";
-import { subscribe } from "@/lib/api/transport";
+import { subscribe, subscribeOsDragDrop } from "@/lib/api/transport";
 import {
+  Download,
   File,
   Folder,
   GripVertical,
@@ -9,11 +10,12 @@ import {
   MoreVertical,
   Search,
   Server,
+  Upload,
 } from "lucide-react";
 import { toast } from "sonner";
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { AppTab, Host, LocalFileEntry, RemoteFileEntry, TransferProgress } from "@/components/app/types";
+import type { AppTab, Host, LocalFileEntry, RemoteFileEntry, TransferProgress, SftpConflictInfo } from "@/components/app/types";
 import { SftpContextMenu } from "@/components/app/SftpContextMenu";
 import { SftpRenameDialog } from "@/components/app/SftpRenameDialog";
 import { SftpPermissionsDialog } from "@/components/app/SftpPermissionsDialog";
@@ -94,6 +96,69 @@ function SftpConnectingOverlay({
   );
 }
 
+function SftpDropOverlay({ label, accent, icon: Icon }: {
+  label: string;
+  accent: string;
+  icon: typeof Download;
+}) {
+  return (
+    <div
+      className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center p-4 backdrop-blur-md transition-all duration-300"
+      style={{
+        background: `color-mix(in oklab, ${accent} 12%, rgba(15, 23, 42, 0.45))`,
+      }}
+    >
+      {/* Outer dashed border container */}
+      <div
+        className="absolute inset-4 rounded-xl border-2 border-dashed transition-all duration-300"
+        style={{
+          borderColor: `color-mix(in oklab, ${accent} 40%, transparent)`,
+        }}
+      />
+      
+      {/* Central Glassmorphic Card */}
+      <div
+        className="relative flex flex-col items-center gap-4 rounded-2xl border px-10 py-8 shadow-2xl transition-all duration-300"
+        style={{
+          borderColor: `color-mix(in oklab, ${accent} 30%, rgba(255, 255, 255, 0.08))`,
+          background: "rgba(30, 41, 59, 0.75)",
+          boxShadow: `0 20px 50px rgba(0, 0, 0, 0.5), 0 0 40px color-mix(in oklab, ${accent} 15%, transparent)`,
+        }}
+      >
+        {/* Pulsing Icon Wrapper */}
+        <div
+          className="relative flex h-16 w-16 items-center justify-center rounded-full"
+          style={{
+            background: `color-mix(in oklab, ${accent} 15%, rgba(255, 255, 255, 0.03))`,
+            border: `1px solid color-mix(in oklab, ${accent} 30%, transparent)`,
+          }}
+        >
+          {/* Pulsing glow ring */}
+          <div
+            className="absolute inset-0 animate-ping rounded-full opacity-30"
+            style={{
+              background: accent,
+              animationDuration: "2s",
+            }}
+          />
+          <Icon className="relative h-7 w-7" style={{ color: accent }} />
+        </div>
+
+        {/* Text Details */}
+        <div className="flex flex-col items-center gap-1 text-center">
+          <span className="text-sm font-semibold tracking-wide text-foreground uppercase">
+            {label}
+          </span>
+          <span className="text-[10px] tracking-wide text-muted-foreground uppercase opacity-80">
+            Release to transfer
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -124,6 +189,24 @@ function joinLocalPath(path: string, parts: string[]): string {
 
 function isLocalPathAtRoot(path: string): boolean {
   return path === getLocalPathRoot(path);
+}
+
+// Last path segment, handling both "/" and "\" separators (remote paths, macOS/Linux
+// local paths, Windows local paths, and OS-dropped paths all pass through here).
+function pathBaseName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? "file";
+}
+
+// Tauri types OS drag positions as "physical" pixels but passes wry's raw
+// values through unconverted (PhysicalPosition::new(x as _, y as _)). wry
+// reports LOGICAL (CSS) pixels on macOS (NSView coords) and Linux (GTK coords),
+// and true PHYSICAL pixels only on Windows (WebView2 client coords) — see
+// tauri-apps/tauri#10744. Normalize to CSS/client pixels for DOM hit-testing.
+const IS_WINDOWS = navigator.userAgent.includes("Windows");
+function osDragToClient(pos: { x: number; y: number }): { x: number; y: number } {
+  const scale = IS_WINDOWS ? window.devicePixelRatio || 1 : 1;
+  return { x: pos.x / scale, y: pos.y / scale };
 }
 
 function getLocalParentPath(path: string): string {
@@ -182,8 +265,26 @@ export function SftpView({ tab }: { tab: AppTab }) {
   const [transferProgress, setTransferProgress] = useState<TransferProgress | null>(null);
   const [transferOverall, setTransferOverall] = useState<{ current: number; total: number; fileName: string } | null>(null);
   const [transferError, setTransferError] = useState<string | null>(null);
-  const [localDragOver, setLocalDragOver] = useState(false);
+  // remoteDragOver: highlight while an OS drag (Finder/Explorer) hovers the remote pane.
   const [remoteDragOver, setRemoteDragOver] = useState(false);
+  // paneDrag: pointer-based drag between panes. HTML5 drag & drop is unusable
+  // here — Tauri's native drag handler consumes drops before WKWebView/WebView2
+  // ever dispatches DOM "drop" events — so we implement dragging ourselves.
+  const [paneDrag, setPaneDrag] = useState<{
+    source: "local" | "remote";
+    count: number;
+    x: number;
+    y: number;
+    over: "local" | "remote" | null;
+  } | null>(null);
+  const paneDragRef = useRef<{
+    source: "local" | "remote";
+    paths: string[];
+    startX: number;
+    startY: number;
+    active: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
   const [showHiddenLocal, setShowHiddenLocal] = useState(false);
   const [showHiddenRemote, setShowHiddenRemote] = useState(false);
   const [localMenuOpen, setLocalMenuOpen] = useState(false);
@@ -198,6 +299,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
   // Resizable divider — 50% default
   const [localWidthPct, setLocalWidthPct] = useState(50);
   const paneContainerRef = useRef<HTMLDivElement>(null);
+  const localPaneRef = useRef<HTMLDivElement>(null);
+  const remotePaneRef = useRef<HTMLDivElement>(null);
 
   const onDividerMouseDown = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -232,6 +335,132 @@ export function SftpView({ tab }: { tab: AppTab }) {
     };
   }, [isConnected, sftpSessionId]);
 
+  const [conflict, setConflict] = useState<SftpConflictInfo | null>(null);
+  const [conflictApplyAll, setConflictApplyAll] = useState(false);
+
+  useEffect(() => {
+    if (!isConnected) return;
+    const unlisten = subscribe<SftpConflictInfo>(`sftp:${sftpSessionId}:conflict`, (ev) => {
+      setConflictApplyAll(false);
+      setConflict(ev.payload);
+    });
+    return () => { void unlisten.then((fn) => fn()); };
+  }, [isConnected, sftpSessionId]);
+
+  const resolveConflict = (base: "overwrite" | "skip" | "cancel") => {
+    const decision = base === "cancel" ? "cancel" : conflictApplyAll ? `${base}_all` : base;
+    void sftpCall("sftp_resolve_conflict", { sessionId: sftpSessionId, decision })
+      .catch((e: unknown) => toast.error(String(e)));
+    setConflict(null);
+  };
+
+  // Latest transfer handlers, readable from the mount-once effects below.
+  const transferRef = useRef<{ upload: (p: string[]) => void; download: (p: string[]) => void }>({
+    upload: () => {},
+    download: () => {},
+  });
+  transferRef.current = {
+    upload: (paths) => { if (isConnected) void handleUpload(paths); },
+    download: (paths) => { if (isConnected) void handleDownload(paths); },
+  };
+  const isConnectedRef = useRef(isConnected);
+  isConnectedRef.current = isConnected;
+
+  // Which pane (if any) contains the given CLIENT (CSS px) coordinates.
+  // Hidden panes (inactive tab, display:none) report a zero-size rect.
+  const hitTestPane = (x: number, y: number): "local" | "remote" | null => {
+    const panes = [
+      ["local", localPaneRef.current],
+      ["remote", remotePaneRef.current],
+    ] as const;
+    for (const [pane, el] of panes) {
+      if (!el) continue;
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        return pane;
+      }
+    }
+    return null;
+  };
+  const hitTestPaneRef = useRef(hitTestPane);
+  hitTestPaneRef.current = hitTestPane;
+
+  // OS-level drag-drop (files/folders dragged from Finder/Explorer): HTML5 drop
+  // events carry no real paths in Tauri, so we listen to the webview drag-drop
+  // event and hit-test the remote pane to decide whether to upload.
+  useEffect(() => {
+    const unlisten = subscribeOsDragDrop((ev) => {
+      if (ev.type === "enter" || ev.type === "over") {
+        const p = osDragToClient(ev.position);
+        setRemoteDragOver(isConnectedRef.current && hitTestPaneRef.current(p.x, p.y) === "remote");
+      } else if (ev.type === "leave") {
+        setRemoteDragOver(false);
+      } else if (ev.type === "drop") {
+        setRemoteDragOver(false);
+        if (ev.paths.length > 0) {
+          const p = osDragToClient(ev.position);
+          if (hitTestPaneRef.current(p.x, p.y) === "remote") {
+            transferRef.current.upload(ev.paths);
+          }
+        }
+      }
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  // Pointer-based drag between panes: armed on row mousedown, becomes an active
+  // drag after ~8px of movement, transfers on mouseup over the opposite pane.
+  const beginPaneDrag = (source: "local" | "remote", path: string, e: React.MouseEvent) => {
+    if (e.button !== 0) return;
+    const selected = source === "local" ? selectedLocal : selectedRemote;
+    const paths = selected.has(path) ? [...selected] : [path];
+    paneDragRef.current = { source, paths, startX: e.clientX, startY: e.clientY, active: false };
+  };
+
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const d = paneDragRef.current;
+      if (!d) return;
+      if (!d.active) {
+        if (Math.abs(e.clientX - d.startX) + Math.abs(e.clientY - d.startY) < 8) return;
+        d.active = true;
+      }
+      e.preventDefault(); // suppress text selection while dragging
+      setPaneDrag({
+        source: d.source,
+        count: d.paths.length,
+        x: e.clientX,
+        y: e.clientY,
+        over: hitTestPaneRef.current(e.clientX, e.clientY),
+      });
+    };
+    const cancelDrag = () => {
+      paneDragRef.current = null;
+      setPaneDrag(null);
+    };
+    const onUp = (e: MouseEvent) => {
+      const d = paneDragRef.current;
+      cancelDrag();
+      if (!d?.active) return;
+      // The click event that follows this mouseup must not toggle selection.
+      suppressClickRef.current = true;
+      setTimeout(() => { suppressClickRef.current = false; }, 0);
+      const target = hitTestPaneRef.current(e.clientX, e.clientY);
+      if (d.source === "local" && target === "remote") transferRef.current.upload(d.paths);
+      else if (d.source === "remote" && target === "local") transferRef.current.download(d.paths);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("blur", cancelDrag);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("blur", cancelDrag);
+    };
+  }, []);
+
   // Listen for file-changed events (remote watch)
   useEffect(() => {
     if (!sftpSessionId) return;
@@ -249,6 +478,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
   }, [sftpSessionId]);
 
   const handleLocalClick = (e: React.MouseEvent, path: string) => {
+    if (suppressClickRef.current) return; // click that ended a pane drag
     if (e.shiftKey && lastLocalClick) {
       const paths = localFiles.map((f) => f.path);
       const a = paths.indexOf(lastLocalClick);
@@ -273,6 +503,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
   };
 
   const handleRemoteClick = (e: React.MouseEvent, path: string) => {
+    if (suppressClickRef.current) return; // click that ended a pane drag
     if (e.shiftKey && lastRemoteClick) {
       const paths = remoteFiles.map((f) => f.path);
       const a = paths.indexOf(lastRemoteClick);
@@ -304,7 +535,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
     try {
       for (let i = 0; i < targets.length; i++) {
         const rp = targets[i];
-        const fileName = rp.split("/").pop() ?? "file";
+        const fileName = pathBaseName(rp);
         setTransferOverall({ current: i + 1, total: targets.length, fileName });
         await sftpTransfer(sftpSessionId, "sftp_download", {
           sessionId: sftpSessionId,
@@ -334,7 +565,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
     try {
       for (let i = 0; i < targets.length; i++) {
         const lp = targets[i];
-        const fileName = lp.split("/").pop() ?? "file";
+        const fileName = pathBaseName(lp);
         setTransferOverall({ current: i + 1, total: targets.length, fileName });
         await sftpTransfer(sftpSessionId, "sftp_upload", {
           sessionId: sftpSessionId,
@@ -557,8 +788,26 @@ export function SftpView({ tab }: { tab: AppTab }) {
     if (remoteHeaderRef.current) remoteHeaderRef.current.scrollLeft = 0;
   }, [remotePath]);
 
+  // Pane highlights: internal pointer drag hovering the OPPOSITE pane, or
+  // (remote only) an OS file drag hovering the remote pane.
+  const localDropTarget = paneDrag?.source === "remote" && paneDrag.over === "local";
+  const remoteDropTarget =
+    remoteDragOver || (isConnected && paneDrag?.source === "local" && paneDrag.over === "remote");
+
   return (
-    <div className="flex h-full min-h-0 flex-1 flex-col">
+    <div
+      className="flex h-full min-h-0 flex-1 flex-col"
+      style={paneDrag ? { userSelect: "none", cursor: "copy" } : undefined}
+    >
+      {/* Drag ghost for pointer-based pane-to-pane drags */}
+      {paneDrag && (
+        <div
+          className="pointer-events-none fixed z-50 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-medium text-foreground shadow-lg"
+          style={{ left: paneDrag.x + 14, top: paneDrag.y + 14 }}
+        >
+          {paneDrag.count === 1 ? "1 item" : `${paneDrag.count} items`}
+        </div>
+      )}
       {/* Transfer progress — fixed bottom sheet, does not affect layout */}
       {(transferOverall || transferError) && (
         <div className="fixed bottom-0 left-0 right-0 z-40 flex h-12 items-center gap-3 border-t border-border bg-[var(--color-surface-2)] px-4 text-xs shadow-[0_-4px_24px_rgba(0,0,0,0.3)]">
@@ -602,20 +851,13 @@ export function SftpView({ tab }: { tab: AppTab }) {
       <div ref={paneContainerRef} className="flex min-h-0 flex-1">
       {/* Local pane */}
       <div
-        className={`flex flex-col border-r border-border overflow-hidden transition-colors ${localDragOver ? "bg-[var(--color-brand-cyan)]/5" : ""}`}
+        ref={localPaneRef}
+        className={`relative flex flex-col border-r border-border overflow-hidden transition-colors ${localDropTarget ? "bg-[var(--color-brand-cyan)]/5" : ""}`}
         style={{ width: `${localWidthPct}%` }}
-        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setLocalDragOver(true); }}
-        onDragLeave={() => setLocalDragOver(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setLocalDragOver(false);
-          const data = e.dataTransfer.getData("application/x-sftp-remote");
-          if (data) {
-            const paths: string[] = JSON.parse(data);
-            void handleDownload(paths);
-          }
-        }}
       >
+        {localDropTarget && (
+          <SftpDropOverlay label="Drop to download here" accent="oklch(0.55 0.18 230)" icon={Download} />
+        )}
         <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4">
           <div className="flex items-center gap-2 text-sm font-medium">
             <span className="flex h-5 w-5 items-center justify-center rounded bg-[oklch(0.55_0.18_230)]">
@@ -736,12 +978,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
                     onEditPermissions={() => {}}
                   >
                   <div
-                    draggable={!f.is_dir}
-                    onDragStart={(e) => {
-                      const toDrag = selectedLocal.has(f.path) ? [...selectedLocal].filter((p) => !localFiles.find((lf) => lf.path === p)?.is_dir) : [f.path];
-                      e.dataTransfer.setData("application/x-sftp-local", JSON.stringify(toDrag));
-                      e.dataTransfer.effectAllowed = "copy";
-                    }}
+                    onMouseDown={(e) => beginPaneDrag("local", f.path, e)}
                     className={`grid min-w-[560px] grid-cols-[1fr_180px_100px_80px] cursor-pointer items-center px-4 py-2 text-sm ${
                       selectedLocal.has(f.path)
                         ? "bg-[var(--color-brand-cyan)]/10 ring-1 ring-inset ring-[var(--color-brand-cyan)]/20"
@@ -783,20 +1020,13 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
       {/* Remote pane */}
       <div
-        className={`flex flex-col overflow-hidden transition-colors ${remoteDragOver ? "bg-[oklch(0.45_0.12_145)]/5" : ""}`}
+        ref={remotePaneRef}
+        className={`relative flex flex-col overflow-hidden transition-colors ${remoteDropTarget ? "bg-[oklch(0.45_0.12_145)]/5" : ""}`}
         style={{ width: `calc(100% - ${localWidthPct}% - 24px)` }}
-        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; setRemoteDragOver(true); }}
-        onDragLeave={() => setRemoteDragOver(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          setRemoteDragOver(false);
-          const data = e.dataTransfer.getData("application/x-sftp-local");
-          if (data) {
-            const paths: string[] = JSON.parse(data);
-            void handleUpload(paths);
-          }
-        }}
       >
+        {remoteDropTarget && (
+          <SftpDropOverlay label="Drop to upload here" accent="oklch(0.45 0.12 145)" icon={Upload} />
+        )}
         <div className="flex h-11 items-center justify-between border-b border-border bg-[var(--color-surface)] px-4">
           <div className="flex items-center gap-2 text-sm font-medium">
             <span className="flex h-5 w-5 items-center justify-center rounded bg-[oklch(0.45_0.12_145)]">
@@ -988,12 +1218,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
                         onEditPermissions={() => setPermTarget(f.path)}
                       >
                       <div
-                        draggable={!f.is_dir}
-                        onDragStart={(e) => {
-                          const toDrag = selectedRemote.has(f.path) ? [...selectedRemote].filter((p) => !remoteFiles.find((rf) => rf.path === p)?.is_dir) : [f.path];
-                          e.dataTransfer.setData("application/x-sftp-remote", JSON.stringify(toDrag));
-                          e.dataTransfer.effectAllowed = "copy";
-                        }}
+                        onMouseDown={(e) => beginPaneDrag("remote", f.path, e)}
                         className={`grid min-w-[500px] grid-cols-[1fr_160px_90px_70px] cursor-pointer items-center px-4 py-2 text-sm ${
                           selectedRemote.has(f.path)
                             ? "bg-[oklch(0.45_0.12_145)]/10 ring-1 ring-inset ring-[oklch(0.45_0.12_145)]/20"
@@ -1054,6 +1279,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
                       sessionId: sftpSessionId,
                       localPath: watchedFile.tmpPath,
                       remotePath: watchedFile.remotePath,
+                      overwrite: true,
                     });
                     await sftpCall("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
                     setWatchedFile(null);
@@ -1220,6 +1446,69 @@ export function SftpView({ tab }: { tab: AppTab }) {
                   Cancel transfer &amp; disconnect
                 </button>
               </AlertDialog.Action>
+            </div>
+          </AlertDialog.Content>
+        </AlertDialog.Portal>
+      </AlertDialog.Root>
+
+      {/* Transfer conflict dialog */}
+      <AlertDialog.Root open={conflict !== null}>
+        <AlertDialog.Portal>
+          <AlertDialog.Overlay className="fixed inset-0 z-50 bg-black/40" />
+          <AlertDialog.Content className="fixed left-1/2 top-1/2 z-50 w-[26rem] -translate-x-1/2 -translate-y-1/2 rounded-lg border border-border bg-[var(--color-surface-2)] p-5 shadow-xl">
+            <AlertDialog.Title className="text-sm font-medium text-foreground">
+              {conflict?.kind === "dir" ? "Folder already exists" : "File already exists"}
+            </AlertDialog.Title>
+            <AlertDialog.Description className="mt-2 text-xs text-muted-foreground">
+              <span className="font-medium text-foreground">"{conflict?.file_name}"</span>{" "}
+              already exists at the {conflict?.direction === "upload" ? "remote" : "local"} destination.
+              {conflict?.kind === "dir"
+                ? " Merging will keep its contents and overwrite files with the same name."
+                : " Overwriting will replace the existing file."}
+            </AlertDialog.Description>
+            {conflict && conflict.kind === "file" && (
+              <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                <div className="rounded-md border border-border p-2">
+                  <div className="mb-1 font-medium text-foreground">Existing</div>
+                  <div className="text-muted-foreground">{conflict.existing_size != null ? formatBytes(conflict.existing_size) : "—"}</div>
+                  <div className="text-muted-foreground">{conflict.existing_modified ?? "—"}</div>
+                </div>
+                <div className="rounded-md border border-border p-2">
+                  <div className="mb-1 font-medium text-foreground">Replacing with</div>
+                  <div className="text-muted-foreground">{conflict.incoming_size != null ? formatBytes(conflict.incoming_size) : "—"}</div>
+                  <div className="text-muted-foreground">{conflict.incoming_modified ?? "—"}</div>
+                </div>
+              </div>
+            )}
+            <label className="mt-3 flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={conflictApplyAll}
+                onChange={(e) => setConflictApplyAll(e.target.checked)}
+                className="h-3.5 w-3.5 accent-[var(--color-brand-cyan)]"
+              />
+              Apply to all remaining conflicts
+            </label>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="rounded px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
+                onClick={() => resolveConflict("cancel")}
+              >
+                Cancel transfer
+              </button>
+              <button
+                autoFocus
+                className="rounded border border-border px-3 py-1.5 text-sm text-foreground hover:bg-white/5"
+                onClick={() => resolveConflict("skip")}
+              >
+                Skip
+              </button>
+              <button
+                className="rounded bg-[var(--color-brand-cyan)] px-3 py-1.5 text-sm font-medium text-black"
+                onClick={() => resolveConflict("overwrite")}
+              >
+                {conflict?.kind === "dir" ? "Merge" : "Overwrite"}
+              </button>
             </div>
           </AlertDialog.Content>
         </AlertDialog.Portal>
