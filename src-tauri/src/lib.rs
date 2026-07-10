@@ -1878,7 +1878,7 @@ pub fn run() {
                     .accelerator("CmdOrCtrl+Q")
                     .build(app)?;
                 let custom_force_quit = MenuItemBuilder::with_id("custom-force-quit", "Force Quit")
-                    .accelerator("CmdOrCtrl+Shift+Q")
+                    .accelerator("CmdOrCtrl+Alt+Q")
                     .build(app)?;
 
                 let file_menu = SubmenuBuilder::new(app, "File")
