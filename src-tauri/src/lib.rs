@@ -68,9 +68,8 @@ struct AppState {
     sftp_manager: Mutex<SftpManager>,
     watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
-    transfer_conflict_tx: Mutex<
-        std::collections::HashMap<String, std::sync::mpsc::Sender<sftp::ConflictDecision>>,
-    >,
+    transfer_conflict_tx:
+        Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<sftp::ConflictDecision>>>,
     dashboard_manager: Mutex<DashboardManager>,
     hosts_store: store::JsonStore<hosts::HostsVault>,
     port_forward_store: store::JsonStore<port_forwarding::PortForwardVault>,
@@ -555,8 +554,10 @@ async fn sftp_connect_from_host(
 }
 
 #[tauri::command]
-fn sftp_list_local(path: String) -> Result<Vec<LocalFileEntry>, String> {
-    sftp::list_local(&path)
+async fn sftp_list_local(path: String) -> Result<Vec<LocalFileEntry>, String> {
+    tokio::task::spawn_blocking(move || sftp::list_local(&path))
+        .await
+        .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
@@ -567,17 +568,22 @@ fn get_home_dir() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn sftp_list_remote(
-    state: State<AppState>,
+async fn sftp_list_remote(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
 ) -> Result<Vec<RemoteFileEntry>, String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.list_remote(&path)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.list_remote(&path)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
@@ -618,7 +624,8 @@ async fn sftp_download(
                             .lock()
                             .unwrap()
                             .insert(sid_conflict.clone(), tx);
-                        let _ = app_conflict.emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
+                        let _ = app_conflict
+                            .emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
                         let decision = loop {
                             if cancel_conflict.load(Ordering::Relaxed) {
                                 break sftp::ConflictDecision::Cancel;
@@ -726,7 +733,8 @@ async fn sftp_upload(
                             .lock()
                             .unwrap()
                             .insert(sid_conflict.clone(), tx);
-                        let _ = app_conflict.emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
+                        let _ = app_conflict
+                            .emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
                         let decision = loop {
                             if cancel_conflict.load(Ordering::Relaxed) {
                                 break sftp::ConflictDecision::Cancel;
@@ -829,46 +837,61 @@ fn sftp_resolve_conflict(
 }
 
 #[tauri::command]
-fn sftp_delete_remote(
-    state: State<AppState>,
+async fn sftp_delete_remote(
+    app: tauri::AppHandle,
     session_id: String,
     paths: Vec<String>,
 ) -> Result<(), String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.delete_remote(&paths)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.delete_remote(&paths)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_rename_remote(
-    state: State<AppState>,
+async fn sftp_rename_remote(
+    app: tauri::AppHandle,
     session_id: String,
     from_path: String,
     to_path: String,
 ) -> Result<(), String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.rename_remote(&from_path, &to_path)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.rename_remote(&from_path, &to_path)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_mkdir_remote(
-    state: State<AppState>,
+async fn sftp_mkdir_remote(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.mkdir_remote(&path)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.mkdir_remote(&path)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
@@ -887,58 +910,79 @@ fn sftp_cancel_transfer(state: State<AppState>, session_id: String) -> Result<()
 }
 
 #[tauri::command]
-fn sftp_stat_remote(
-    state: State<AppState>,
+async fn sftp_stat_remote(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
 ) -> Result<sftp::RemoteStatResult, String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.stat_remote(&path)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.stat_remote(&path)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
-    let dest = p.parent().ok_or("No parent dir")?.join(&new_name);
-    std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
+async fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        let dest = p.parent().ok_or("No parent dir")?.join(&new_name);
+        std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
-    for path in &paths {
-        let p = std::path::Path::new(path);
-        if p.is_dir() {
-            std::fs::remove_dir_all(p).map_err(|e| format!("Delete dir '{}': {}", path, e))?;
-        } else {
-            std::fs::remove_file(p).map_err(|e| format!("Delete '{}': {}", path, e))?;
+async fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        for path in &paths {
+            let p = std::path::Path::new(path);
+            if p.is_dir() {
+                std::fs::remove_dir_all(p).map_err(|e| format!("Delete dir '{}': {}", path, e))?;
+            } else {
+                std::fs::remove_file(p).map_err(|e| format!("Delete '{}': {}", path, e))?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_mkdir_local(path: String) -> Result<(), String> {
-    std::fs::create_dir_all(&path).map_err(|e| format!("Create dir '{}': {}", path, e))
+async fn sftp_mkdir_local(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&path).map_err(|e| format!("Create dir '{}': {}", path, e))
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_copy_local(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
-    let dest = std::path::Path::new(&dest_dir);
-    for path in &paths {
-        let src = std::path::Path::new(path);
-        let name = src.file_name().ok_or("No file name")?;
-        let target = dest.join(name);
-        if src.is_dir() {
-            copy_dir_all(src, &target).map_err(|e| format!("Copy dir '{}': {}", path, e))?;
-        } else {
-            std::fs::copy(src, &target).map_err(|e| format!("Copy '{}': {}", path, e))?;
+async fn sftp_copy_local(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let dest = std::path::Path::new(&dest_dir);
+        for path in &paths {
+            let src = std::path::Path::new(path);
+            let name = src.file_name().ok_or("No file name")?;
+            let target = dest.join(name);
+            if src.is_dir() {
+                copy_dir_all(src, &target).map_err(|e| format!("Copy dir '{}': {}", path, e))?;
+            } else {
+                std::fs::copy(src, &target).map_err(|e| format!("Copy '{}': {}", path, e))?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
@@ -1088,51 +1132,66 @@ fn sftp_stop_watch(state: State<AppState>, tmp_path: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn sftp_chmod(
-    state: State<AppState>,
+async fn sftp_chmod(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
     mode: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.chmod(&path, &mode, recursive)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.chmod(&path, &mode, recursive)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_chown(
-    state: State<AppState>,
+async fn sftp_chown(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
     user: String,
     group: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.chown(&path, &user, &group, recursive)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.chown(&path, &user, &group, recursive)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_copy_remote(
-    state: State<AppState>,
+async fn sftp_copy_remote(
+    app: tauri::AppHandle,
     session_id: String,
     paths: Vec<String>,
     dest_dir: String,
 ) -> Result<(), String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.copy_remote(&paths, &dest_dir)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.copy_remote(&paths, &dest_dir)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]

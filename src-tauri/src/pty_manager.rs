@@ -117,6 +117,43 @@ impl PtyManager {
         let mut connection_tracker = ConnectionTracker::new(app.clone(), ready_marker.as_deref());
         connection_tracker.start();
 
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let event_name_clone = event_name.clone();
+        let app_handle_clone = app.clone();
+        thread::spawn(move || {
+            let mut buffer = String::new();
+            let mut last_flush = std::time::Instant::now();
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(data) => {
+                        buffer.push_str(&data);
+                        if buffer.len() >= 8192
+                            || last_flush.elapsed() >= std::time::Duration::from_millis(10)
+                        {
+                            if !buffer.is_empty() {
+                                let _ = app_handle_clone.emit(&event_name_clone, &buffer);
+                                buffer.clear();
+                            }
+                            last_flush = std::time::Instant::now();
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if !buffer.is_empty() {
+                            let _ = app_handle_clone.emit(&event_name_clone, &buffer);
+                            buffer.clear();
+                        }
+                        last_flush = std::time::Instant::now();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if !buffer.is_empty() {
+                            let _ = app_handle_clone.emit(&event_name_clone, &buffer);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut recent_output = String::new();
@@ -130,8 +167,7 @@ impl PtyManager {
                             connection_tracker.fail_current(
                                 "Connection failed before the SSH session became ready.",
                             );
-                            let _ = app_handle.emit(
-                                &event_name,
+                            let _ = tx.send(
                                 "\r\n\x1b[31mConnection failed before SSH session became ready.\x1b[0m\r\n"
                                     .to_string(),
                             );
@@ -168,7 +204,7 @@ impl PtyManager {
                             }
                         }
                         if ready {
-                            let _ = app_handle.emit(&event_name, data);
+                            let _ = tx.send(data);
                         } else if let Some(marker) = ready_marker.as_deref() {
                             pending_output.push_str(&data);
                             if let Some(marker_end) =
@@ -176,13 +212,13 @@ impl PtyManager {
                             {
                                 ready = true;
                                 connection_tracker.complete();
-                                let _ = app_handle.emit(&event_name, "\x1b[2J\x1b[H".to_string());
+                                let _ = tx.send("\x1b[2J\x1b[H".to_string());
                                 let cleaned = pending_output[marker_end..]
                                     .trim_start_matches('\r')
                                     .trim_start_matches('\n')
                                     .to_string();
                                 if !cleaned.is_empty() {
-                                    let _ = app_handle.emit(&event_name, cleaned);
+                                    let _ = tx.send(cleaned);
                                 }
                                 pending_output.clear();
                             } else if pending_output.len() > 8192 {
@@ -196,8 +232,7 @@ impl PtyManager {
                             connection_tracker.fail_current(
                                 "Connection failed before the SSH session became ready.",
                             );
-                            let _ = app_handle.emit(
-                                &event_name,
+                            let _ = tx.send(
                                 "\r\n\x1b[31mConnection failed before SSH session became ready.\x1b[0m\r\n"
                                     .to_string(),
                             );
