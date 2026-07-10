@@ -5,6 +5,7 @@ mod port_forwarding;
 mod pty_manager;
 mod quick_terminal;
 mod sftp;
+mod snippet_exec;
 mod snippets;
 mod ssh;
 mod ssh_keys;
