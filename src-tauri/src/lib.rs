@@ -2007,6 +2007,11 @@ pub fn run() {
                 tombstones_store: store::JsonStore::new(vault_dir.join("tombstones.json")),
                 sync_state_store: store::JsonStore::new(vault_dir.join("sync_state.json")),
             });
+            // One-time move of legacy inline snippet scripts into .sh files.
+            // Non-fatal: a failure keeps scripts inline (still readable).
+            if let Err(e) = snippets::migrate_inline_scripts(app.handle()) {
+                eprintln!("Snippet script migration failed: {}", e);
+            }
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
             // Also set UTF-8 (codepage 65001) so ConPTY correctly interprets multi-byte

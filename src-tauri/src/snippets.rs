@@ -37,23 +37,21 @@ fn get_snippets_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(snippets_dir)
 }
 
-fn read_script_file(app: &AppHandle, id: &str) -> Option<String> {
-    let dir = get_snippets_dir(app).ok()?;
-    let path = dir.join(format!("{}.sh", id));
-    std::fs::read_to_string(path).ok()
+fn script_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    dir.join(format!("{}.sh", id))
 }
 
-fn write_script_file(app: &AppHandle, id: &str, content: &str) -> Result<(), String> {
-    let dir = get_snippets_dir(app)?;
-    let path = dir.join(format!("{}.sh", id));
-    std::fs::write(path, content).map_err(|e| format!("Failed to write script file: {}", e))
+fn read_script_file(dir: &std::path::Path, id: &str) -> Option<String> {
+    std::fs::read_to_string(script_path(dir, id)).ok()
 }
 
-fn delete_script_file(app: &AppHandle, id: &str) {
-    if let Ok(dir) = get_snippets_dir(app) {
-        let path = dir.join(format!("{}.sh", id));
-        let _ = std::fs::remove_file(path);
-    }
+fn write_script_file(dir: &std::path::Path, id: &str, content: &str) -> Result<(), String> {
+    std::fs::write(script_path(dir, id), content)
+        .map_err(|e| format!("Failed to write script file: {}", e))
+}
+
+fn delete_script_file(dir: &std::path::Path, id: &str) {
+    let _ = std::fs::remove_file(script_path(dir, id));
 }
 
 pub fn list_snippets(app: &AppHandle) -> Result<Vec<Snippet>, String> {
@@ -63,34 +61,57 @@ pub fn list_snippets(app: &AppHandle) -> Result<Vec<Snippet>, String> {
         .load_with_migration(migrate_snippets_vault)
         .map_err(|e| e.to_string())?;
 
+    let dir = get_snippets_dir(app)?;
     let mut snippets = vault.snippets;
-    let mut migrated_any = false;
-
     for snippet in &mut snippets {
         if matches!(snippet.kind, SnippetKind::Script) {
-            let script_path = get_snippets_dir(app)?.join(format!("{}.sh", snippet.id));
-            if !script_path.exists() {
-                if let Some(ref script_content) = snippet.script {
-                    let _ = write_script_file(app, &snippet.id, script_content);
-                    migrated_any = true;
+            // Prefer the .sh file; keep any inline copy that hasn't been
+            // migrated yet (never downgrade Some(inline) to None here).
+            if let Some(content) = read_script_file(&dir, &snippet.id) {
+                snippet.script = Some(content);
+            }
+        }
+    }
+    Ok(snippets)
+}
+
+/// One-time startup migration: move inline script bodies from the DB vault
+/// into per-snippet .sh files. The inline copy is cleared ONLY for snippets
+/// whose file write succeeded (or that already have a file on disk), so a
+/// failed write can never lose the script.
+pub fn migrate_inline_scripts(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let vault = state
+        .snippets_store
+        .load_with_migration(migrate_snippets_vault)
+        .map_err(|e| e.to_string())?;
+
+    let dir = get_snippets_dir(app)?;
+    let mut migrated_ids: Vec<String> = Vec::new();
+    for s in &vault.snippets {
+        if matches!(s.kind, SnippetKind::Script) {
+            if let Some(ref content) = s.script {
+                let already_on_disk = script_path(&dir, &s.id).exists();
+                if already_on_disk || write_script_file(&dir, &s.id, content).is_ok() {
+                    migrated_ids.push(s.id.clone());
                 }
             }
-            snippet.script = read_script_file(app, &snippet.id);
         }
     }
 
-    // If we migrated script files from inline DB, update the DB to clear inline scripts
-    if migrated_any {
-        let _ = state.snippets_store.update_with_migration(migrate_snippets_vault, |v| {
-            for s in &mut v.snippets {
-                if matches!(s.kind, SnippetKind::Script) {
-                    s.script = None;
+    if !migrated_ids.is_empty() {
+        state
+            .snippets_store
+            .update_with_migration(migrate_snippets_vault, |v| {
+                for s in &mut v.snippets {
+                    if migrated_ids.contains(&s.id) {
+                        s.script = None;
+                    }
                 }
-            }
-        });
+            })
+            .map_err(|e| e.to_string())?;
     }
-
-    Ok(snippets)
+    Ok(())
 }
 
 pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snippet, String> {
@@ -101,10 +122,14 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
 
+    let dir = get_snippets_dir(app)?;
     if matches!(request.kind, SnippetKind::Script) {
         if let Some(ref script_content) = request.script {
-            write_script_file(app, &id, script_content)?;
+            write_script_file(&dir, &id, script_content)?;
         }
+    } else {
+        // Editing an existing Script snippet to another kind orphans its file.
+        delete_script_file(&dir, &id);
     }
 
     let state = app.state::<AppState>();
@@ -147,8 +172,10 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
 pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
     let state = app.state::<AppState>();
 
-    for id in &ids {
-        delete_script_file(app, id);
+    if let Ok(dir) = get_snippets_dir(app) {
+        for id in &ids {
+            delete_script_file(&dir, id);
+        }
     }
 
     state
@@ -231,4 +258,38 @@ fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("termifai_snippets_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn script_file_roundtrip() {
+        let dir = temp_dir();
+        write_script_file(&dir, "abc", "echo hi").unwrap();
+        assert_eq!(read_script_file(&dir, "abc").as_deref(), Some("echo hi"));
+        delete_script_file(&dir, "abc");
+        assert!(read_script_file(&dir, "abc").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn script_path_uses_id_and_sh_extension() {
+        let dir = temp_dir();
+        assert_eq!(script_path(&dir, "s-1"), dir.join("s-1.sh"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_to_missing_dir_fails_without_panicking() {
+        let dir = std::env::temp_dir().join("termifai_missing_dir_test/never_created");
+        assert!(write_script_file(&dir, "abc", "x").is_err());
+    }
 }
