@@ -1081,6 +1081,13 @@ impl DashboardManager {
         }
     }
 
+    /// Disconnects every host actor — used by quit-to-background reset.
+    pub fn disconnect_all(&mut self) {
+        for (_, actor) in self.actors.drain() {
+            let _ = actor.tx.try_send(ActorCmd::Disconnect);
+        }
+    }
+
     /// Returns cloned senders only — Mutex is released immediately after.
     pub fn senders(&self) -> Vec<(String, std::sync::mpsc::SyncSender<ActorCmd>)> {
         self.actors
@@ -1285,5 +1292,17 @@ eth0: 5100000 0 0 0 0 0 0 0 2100000 0
         assert_eq!(mem_used, 10485760);
         assert_eq!(mem_limit, 8589934592);
         assert_eq!(next_cpu, Some(500_000_000)); // 500_000 µs × 1000 = 500_000_000 ns
+    }
+}
+
+#[cfg(test)]
+mod quit_reset_tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_all_on_empty_manager_is_noop() {
+        let mut mgr = DashboardManager::new();
+        mgr.disconnect_all();
+        assert!(mgr.actors.is_empty());
     }
 }
