@@ -20,6 +20,8 @@ import {
   Square,
   Menu,
   Maximize2,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -848,9 +850,27 @@ function SortableTabChip(props: Omit<BaseTabChipProps, "style" | "dragAttributes
 /* ---------------- Sidebar ---------------- */
 
 function Sidebar({ active, onChange }: { active: SidebarKey; onChange: (k: SidebarKey) => void }) {
+  const [collapsed, setCollapsed] = useState(() => {
+    return localStorage.getItem("sidebar-collapsed") === "true";
+  });
+
+  const toggleCollapsed = () => {
+    const next = !collapsed;
+    setCollapsed(next);
+    localStorage.setItem("sidebar-collapsed", String(next));
+  };
+
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r border-border bg-sidebar py-3 text-sidebar-foreground">
-      <nav className="flex-1 space-y-0.5 px-2">
+    <aside className={`relative flex shrink-0 flex-col border-r border-border bg-sidebar py-3 text-sidebar-foreground transition-all duration-200 ${collapsed ? "w-14" : "w-56"}`}>
+      <button
+        onClick={toggleCollapsed}
+        className="absolute top-6 right-0 translate-x-1/2 z-40 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-[var(--color-surface)] text-sidebar-foreground hover:bg-[var(--color-sidebar-active)] hover:text-foreground shadow-sm transition-all"
+        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+      >
+        {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronLeft className="h-3 w-3" />}
+      </button>
+
+      <nav className="flex-1 space-y-0.5 px-2 mt-4">
         {sidebarItems.map((item) => {
           const Icon = item.icon;
           const isActive = active === item.key;
@@ -858,21 +878,23 @@ function Sidebar({ active, onChange }: { active: SidebarKey; onChange: (k: Sideb
             <button
               key={item.key}
               onClick={() => onChange(item.key)}
+              title={collapsed ? item.label : undefined}
               className={[
-                "flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
+                "flex items-center rounded-md py-2 transition-colors",
+                collapsed ? "w-10 h-10 justify-center px-0 mx-auto" : "w-full gap-3 px-3 text-sm",
                 isActive
                   ? "bg-[var(--color-sidebar-active)] text-foreground"
                   : "text-sidebar-foreground hover:bg-[var(--color-sidebar-active)]/60 hover:text-foreground",
               ].join(" ")}
             >
               <Icon className="h-4 w-4" />
-              <span>{item.label}</span>
+              {!collapsed && <span>{item.label}</span>}
             </button>
           );
         })}
       </nav>
-      <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground">
-        v0.1 · Termifai
+      <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground text-center truncate">
+        {collapsed ? "v0.1" : "v0.1 · Termifai"}
       </div>
     </aside>
   );
