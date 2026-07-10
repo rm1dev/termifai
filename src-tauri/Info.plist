@@ -9,5 +9,18 @@
 	     the Dock icon up. -->
 	<key>LSUIElement</key>
 	<true/>
+	<!-- URL scheme used by the bundled FinderSync extension (PlugIns/
+	     TermifaiFinder.appex) to hand the clicked folder to the app. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.termifai</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>termifai</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>

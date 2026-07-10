@@ -1125,12 +1125,15 @@ fn dashboard_disconnect(
 #[serde(rename_all = "camelCase")]
 pub struct GeneralSettings {
     pub run_in_background: bool,
+    #[serde(default)]
+    pub open_in_context_menu: bool,
 }
 
 impl Default for GeneralSettings {
     fn default() -> Self {
         Self {
             run_in_background: true,
+            open_in_context_menu: false,
         }
     }
 }
@@ -1160,6 +1163,207 @@ fn save_general_settings(app: &tauri::AppHandle, settings: &GeneralSettings) {
     }
 }
 
+/// Folder paths received from the FinderSync extension (via the termifai://
+/// URL scheme) that the frontend has not consumed yet. The frontend drains
+/// this on mount and whenever the `open-folder-pending` event fires, so paths
+/// arriving before the webview is ready are not lost.
+#[derive(Default)]
+struct PendingOpenFolders(std::sync::Mutex<Vec<String>>);
+
+#[tauri::command]
+fn take_pending_open_folders(state: State<PendingOpenFolders>) -> Vec<String> {
+    std::mem::take(&mut *state.0.lock().unwrap())
+}
+
+#[cfg(target_os = "macos")]
+fn handle_opened_urls(app: &tauri::AppHandle, urls: Vec<tauri::Url>) {
+    for url in urls {
+        if url.scheme() != "termifai" || url.host_str() != Some("open-folder") {
+            continue;
+        }
+        let Some(path) = url
+            .query_pairs()
+            .find(|(key, _)| key == "path")
+            .map(|(_, value)| value.into_owned())
+        else {
+            continue;
+        };
+
+        app.state::<PendingOpenFolders>()
+            .0
+            .lock()
+            .unwrap()
+            .push(path);
+
+        if let Some(window) = app.get_webview_window("main") {
+            global_hotkey::set_dock_visible(app, true);
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        let _ = app.emit("open-folder-pending", ());
+    }
+}
+
+fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // The context menu item comes from the bundled FinderSync extension
+        // (PlugIns/TermifaiFinder.appex); pluginkit toggles the same switch as
+        // System Settings > General > Login Items & Extensions > File Providers.
+        let action = if _enabled { "use" } else { "ignore" };
+        let status = std::process::Command::new("pluginkit")
+            .args(["-e", action, "-i", "com.termifai.finder"])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("pluginkit failed to update the Finder extension".into());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+
+        let reg_exe = "reg.exe";
+        if _enabled {
+            // Add Directory shell
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\shell\\Termifai",
+                    "/ve",
+                    "/d",
+                    "Open in Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Add Directory command
+            let cmd_val = format!("\"{}\" \"%V\"", current_exe);
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\shell\\Termifai\\command",
+                    "/ve",
+                    "/d",
+                    &cmd_val,
+                    "/f",
+                ])
+                .status();
+
+            // Add Background shell
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\Background\\shell\\Termifai",
+                    "/ve",
+                    "/d",
+                    "Open in Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Add Background command
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\Background\\shell\\Termifai\\command",
+                    "/ve",
+                    "/d",
+                    &cmd_val,
+                    "/f",
+                ])
+                .status();
+        } else {
+            // Remove Directory
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "delete",
+                    "HKCU\\Software\\Classes\\Directory\\shell\\Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Remove Background
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "delete",
+                    "HKCU\\Software\\Classes\\Directory\\Background\\shell\\Termifai",
+                    "/f",
+                ])
+                .status();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+
+        let home = std::env::var("HOME").map(std::path::PathBuf::from).ok();
+        
+        // 1. KDE Dolphin ServiceMenu
+        if let Some(ref h) = home {
+            let dir = h.join(".local/share/kservices5/ServiceMenus");
+            let file_path = dir.join("termifai.desktop");
+            if _enabled {
+                let _ = std::fs::create_dir_all(&dir);
+                let content = format!(
+                    "[Desktop Entry]\n\
+                     Type=Service\n\
+                     ServiceTypes=KonqPopupMenu/Plugin,inode/directory\n\
+                     Actions=openInTermifai\n\
+                     MimeType=inode/directory;\n\n\
+                     [Desktop Action openInTermifai]\n\
+                     Name=Open in Termifai\n\
+                     Icon=utilities-terminal\n\
+                     Exec=\"{}\" \"%f\"\n",
+                    current_exe
+                );
+                let _ = std::fs::write(file_path, content);
+            } else {
+                let _ = std::fs::remove_file(file_path);
+            }
+        }
+
+        // 2. GNOME Nautilus Scripts
+        if let Some(ref h) = home {
+            let nautilus_dir = h.join(".local/share/nautilus/scripts");
+            let script_path = nautilus_dir.join("Open in Termifai");
+            if _enabled {
+                let _ = std::fs::create_dir_all(&nautilus_dir);
+                let content = format!(
+                    "#!/bin/sh\n\
+                     path=$(echo \"$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS\" | head -n 1)\n\
+                     if [ -z \"$path\" ]; then\n\
+                       path=\"$NAUTILUS_SCRIPT_CURRENT_URI\"\n\
+                       path=\"${{path#file://}}\"\n\
+                     fi\n\
+                     exec \"{}\" \"$path\"\n",
+                    current_exe
+                );
+                if std::fs::write(&script_path, content).is_ok() {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&script_path) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&script_path, perms);
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_file(script_path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[tauri::command]
 fn get_general_settings(app: tauri::AppHandle) -> GeneralSettings {
     load_general_settings(&app)
@@ -1167,6 +1371,10 @@ fn get_general_settings(app: tauri::AppHandle) -> GeneralSettings {
 
 #[tauri::command]
 fn set_general_settings(app: tauri::AppHandle, settings: GeneralSettings) {
+    let old_settings = load_general_settings(&app);
+    if old_settings.open_in_context_menu != settings.open_in_context_menu {
+        let _ = update_os_context_menu(&app, settings.open_in_context_menu);
+    }
     save_general_settings(&app, &settings);
 }
 
@@ -1282,6 +1490,9 @@ fn start_screen_lock_monitor(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Managed at builder level (not in setup) so it exists even for
+        // RunEvent::Opened URLs delivered during early launch.
+        .manage(PendingOpenFolders::default())
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // The hotkey daemon launches us with --hotkey=<action>; when an
             // instance is already running the argument lands here and is
@@ -1303,6 +1514,7 @@ pub fn run() {
         )
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            take_pending_open_folders,
             create_session,
             write_to_session,
             resize_session,
@@ -1785,6 +1997,10 @@ pub fn run() {
             }
             tauri::RunEvent::Exit => {
                 vault::on_app_exit(app_handle);
+            }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Opened { urls } => {
+                handle_opened_urls(app_handle, urls);
             }
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen {

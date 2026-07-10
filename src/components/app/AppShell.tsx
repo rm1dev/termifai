@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, forwardRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
 import { subscribe } from "@/lib/api/transport";
-import { forceQuitApp, openSettingsWindow, quitApp } from "@/lib/api/terminal";
+import { forceQuitApp, openSettingsWindow, quitApp, takePendingOpenFolders } from "@/lib/api/terminal";
 import { listSshKeys } from "@/lib/api/ssh-keys";
 import {
   Server,
@@ -20,6 +20,8 @@ import {
   Square,
   Menu,
   Maximize2,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -104,6 +106,32 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
     setTabs((t) => [...t, { id, kind, title, closable: true }]);
     setActiveTab(id);
   };
+  const openFolderTab = (folderPath: string) => {
+    const id = `t-terminal-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const title = folderPath.split("/").filter(Boolean).pop() || folderPath;
+    setTabs((t) => [...t, { id, kind: "terminal", title, closable: true, cwd: folderPath }]);
+    setActiveTab(id);
+  };
+
+  // Folders arriving from the macOS Finder extension ("Open in Termifai").
+  // Paths are queued on the Rust side; drain on mount (covers cold launch,
+  // where the URL arrives before the webview is ready) and on every
+  // open-folder-pending signal (app already running).
+  useEffect(() => {
+    if (variant !== "main") return;
+    const drain = () => {
+      void takePendingOpenFolders().then((paths) => {
+        for (const p of paths) openFolderTab(p);
+      });
+    };
+    drain();
+    const unlistenPromise = subscribe("open-folder-pending", drain);
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [variant]);
+
   const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const openSshTerminal = async (host: Host) => {
     const id = `t-ssh-${host.id}-${Date.now()}`;
@@ -401,6 +429,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
               <XTerminal
                 sessionId={t.sessionId}
                 initialCommand={t.initialCommand}
+                cwd={t.cwd}
                 hostId={t.hostId}
                 readyMarker={t.readyMarker}
                 connectionLabel={t.connectionLabel}
@@ -431,7 +460,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
                 />
               ) : (
                 <>
-                  <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
+                  <Sidebar active={activeSidebar} onChange={setActiveSidebar} variant={variant} />
                   <main className="flex min-w-0 flex-1 flex-col">
                     {activeSidebar === "dashboard" && <DashboardView />}
                     {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
@@ -847,9 +876,42 @@ function SortableTabChip(props: Omit<BaseTabChipProps, "style" | "dragAttributes
 
 /* ---------------- Sidebar ---------------- */
 
-function Sidebar({ active, onChange }: { active: SidebarKey; onChange: (k: SidebarKey) => void }) {
+function Sidebar({
+  active,
+  onChange,
+  variant,
+}: {
+  active: SidebarKey;
+  onChange: (k: SidebarKey) => void;
+  variant?: "main" | "quick-terminal";
+}) {
+  const isQuickTerminal = variant === "quick-terminal";
+  const [collapsed, setCollapsed] = useState(() => {
+    if (isQuickTerminal) return true;
+    return localStorage.getItem("sidebar-collapsed") === "true";
+  });
+
+  const isCurrentlyCollapsed = isQuickTerminal || collapsed;
+
+  const toggleCollapsed = () => {
+    if (isQuickTerminal) return;
+    const next = !collapsed;
+    setCollapsed(next);
+    localStorage.setItem("sidebar-collapsed", String(next));
+  };
+
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r border-border bg-sidebar py-3 text-sidebar-foreground">
+    <aside className={`relative flex shrink-0 flex-col border-r border-border bg-sidebar py-3 text-sidebar-foreground transition-all duration-200 ${isCurrentlyCollapsed ? "w-14" : "w-56"}`}>
+      {!isQuickTerminal && (
+        <button
+          onClick={toggleCollapsed}
+          className="absolute top-6 right-0 translate-x-1/2 z-40 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-[var(--color-surface)] text-sidebar-foreground hover:bg-[var(--color-sidebar-active)] hover:text-foreground shadow-sm transition-all"
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronLeft className="h-3 w-3" />}
+        </button>
+      )}
+
       <nav className="flex-1 space-y-0.5 px-2">
         {sidebarItems.map((item) => {
           const Icon = item.icon;
@@ -858,21 +920,23 @@ function Sidebar({ active, onChange }: { active: SidebarKey; onChange: (k: Sideb
             <button
               key={item.key}
               onClick={() => onChange(item.key)}
+              title={isCurrentlyCollapsed ? item.label : undefined}
               className={[
-                "flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
+                "flex items-center rounded-md py-2 transition-colors",
+                isCurrentlyCollapsed ? "w-10 h-10 justify-center px-0 mx-auto" : "w-full gap-3 px-3 text-sm",
                 isActive
                   ? "bg-[var(--color-sidebar-active)] text-foreground"
                   : "text-sidebar-foreground hover:bg-[var(--color-sidebar-active)]/60 hover:text-foreground",
               ].join(" ")}
             >
               <Icon className="h-4 w-4" />
-              <span>{item.label}</span>
+              {!isCurrentlyCollapsed && <span>{item.label}</span>}
             </button>
           );
         })}
       </nav>
-      <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground">
-        v0.1 · Termifai
+      <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground text-center truncate">
+        {isCurrentlyCollapsed ? "v0.1" : "v0.1 · Termifai"}
       </div>
     </aside>
   );
