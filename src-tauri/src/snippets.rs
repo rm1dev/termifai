@@ -23,13 +23,74 @@ pub struct SaveSnippetRequest {
 // Public API
 // ──────────────────────────────────────────────────────────────────────────────
 
+fn get_snippets_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let vault_dir = termifai_core::layout::vault_dir(&app_data_dir, termifai_core::layout::DEFAULT_VAULT_ID);
+    let snippets_dir = vault_dir.join("snippets");
+    if !snippets_dir.exists() {
+        std::fs::create_dir_all(&snippets_dir)
+            .map_err(|e| format!("Failed to create snippets dir: {}", e))?;
+    }
+    Ok(snippets_dir)
+}
+
+fn read_script_file(app: &AppHandle, id: &str) -> Option<String> {
+    let dir = get_snippets_dir(app).ok()?;
+    let path = dir.join(format!("{}.sh", id));
+    std::fs::read_to_string(path).ok()
+}
+
+fn write_script_file(app: &AppHandle, id: &str, content: &str) -> Result<(), String> {
+    let dir = get_snippets_dir(app)?;
+    let path = dir.join(format!("{}.sh", id));
+    std::fs::write(path, content).map_err(|e| format!("Failed to write script file: {}", e))
+}
+
+fn delete_script_file(app: &AppHandle, id: &str) {
+    if let Ok(dir) = get_snippets_dir(app) {
+        let path = dir.join(format!("{}.sh", id));
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 pub fn list_snippets(app: &AppHandle) -> Result<Vec<Snippet>, String> {
     let state = app.state::<AppState>();
     let vault = state
         .snippets_store
         .load_with_migration(migrate_snippets_vault)
         .map_err(|e| e.to_string())?;
-    Ok(vault.snippets)
+
+    let mut snippets = vault.snippets;
+    let mut migrated_any = false;
+
+    for snippet in &mut snippets {
+        if matches!(snippet.kind, SnippetKind::Script) {
+            let script_path = get_snippets_dir(app)?.join(format!("{}.sh", snippet.id));
+            if !script_path.exists() {
+                if let Some(ref script_content) = snippet.script {
+                    let _ = write_script_file(app, &snippet.id, script_content);
+                    migrated_any = true;
+                }
+            }
+            snippet.script = read_script_file(app, &snippet.id);
+        }
+    }
+
+    // If we migrated script files from inline DB, update the DB to clear inline scripts
+    if migrated_any {
+        let _ = state.snippets_store.update_with_migration(migrate_snippets_vault, |v| {
+            for s in &mut v.snippets {
+                if matches!(s.kind, SnippetKind::Script) {
+                    s.script = None;
+                }
+            }
+        });
+    }
+
+    Ok(snippets)
 }
 
 pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snippet, String> {
@@ -39,6 +100,12 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
         .id
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
+
+    if matches!(request.kind, SnippetKind::Script) {
+        if let Some(ref script_content) = request.script {
+            write_script_file(app, &id, script_content)?;
+        }
+    }
 
     let state = app.state::<AppState>();
     let mut saved_snippet = None;
@@ -52,20 +119,25 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
                 .find(|s| s.id == id)
                 .and_then(|s| s.created_at.clone());
 
-            let snippet = Snippet {
+            let snippet_db = Snippet {
                 id: id.clone(),
-                kind: request.kind,
+                kind: request.kind.clone(),
                 name: request.name.trim().to_string(),
                 body: request.body.filter(|v| !v.trim().is_empty()),
                 command: request.command.filter(|v| !v.trim().is_empty()),
-                script: request.script.filter(|v| !v.trim().is_empty()),
-                variables: request.variables,
+                script: None, // Do not store script content inline in DB
+                variables: request.variables.clone(),
                 created_at: existing_created_at.or_else(|| Some(now_iso())),
                 updated_at: Some(now_iso()),
             };
 
-            upsert_by_id(&mut vault.snippets, snippet.clone());
-            saved_snippet = Some(snippet);
+            upsert_by_id(&mut vault.snippets, snippet_db.clone());
+
+            let mut returned = snippet_db;
+            if matches!(request.kind, SnippetKind::Script) {
+                returned.script = request.script.clone();
+            }
+            saved_snippet = Some(returned);
         })
         .map_err(|e| e.to_string())?;
 
@@ -74,6 +146,11 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
 
 pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
     let state = app.state::<AppState>();
+
+    for id in &ids {
+        delete_script_file(app, id);
+    }
+
     state
         .snippets_store
         .update_with_migration(migrate_snippets_vault, |vault| {

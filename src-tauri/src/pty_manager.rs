@@ -26,6 +26,7 @@ struct ConnectionStatusPayload {
 struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
+    host_id: Option<String>,
 }
 
 pub struct PtyManager {
@@ -46,6 +47,7 @@ impl PtyManager {
         initial_command: Option<&str>,
         initial_password: Option<&str>,
         ready_marker: Option<&str>,
+        host_id: Option<&str>,
     ) -> Result<TabInfo, String> {
         let pty_system = native_pty_system();
 
@@ -107,6 +109,7 @@ impl PtyManager {
         let session = Session {
             master: pair.master,
             writer,
+            host_id: host_id.map(|s| s.to_string()),
         };
 
         self.sessions
@@ -260,6 +263,14 @@ impl PtyManager {
             .write_all(data.as_bytes())
             .map_err(|e| format!("Write failed: {}", e))?;
         Ok(())
+    }
+
+    pub fn get_host_id(&self, session_id: &str) -> Result<Option<String>, String> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id))?;
+        Ok(session.host_id.clone())
     }
 
     pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), String> {
@@ -656,6 +667,7 @@ mod tests {
             Session {
                 master: pair.master,
                 writer,
+                host_id: None,
             },
         );
         assert_eq!(mgr.sessions.lock().unwrap().len(), 1);
