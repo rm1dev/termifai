@@ -65,10 +65,16 @@ mod tests {
     #[test]
     fn remote_payload_runs_via_bash_and_cleans_up() {
         let p = remote_exec_payload("/tmp/x.sh");
-        assert!(p.contains("bash \"/tmp/x.sh\""), "must run via bash, got: {p}");
+        assert!(
+            p.contains("bash \"/tmp/x.sh\""),
+            "must run via bash, got: {p}"
+        );
         assert!(p.contains("rm -f \"/tmp/x.sh\""));
         assert!(!p.contains("chmod"), "bash execution needs no chmod");
-        assert!(p.starts_with(' '), "leading space keeps it out of shell history");
+        assert!(
+            p.starts_with(' '),
+            "leading space keeps it out of shell history"
+        );
         assert!(p.ends_with('\r'));
     }
 
