@@ -423,9 +423,8 @@ fn remove_snippets(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String
 }
 
 #[tauri::command]
-fn run_snippet_script(
+async fn run_snippet_script(
     app: tauri::AppHandle,
-    state: State<AppState>,
     session_id: String,
     title: String,
     script: String,
@@ -438,87 +437,129 @@ fn run_snippet_script(
     let event_name = format!("term:{}:output", session_id);
     let _ = app.emit(&event_name, title_msg);
 
-    let host_id = {
-        let manager = state.pty_manager.lock().unwrap();
-        manager.get_host_id(&session_id)?
+    let script = snippet_exec::normalize_script(&script);
+
+    // All PTY/SFTP work is blocking I/O (network for SSH sessions) — keep it
+    // off the main thread so the UI never freezes while a connection is made.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let host_id = {
+            let manager = state.pty_manager.lock().unwrap();
+            manager.get_host_id(&session_id)?
+        };
+
+        match host_id {
+            Some(h_id) => run_script_over_ssh(&app, &session_id, &h_id, &script),
+            None => run_script_locally(&app, &session_id, &script),
+        }
+    })
+    .await
+    .map_err(|e| format!("Script task failed: {}", e))?
+}
+
+/// SSH session: upload via SFTP and execute; fall back to a heredoc over the
+/// PTY when SFTP is unavailable (subsystem disabled, auth not stored, etc.).
+fn run_script_over_ssh(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    host_id: &str,
+    script: &str,
+) -> Result<(), String> {
+    match upload_script_via_sftp(app, session_id, host_id, script) {
+        Ok(remote_path) => {
+            let state = app.state::<AppState>();
+            let payload = snippet_exec::remote_exec_payload(&remote_path);
+            let manager = state.pty_manager.lock().unwrap();
+            manager.write_to_session(session_id, &payload)
+        }
+        Err(sftp_err) => run_script_via_heredoc(app, session_id, script).map_err(|heredoc_err| {
+            format!(
+                "SFTP upload failed ({}); heredoc fallback failed: {}",
+                sftp_err, heredoc_err
+            )
+        }),
+    }
+}
+
+/// Ensure an SFTP session exists for `session_id`, upload the script to a
+/// random /tmp path, and return that path. Errors carry the real cause
+/// (connect/auth/subsystem/write) so callers can report or fall back.
+fn upload_script_via_sftp(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    host_id: &str,
+    script: &str,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+
+    let has_sftp = {
+        let sftp_mgr = state.sftp_manager.lock().unwrap();
+        sftp_mgr.get_session(session_id).is_ok()
     };
 
-    if let Some(ref h_id) = host_id {
-        // SSH Session: Upload via SFTP first, then execute
-        let has_sftp = {
-            let sftp_mgr = state.sftp_manager.lock().unwrap();
-            sftp_mgr.get_session(&session_id).is_ok()
-        };
-
-        if !has_sftp {
-            let vault = hosts::list_hosts(&app)?;
-            let host = vault
-                .hosts
-                .into_iter()
-                .find(|h| h.id == *h_id)
-                .ok_or_else(|| format!("Host '{}' not found", h_id))?;
-
-            let private_key_path = if let Some(key_id) = &host.ssh_key_id {
-                let keys = ssh_keys::list_ssh_keys(&app)?;
-                keys.into_iter()
-                    .find(|k| &k.id == key_id)
-                    .map(|k| k.private_key_path)
-            } else {
-                None
-            };
-
-            let request = SftpConnectRequest {
-                session_id: session_id.clone(),
-                hostname: host.hostname.clone(),
-                port: host.port,
-                username: host.user.clone(),
-                password: hosts::decrypt_host_password(&host),
-                private_key_path,
-                default_remote_path: host.default_sftp_path.clone(),
-            };
-
-            let mut sftp_mgr = state.sftp_manager.lock().unwrap();
-            let _ = sftp_mgr.connect(request, |_, _| {});
-        }
-
-        let sftp_entry_arc = {
-            let sftp_mgr = state.sftp_manager.lock().unwrap();
-            sftp_mgr.get_session(&session_id)?
-        };
-        let sftp_entry = sftp_entry_arc.lock().unwrap();
-        let sftp = sftp_entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
-
-        let remote_filename = format!("termifai_run_{}.sh", &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]);
-        let remote_path = format!("/tmp/{}", remote_filename);
-
-        let mut remote_file = sftp
-            .create(std::path::Path::new(&remote_path))
-            .map_err(|e| format!("Failed to create remote temp file: {}", e))?;
-
-        use std::io::Write;
-        remote_file
-            .write_all(script.as_bytes())
-            .map_err(|e| format!("Failed to write remote script file: {}", e))?;
-
-        let payload = format!(
-            " printf '\\033[1A\\033[2K\\r' && chmod +x {remote} && {remote}; rm -f {remote}\r",
-            remote = remote_path
-        );
-        let manager = state.pty_manager.lock().unwrap();
-        manager.write_to_session(&session_id, &payload)
-    } else {
-        // Local Session: Write resolved script to local temp file and execute
-        let local_temp_path = std::env::temp_dir().join(format!("termifai_run_{}.sh", &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]));
-        std::fs::write(&local_temp_path, &script).map_err(|e| format!("Failed to write local temp script: {}", e))?;
-
-        let payload = format!(
-            " printf '\\033[1A\\033[2K\\r' && bash \"{}\"; rm -f \"{}\"\r",
-            local_temp_path.to_string_lossy(),
-            local_temp_path.to_string_lossy()
-        );
-        let manager = state.pty_manager.lock().unwrap();
-        manager.write_to_session(&session_id, &payload)
+    if !has_sftp {
+        let request = build_sftp_request_from_host(app, session_id, host_id)?;
+        let mut sftp_mgr = state.sftp_manager.lock().unwrap();
+        sftp_mgr
+            .connect(request, |_, _| {})
+            .map_err(|e| format!("SFTP connect failed: {}", e))?;
     }
+
+    let sftp_entry_arc = {
+        let sftp_mgr = state.sftp_manager.lock().unwrap();
+        sftp_mgr.get_session(session_id)?
+    };
+    let sftp_entry = sftp_entry_arc.lock().unwrap();
+    let sftp = sftp_entry
+        .session
+        .sftp()
+        .map_err(|e| format!("SFTP subsystem: {}", e))?;
+
+    let remote_path = format!("/tmp/termifai_run_{}.sh", snippet_exec::short_id());
+
+    let mut remote_file = sftp
+        .create(std::path::Path::new(&remote_path))
+        .map_err(|e| format!("Failed to create remote temp file: {}", e))?;
+
+    use std::io::Write;
+    remote_file
+        .write_all(script.as_bytes())
+        .map_err(|e| format!("Failed to write remote script file: {}", e))?;
+    // Close the SFTP handle before anything executes the file — close is what
+    // makes the server flush; Drop-at-end-of-scope would race the PTY exec.
+    drop(remote_file);
+
+    Ok(remote_path)
+}
+
+/// Write the script into the PTY as a non-echoed heredoc — works on any host
+/// the PTY is already connected to, with no SFTP or second connection needed.
+fn run_script_via_heredoc(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    script: &str,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let payload = snippet_exec::heredoc_payload(script, &snippet_exec::short_id());
+    let manager = state.pty_manager.lock().unwrap();
+    manager.write_to_session(session_id, &payload)
+}
+
+/// Local session: write the script to a local temp file and execute via bash.
+fn run_script_locally(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    script: &str,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let local_temp_path =
+        std::env::temp_dir().join(format!("termifai_run_{}.sh", snippet_exec::short_id()));
+    std::fs::write(&local_temp_path, script)
+        .map_err(|e| format!("Failed to write local temp script: {}", e))?;
+
+    let payload = snippet_exec::local_exec_payload(&local_temp_path.to_string_lossy());
+    let manager = state.pty_manager.lock().unwrap();
+    manager.write_to_session(session_id, &payload)
 }
 
 /// Resolve a host from the vault into a ready-to-use SFTP connect request
