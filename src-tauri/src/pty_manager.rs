@@ -248,6 +248,12 @@ impl PtyManager {
         self.sessions.lock().unwrap().remove(session_id);
         Ok(())
     }
+
+    /// Drops every session (same teardown as close_session) — used by
+    /// quit-to-background so the next open starts with no terminals.
+    pub fn kill_all(&self) {
+        self.sessions.lock().unwrap().clear();
+    }
 }
 
 fn build_shell_command(initial_command: Option<&str>) -> CommandBuilder {
@@ -583,4 +589,38 @@ fn find_ready_marker_line(output: &str, marker: &str) -> Option<usize> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_all_empties_sessions() {
+        let mgr = PtyManager::new();
+        // Build a real Session without an AppHandle: open a pty and spawn a shell.
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let _child = pair
+            .slave
+            .spawn_command(CommandBuilder::new(if cfg!(windows) { "cmd" } else { "sh" }))
+            .expect("spawn");
+        let writer = pair.master.take_writer().expect("writer");
+        mgr.sessions.lock().unwrap().insert(
+            "t1".into(),
+            Session {
+                master: pair.master,
+                writer,
+            },
+        );
+        assert_eq!(mgr.sessions.lock().unwrap().len(), 1);
+        mgr.kill_all();
+        assert!(mgr.sessions.lock().unwrap().is_empty());
+    }
 }

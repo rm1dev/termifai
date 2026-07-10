@@ -517,6 +517,11 @@ impl SftpManager {
         }
     }
 
+    /// Drops every SFTP session — used by quit-to-background reset.
+    pub fn clear_all(&mut self) {
+        self.sessions.clear();
+    }
+
     pub fn get_session(&self, session_id: &str) -> Result<Arc<Mutex<SftpEntry>>, String> {
         self.sessions
             .get(session_id)
@@ -637,5 +642,17 @@ mod tests {
         let result = manager.disconnect("nonexistent-id");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+}
+
+#[cfg(test)]
+mod quit_reset_tests {
+    use super::*;
+
+    #[test]
+    fn clear_all_empties_sessions() {
+        let mut mgr = SftpManager::new();
+        mgr.clear_all();
+        assert!(mgr.sessions.is_empty());
     }
 }

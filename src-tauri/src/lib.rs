@@ -1405,7 +1405,65 @@ fn force_quit_app(app: tauri::AppHandle) {
 
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
+    if load_general_settings(&app).run_in_background {
+        quit_to_background(&app);
+    } else {
+        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+        global_hotkey::clean_quit(&app);
+        app.exit(0);
+    }
+}
+
+/// "Quit" while `run_in_background` is on: the process stays resident (tray,
+/// global hotkeys, quick terminal) but everything else resets so the next
+/// open is indistinguishable from a cold launch. Steps are best-effort — one
+/// failing teardown must not abort the rest. Reload comes last so the UI is
+/// never shown half-torn-down.
+fn quit_to_background(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+
+    if let Ok(pty) = state.pty_manager.lock() {
+        pty.kill_all();
+    }
+    if let Ok(mut tunnels) = state.tunnel_manager.lock() {
+        tunnels.stop_all();
+    }
+    if let Ok(mut sftp) = state.sftp_manager.lock() {
+        sftp.clear_all();
+    }
+    if let Ok(mut watchers) = state.watch_handles.lock() {
+        for (_, stop) in watchers.drain() {
+            let _ = stop.send(());
+        }
+    }
+    if let Ok(mut flags) = state.transfer_cancel_flags.lock() {
+        for (_, flag) in flags.drain() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    if let Ok(mut dash) = state.dashboard_manager.lock() {
+        dash.disconnect_all();
+    }
+
+    // Vault: exactly what a relaunch does. on_app_exit covers the OnAppClose
+    // policy (forget keychain cache + lock). For every other policy a real
+    // relaunch silently re-unlocks from the keychain cache in setup(), so
+    // keeping the in-memory unlock is equivalent — do NOT call op_lock()
+    // here: it wipes the keychain cache and session token, which would force
+    // a master-password prompt even under the OnRestart policy.
+    vault::on_app_exit(app);
+
+    for window in app.webview_windows().values() {
+        let _ = window.hide();
+    }
+    global_hotkey::set_dock_visible(app, false);
+
+    // Fresh frontend boot. Each window loads index.html?window=…, so a
+    // reload equals a cold start of that webview. Windows are never
+    // destroyed/recreated: dynamic creation deadlocks WebView2 on Windows.
+    for window in app.webview_windows().values() {
+        let _ = window.eval("window.location.reload()");
+    }
 }
 
 /// Global AppHandle for the screen-lock notification callback.
@@ -1873,10 +1931,13 @@ pub fn run() {
                         let _ = handle.emit("vault-locked", ());
                     }
                     "custom-quit" => {
-                        for window in handle.webview_windows().values() {
-                            let _ = window.hide();
+                        if load_general_settings(&handle).run_in_background {
+                            quit_to_background(&handle);
+                        } else {
+                            SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                            global_hotkey::clean_quit(&handle);
+                            handle.exit(0);
                         }
-                        global_hotkey::set_dock_visible(&handle, false);
                     }
                     "custom-force-quit" => {
                         SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1936,9 +1997,13 @@ pub fn run() {
                         }
                     }
                     "tray-quit" => {
-                        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
-                        global_hotkey::clean_quit(app);
-                        app.exit(0);
+                        if load_general_settings(app).run_in_background {
+                            quit_to_background(app);
+                        } else {
+                            SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                            global_hotkey::clean_quit(app);
+                            app.exit(0);
+                        }
                     }
                     "tray-force-quit" => {
                         SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);

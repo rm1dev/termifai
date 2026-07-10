@@ -43,6 +43,13 @@ impl TunnelManager {
             processes: HashMap::new(),
         }
     }
+
+    /// Kills every running tunnel process — used by quit-to-background reset.
+    pub fn stop_all(&mut self) {
+        for (_, mut child) in self.processes.drain() {
+            let _ = child.kill();
+        }
+    }
 }
 
 pub type TunnelManagerState = Mutex<TunnelManager>;
@@ -524,4 +531,16 @@ fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod quit_reset_tests {
+    use super::*;
+
+    #[test]
+    fn stop_all_on_empty_manager_is_noop() {
+        let mut mgr = TunnelManager::new();
+        mgr.stop_all();
+        assert!(mgr.processes.is_empty());
+    }
 }
