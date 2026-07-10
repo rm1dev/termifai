@@ -3,6 +3,7 @@ mod global_hotkey;
 mod hosts;
 mod port_forwarding;
 mod pty_manager;
+mod quick_terminal;
 mod sftp;
 mod snippets;
 mod ssh;
@@ -40,19 +41,26 @@ struct SftpTransferDone {
     ok: bool,
     error: Option<String>,
 }
+use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
+use quick_terminal::{
+    get_quick_terminal_info, hide_quick_terminal, quick_terminal_frontend_ready,
+    resize_quick_terminal, set_quick_terminal_edge, set_quick_terminal_enabled,
+    set_quick_terminal_opacity, toggle_quick_terminal,
+};
 use snippets::{SaveSnippetRequest, Snippet};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::menu::{Menu, MenuItem};
 #[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
-use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_window_state::StateFlags;
-use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
 
 static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SHOULD_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct AppState {
     pty_manager: Mutex<PtyManager>,
@@ -1113,6 +1121,80 @@ fn dashboard_disconnect(
     Ok(())
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneralSettings {
+    pub run_in_background: bool,
+}
+
+impl Default for GeneralSettings {
+    fn default() -> Self {
+        Self {
+            run_in_background: true,
+        }
+    }
+}
+
+fn general_settings_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("general_settings.json"))
+}
+
+fn load_general_settings(app: &tauri::AppHandle) -> GeneralSettings {
+    general_settings_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<GeneralSettings>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_general_settings(app: &tauri::AppHandle, settings: &GeneralSettings) {
+    if let Some(path) = general_settings_path(app) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+#[tauri::command]
+fn get_general_settings(app: tauri::AppHandle) -> GeneralSettings {
+    load_general_settings(&app)
+}
+
+#[tauri::command]
+fn set_general_settings(app: tauri::AppHandle, settings: GeneralSettings) {
+    save_general_settings(&app, &settings);
+}
+
+#[tauri::command]
+fn is_autostart_enabled(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    if enabled {
+        app.autolaunch().enable().map_err(|e| e.to_string())
+    } else {
+        app.autolaunch().disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn force_quit_app(app: tauri::AppHandle) {
+    // Without this flag the ExitRequested handler treats the exit as a
+    // window close and hides the app instead of quitting it.
+    SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    global_hotkey::kill_daemon();
+    app.exit(0);
+}
+
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     app.exit(0);
@@ -1200,10 +1282,15 @@ fn start_screen_lock_monitor(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            // A second launch (e.g. clicking the app icon again) just surfaces
-            // the existing instance instead of starting a competing process.
-            if let Some(window) = app.get_webview_window("main") {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // The hotkey daemon launches us with --hotkey=<action>; when an
+            // instance is already running the argument lands here and is
+            // dispatched directly. Any other second launch (e.g. clicking the
+            // app icon again) just surfaces the existing instance.
+            if let Some(action) = global_hotkey::hotkey_arg(&argv) {
+                global_hotkey::dispatch(app, &action);
+            } else if let Some(window) = app.get_webview_window("main") {
+                global_hotkey::set_dock_visible(app, true);
                 let _ = window.show();
                 let _ = window.set_focus();
             }
@@ -1211,15 +1298,10 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
-                .with_filter(|label| label != "settings")
+                .with_filter(|label| label != "settings" && label != quick_terminal::WINDOW_LABEL)
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(global_hotkey::plugin_handler)
-                .build(),
-        )
         .invoke_handler(tauri::generate_handler![
             create_session,
             write_to_session,
@@ -1293,9 +1375,22 @@ pub fn run() {
             dashboard_poll,
             dashboard_disconnect,
             quit_app,
+            get_general_settings,
+            set_general_settings,
+            is_autostart_enabled,
+            set_autostart_enabled,
+            force_quit_app,
             enable_global_hotkey,
             disable_global_hotkey,
             get_global_hotkey_status,
+            toggle_quick_terminal,
+            hide_quick_terminal,
+            resize_quick_terminal,
+            get_quick_terminal_info,
+            set_quick_terminal_edge,
+            set_quick_terminal_enabled,
+            set_quick_terminal_opacity,
+            quick_terminal_frontend_ready,
         ])
         .on_window_event(|window, event| {
             // Closing the main/extra windows hides them rather than exiting the
@@ -1304,13 +1399,36 @@ pub fn run() {
             // tray's "Quit" item (or the menu/shortcut equivalent) is the real exit.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let label = window.label();
-                if label == "main" || label.starts_with("window-") {
-                    let _ = window.hide();
-                    api.prevent_close();
+                if label == "main"
+                    || label.starts_with("window-")
+                    || label == quick_terminal::WINDOW_LABEL
+                {
+                    let app = window.app_handle();
+                    let settings = load_general_settings(app);
+                    if settings.run_in_background {
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
                 }
             }
         })
         .setup(|app| {
+            // Cold launch triggered by the termifaid hotkey service?
+            // This must be decided FIRST: Tauri pumps the event loop while
+            // building the webviews below, which fires didFinishLaunching and
+            // locks in the activation policy — setting Accessory any later
+            // leaves the app registered as a regular (Dock-visible) app.
+            let launch_args: Vec<String> = std::env::args().collect();
+            let is_background_flag = launch_args.iter().any(|arg| arg == "--background");
+            let hotkey_action = global_hotkey::hotkey_arg(&launch_args);
+            let is_hotkey_launch = hotkey_action.is_some();
+            let background_launch = is_background_flag || is_hotkey_launch;
+
+            #[cfg(target_os = "macos")]
+            if background_launch {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
             let app_data_dir = app
                 .path()
                 .app_data_dir()
@@ -1341,7 +1459,6 @@ pub fn run() {
                 tombstones_store: store::JsonStore::new(vault_dir.join("tombstones.json")),
                 sync_state_store: store::JsonStore::new(vault_dir.join("sync_state.json")),
             });
-            app.manage(global_hotkey::HotkeyState::default());
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
             // Also set UTF-8 (codepage 65001) so ConPTY correctly interprets multi-byte
@@ -1362,12 +1479,36 @@ pub fn run() {
             }
 
             // On Linux and Windows, remove native decorations so the custom frontend titlebar takes over
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            // Build the main window programmatically.
+            // On macOS: with decorations and Overlay title bar style for traffic lights.
+            // On Windows/Linux: without decorations to avoid two-toned title bar.
+            let mut main_builder =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("Termifai")
+                    .inner_size(900.0, 600.0)
+                    .min_inner_size(900.0, 600.0)
+                    .resizable(true)
+                    .transparent(true)
+                    // On a quick-terminal cold launch the main window must
+                    // never appear — creating it visible and hiding later
+                    // makes it (and the Dock icon) flash.
+                    .visible(!background_launch);
+
+            #[cfg(target_os = "macos")]
             {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_decorations(false);
-                }
+                main_builder = main_builder
+                    .decorations(true)
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .hidden_title(true)
+                    .traffic_light_position(tauri::LogicalPosition::new(12.0, 25.0));
             }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                main_builder = main_builder.decorations(false);
+            }
+
+            let _main_win = main_builder.build()?;
 
             // Create the settings window hidden at startup — creating it dynamically after
             // the event loop starts deadlocks on Windows because WebView2 initialization
@@ -1388,8 +1529,56 @@ pub fn run() {
             .visible(false)
             .build()?;
 
+            // Quick Terminal panel — same create-hidden-at-startup pattern as the
+            // settings window (dynamic creation deadlocks WebView2 on Windows).
+            // Not draggable (no drag region in its HTML) and not natively
+            // resizable: sizing happens only via the in-panel drag handle.
+            WebviewWindowBuilder::new(
+                app,
+                quick_terminal::WINDOW_LABEL,
+                WebviewUrl::App("index.html?window=quick-terminal".into()),
+            )
+            .title("Quick Terminal")
+            .decorations(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .minimizable(false)
+            .maximizable(false)
+            // Transparent + shadowless so the native window itself is invisible:
+            // what the user sees sliding in is the panel div inside the webview.
+            .transparent(true)
+            .shadow(false)
+            // Native backdrop blur for the glass look: the first effect the
+            // platform supports is applied (HudWindow → macOS vibrancy,
+            // Acrylic/Blur → Windows; no-op on Linux). Only visible where the
+            // frontend makes its backgrounds translucent (panel transparency
+            // setting below 100%).
+            .effects(
+                tauri::window::EffectsBuilder::new()
+                    .effect(tauri::window::Effect::HudWindow)
+                    .effect(tauri::window::Effect::Acrylic)
+                    .effect(tauri::window::Effect::Blur)
+                    // Pin the effect to its active look — by default macOS
+                    // vibrancy follows window focus and dims when the panel
+                    // loses key status, which reads as the panel "darkening".
+                    .state(tauri::window::EffectState::Active)
+                    .build(),
+            )
+            .visible(false)
+            .build()?;
+
             let app_handle = app.handle().clone();
             if let Some(main_win) = app.get_webview_window("main") {
+                let _ = main_win.set_effects(
+                    tauri::window::EffectsBuilder::new()
+                        .effect(tauri::window::Effect::HudWindow)
+                        .effect(tauri::window::Effect::Acrylic)
+                        .effect(tauri::window::Effect::Blur)
+                        .state(tauri::window::EffectState::Active)
+                        .build(),
+                );
+
                 main_win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { .. } = event {
                         // Closing "main" now only hides it on every platform (the app
@@ -1415,6 +1604,12 @@ pub fn run() {
                 let lock_vault = MenuItemBuilder::with_id("lock-vault", "Lock Vault")
                     .accelerator("CmdOrCtrl+Shift+L")
                     .build(app)?;
+                let custom_quit = MenuItemBuilder::with_id("custom-quit", "Quit Termifai")
+                    .accelerator("CmdOrCtrl+Q")
+                    .build(app)?;
+                let custom_force_quit = MenuItemBuilder::with_id("custom-force-quit", "Force Quit")
+                    .accelerator("CmdOrCtrl+Shift+Q")
+                    .build(app)?;
 
                 let file_menu = SubmenuBuilder::new(app, "File")
                     .item(&new_terminal)
@@ -1424,7 +1619,8 @@ pub fn run() {
                     .separator()
                     .item(&PredefinedMenuItem::close_window(app, None)?)
                     .separator()
-                    .item(&PredefinedMenuItem::quit(app, None)?)
+                    .item(&custom_quit)
+                    .item(&custom_force_quit)
                     .build()?;
 
                 let edit_menu = SubmenuBuilder::new(app, "Edit")
@@ -1464,6 +1660,17 @@ pub fn run() {
                         vault::op_lock();
                         let _ = handle.emit("vault-locked", ());
                     }
+                    "custom-quit" => {
+                        for window in handle.webview_windows().values() {
+                            let _ = window.hide();
+                        }
+                        global_hotkey::set_dock_visible(&handle, false);
+                    }
+                    "custom-force-quit" => {
+                        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        global_hotkey::kill_daemon();
+                        handle.exit(0);
+                    }
                     _ => {}
                 });
             }
@@ -1475,6 +1682,10 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            app.handle().plugin(tauri_plugin_autostart::init(
+                MacosLauncher::LaunchAgent,
+                Some(vec!["--background"]),
+            ))?;
             // Try to unlock the vault silently using the keychain-cached master password,
             // so a returning user on this device isn't prompted again. This bypasses the
             // vault_unlock command, so — same as that command — it must also trigger the
@@ -1491,49 +1702,102 @@ pub fn run() {
             // Tray icon so the app can keep running in the background (required
             // for the optional global hotkey to mean anything) with an explicit
             // way to show the window or quit.
-            let show_item = MenuItem::with_id(app, "tray-show", "Show Termifai", true, None::<&str>)?;
+            let show_item =
+                MenuItem::with_id(app, "tray-show", "Show Termifai", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let force_quit_item = MenuItem::with_id(app, "tray-force-quit", "Force Quit", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item, &force_quit_item])?;
             TrayIconBuilder::new()
-                .icon(app.default_window_icon().cloned().ok_or("Missing default window icon")?)
+                .icon(
+                    app.default_window_icon()
+                        .cloned()
+                        .ok_or("Missing default window icon")?,
+                )
                 .menu(&tray_menu)
                 .show_menu_on_left_click(true)
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "tray-show" => {
                         if let Some(window) = app.get_webview_window("main") {
+                            global_hotkey::set_dock_visible(app, true);
                             let _ = window.show();
                             let _ = window.set_focus();
                         }
                     }
-                    "tray-quit" => app.exit(0),
+                    "tray-quit" => {
+                        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        global_hotkey::clean_quit(app);
+                        app.exit(0);
+                    }
+                    "tray-force-quit" => {
+                        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        global_hotkey::kill_daemon();
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .build(app)?;
 
-            // Restore a previously-enabled global hotkey, if any.
+            // Record our exe path for the hotkey daemon and make sure the
+            // daemon is running if any hotkey is enabled.
             global_hotkey::restore_on_startup(&app.handle().clone());
+
+            // Cold launch triggered by the hotkey daemon (--hotkey=<action>).
+            // main-window needs nothing: the main window shows by default.
+            // quick-terminal: the user asked for the panel, not the app — hide
+            // the main window and slide the panel in once its webview reports
+            // ready (see quick_terminal_frontend_ready).
+            app.manage(quick_terminal::PendingToggle::default());
+            // Finish the cold-launch handling decided at the top of setup:
+            // the panel slides in once its webview reports ready. The bundle
+            // is marked LSUIElement (agent) to cover the instant before
+            // didFinishLaunching; normal launches opt back into being a
+            // regular app here, which is what shows the Dock icon.
+            if hotkey_action.as_deref() == Some(global_hotkey::ACTION_QUICK_TERMINAL) {
+                app.state::<quick_terminal::PendingToggle>()
+                    .0
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            } else if hotkey_action.as_deref() == Some(global_hotkey::ACTION_MAIN_WINDOW) {
+                if let Some(main_win) = app.get_webview_window("main") {
+                    global_hotkey::set_dock_visible(app.handle(), true);
+                    let _ = main_win.show();
+                    let _ = main_win.set_focus();
+                }
+            } else if !background_launch {
+                global_hotkey::set_dock_visible(app.handle(), true);
+            }
 
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                let run_in_background = load_general_settings(app_handle).run_in_background;
+                if !run_in_background {
+                    global_hotkey::kill_daemon();
+                } else if !SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+                    api.prevent_exit();
+                    for window in app_handle.webview_windows().values() {
+                        let _ = window.hide();
+                    }
+                    global_hotkey::set_dock_visible(app_handle, false);
+                }
+            }
+            tauri::RunEvent::Exit => {
                 vault::on_app_exit(app_handle);
             }
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen {
-                has_visible_windows,
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
                 ..
-            } = event
-            {
-                if !has_visible_windows {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
+            } => {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    global_hotkey::set_dock_visible(app_handle, true);
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
             }
+            _ => {}
         });
 }
 
@@ -1542,6 +1806,16 @@ fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("settings")
         .ok_or_else(|| "Settings window not found".to_string())?;
+
+    // The settings window is a normal window (not always-on-top), so it would
+    // end up *behind* the always-on-top Quick Terminal panel. Collapse the
+    // panel instead — it's a transient overlay, and this keeps the settings
+    // window from having to sit above other apps' windows.
+    if let Some(quick) = app.get_webview_window(quick_terminal::WINDOW_LABEL) {
+        if quick.is_visible().unwrap_or(false) {
+            let _ = app.emit("quick-terminal:hide", ());
+        }
+    }
 
     // Center on the main window using *logical* coordinates: physical
     // coordinates are interpreted with the scale factor of the monitor the
@@ -1559,9 +1833,8 @@ fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
                 let main_size = main_size.to_logical::<f64>(scale_factor);
                 let x = main_pos.x + (main_size.width - 800.0) / 2.0;
                 let y = main_pos.y + (main_size.height - 600.0) / 2.0;
-                let _ = window.set_position(tauri::Position::Logical(
-                    tauri::LogicalPosition::new(x, y),
-                ));
+                let _ = window
+                    .set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
             }
         }
     };

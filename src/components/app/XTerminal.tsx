@@ -48,6 +48,12 @@ interface Props {
   isActive?: boolean;
   onClose?: () => void;
   onSessionCreated?: (sessionId: string) => void;
+  /**
+   * Quick Terminal glass mode: xterm paints its own opaque background canvas,
+   * which would cover the translucent panel — this swaps it for a fully
+   * transparent one so the panel's (blurred) backdrop shows through.
+   */
+  transparentBackground?: boolean;
 }
 
 type ConnectionStage = "connecting" | "handshaking" | "authenticating" | "shell";
@@ -156,7 +162,7 @@ function EnumDropdown({
   );
 }
 
-export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated }: Props) {
+export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated, transparentBackground }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [isConnecting, setIsConnecting] = useState(Boolean(readyMarker && !sessionId));
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
@@ -179,6 +185,10 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
   const notifiedSessionRef = useRef<string | null>(sessionId ?? null);
   const appearanceRequestRef = useRef(0);
 
+  // Constant per window (the quick-terminal window always passes true).
+  const xtermTheme = (theme: AppTheme) =>
+    transparentBackground ? { ...theme.xterm, background: "#00000000" } : theme.xterm;
+
   useLayoutEffect(() => {
     if (!ref.current || isInitializedRef.current) return;
     isInitializedRef.current = true;
@@ -194,7 +204,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       fontFamily: getTerminalFontStack(appearance.fontFamily),
       fontSize: appearance.fontSize,
       lineHeight: appearance.lineHeight,
-      theme: appTheme.xterm,
+      theme: xtermTheme(appTheme),
       allowTransparency: true,
       scrollback: 50000,
     });
@@ -280,11 +290,11 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       if (event.key === terminalAppearanceStorageKey) {
         applyAppearance(loadTerminalAppearance());
       } else if (event.key === appThemeStorageKey) {
-        term.options.theme = loadAppTheme().xterm;
+        term.options.theme = xtermTheme(loadAppTheme());
       }
     };
     const applyTheme = (theme: AppTheme) => {
-      term.options.theme = theme.xterm;
+      term.options.theme = xtermTheme(theme);
     };
     const onAppThemeChanged = (event: Event) => {
       applyTheme((event as CustomEvent<AppTheme>).detail);

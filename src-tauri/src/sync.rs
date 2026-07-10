@@ -119,17 +119,19 @@ pub async fn sync_connect_provider(_app: AppHandle, provider: String) -> Result<
     } else {
         "127.0.0.1:0".to_string()
     };
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await.map_err(|e| {
-        if provider == "dropbox" {
-            format!(
-                "Failed to bind 127.0.0.1:{} for the Dropbox OAuth callback — is another \
+    let listener = tokio::net::TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| {
+            if provider == "dropbox" {
+                format!(
+                    "Failed to bind 127.0.0.1:{} for the Dropbox OAuth callback — is another \
                  program using that port? ({e})",
-                sync::oauth::DROPBOX_REDIRECT_PORT
-            )
-        } else {
-            format!("Failed to bind loopback address: {}", e)
-        }
-    })?;
+                    sync::oauth::DROPBOX_REDIRECT_PORT
+                )
+            } else {
+                format!("Failed to bind loopback address: {}", e)
+            }
+        })?;
     let port = listener.local_addr().unwrap().port();
 
     let client = BasicClient::new(
@@ -571,7 +573,10 @@ impl termifai_core::sync::TokenStore for KeyringTokenStore {
 /// shells do. Expand it ourselves so a path typed in Settings behaves the
 /// way the user expects.
 fn expand_home(path: &str) -> std::path::PathBuf {
-    if let Some(rest) = path.strip_prefix("~/").or_else(|| (path == "~").then_some("")) {
+    if let Some(rest) = path
+        .strip_prefix("~/")
+        .or_else(|| (path == "~").then_some(""))
+    {
         if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
             return std::path::PathBuf::from(home).join(rest);
         }
