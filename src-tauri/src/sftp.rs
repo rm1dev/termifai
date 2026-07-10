@@ -1130,10 +1130,10 @@ mod tests {
         let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| {
             ConflictDecision::Overwrite
         });
-        assert_eq!(h.resolve(&conflict_info()).unwrap(), true);
+        assert!(h.resolve(&conflict_info()).unwrap());
         let mut h =
             ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| ConflictDecision::Skip);
-        assert_eq!(h.resolve(&conflict_info()).unwrap(), false);
+        assert!(!h.resolve(&conflict_info()).unwrap());
     }
 
     #[test]
@@ -1143,8 +1143,8 @@ mod tests {
             calls.set(calls.get() + 1);
             ConflictDecision::OverwriteAll
         });
-        assert_eq!(h.resolve(&conflict_info()).unwrap(), true);
-        assert_eq!(h.resolve(&conflict_info()).unwrap(), true);
+        assert!(h.resolve(&conflict_info()).unwrap());
+        assert!(h.resolve(&conflict_info()).unwrap());
         assert_eq!(calls.get(), 1);
 
         let calls = Cell::new(0u32);
@@ -1152,8 +1152,8 @@ mod tests {
             calls.set(calls.get() + 1);
             ConflictDecision::SkipAll
         });
-        assert_eq!(h.resolve(&conflict_info()).unwrap(), false);
-        assert_eq!(h.resolve(&conflict_info()).unwrap(), false);
+        assert!(!h.resolve(&conflict_info()).unwrap());
+        assert!(!h.resolve(&conflict_info()).unwrap());
         assert_eq!(calls.get(), 1);
     }
 
@@ -1162,7 +1162,7 @@ mod tests {
         let mut h = ConflictHandler::new(ConflictMode::OverwriteAll, |_: &ConflictInfo| {
             panic!("must not prompt")
         });
-        assert_eq!(h.resolve(&conflict_info()).unwrap(), true);
+        assert!(h.resolve(&conflict_info()).unwrap());
     }
 
     #[test]

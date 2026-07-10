@@ -108,6 +108,7 @@ fn create_session(
         initial_command.as_deref(),
         password.as_deref(),
         ready_marker.as_deref(),
+        host_id.as_deref(),
     )
 }
 
@@ -436,40 +437,87 @@ fn run_snippet_script(
     let event_name = format!("term:{}:output", session_id);
     let _ = app.emit(&event_name, title_msg);
 
-    // Strategy for hiding the command from terminal display AND supporting remote SSH:
-    // We cannot write to the remote filesystem from Rust directly.
-    // Instead we use heredoc via PTY to write the script to /tmp on the target machine,
-    // then execute it. The heredoc content is NOT echoed by the shell (only the cat command is).
-    // A wrapper script erases the visible command line with ANSI escapes.
-    // The full sequence sent to PTY:
-    //   printf '\033[1A\033[2K\r' && f=$(mktemp /tmp/termifai_XXXXXXXX) && cat > "$f" << 'TERMIFAI_EOF_random'
-    //   [script content - not echoed by shell]
-    //   TERMIFAI_EOF_random
-    //   chmod +x "$f" && bash "$f"; rm -f "$f"
-    //
-    // The X's must be the trailing characters of the template with nothing after them —
-    // BSD/macOS mktemp and busybox mktemp (used on Alpine, a supported host OS) only
-    // substitute a trailing run of X's and either leave a literal "XXXXXXXX" in the
-    // filename (macOS) or fail outright (busybox) if a suffix like ".sh" follows it.
-    // No extension is needed since the file is executed explicitly via `bash "$f"`.
+    let host_id = {
+        let manager = state.pty_manager.lock().unwrap();
+        manager.get_host_id(&session_id)?
+    };
 
-    let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let rand_id = &rand_id[..8];
-    let eof_marker = format!("TERMIFAI_EOF_{}", rand_id);
+    if let Some(ref h_id) = host_id {
+        // SSH Session: Upload via SFTP first, then execute
+        let has_sftp = {
+            let sftp_mgr = state.sftp_manager.lock().unwrap();
+            sftp_mgr.get_session(&session_id).is_ok()
+        };
 
-    // Build the full payload to send to PTY
-    // Line 1: erase the echoed command + create temp file + write script via heredoc
-    // Line 2..N: script content (shell does NOT echo heredoc body)
-    // Last line: EOF marker
-    // Then: chmod + execute + cleanup
-    let payload = format!(
-        " printf '\\033[1A\\033[2K\\r' && f=$(mktemp /tmp/termifai_XXXXXXXX) && cat > \"$f\" << '{eof}'\r{script}\r{eof}\rchmod +x \"$f\" && bash \"$f\"; rm -f \"$f\"\r",
-        eof = eof_marker,
-        script = script.replace('\r', ""),
-    );
+        if !has_sftp {
+            let vault = hosts::list_hosts(&app)?;
+            let host = vault
+                .hosts
+                .into_iter()
+                .find(|h| h.id == *h_id)
+                .ok_or_else(|| format!("Host '{}' not found", h_id))?;
 
-    let manager = state.pty_manager.lock().unwrap();
-    manager.write_to_session(&session_id, &payload)
+            let private_key_path = if let Some(key_id) = &host.ssh_key_id {
+                let keys = ssh_keys::list_ssh_keys(&app)?;
+                keys.into_iter()
+                    .find(|k| &k.id == key_id)
+                    .map(|k| k.private_key_path)
+            } else {
+                None
+            };
+
+            let request = SftpConnectRequest {
+                session_id: session_id.clone(),
+                hostname: host.hostname.clone(),
+                port: host.port,
+                username: host.user.clone(),
+                password: hosts::decrypt_host_password(&host),
+                private_key_path,
+                default_remote_path: host.default_sftp_path.clone(),
+            };
+
+            let mut sftp_mgr = state.sftp_manager.lock().unwrap();
+            let _ = sftp_mgr.connect(request, |_, _| {});
+        }
+
+        let sftp_entry_arc = {
+            let sftp_mgr = state.sftp_manager.lock().unwrap();
+            sftp_mgr.get_session(&session_id)?
+        };
+        let sftp_entry = sftp_entry_arc.lock().unwrap();
+        let sftp = sftp_entry.session.sftp().map_err(|e| format!("SFTP subsystem: {}", e))?;
+
+        let remote_filename = format!("termifai_run_{}.sh", &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]);
+        let remote_path = format!("/tmp/{}", remote_filename);
+
+        let mut remote_file = sftp
+            .create(std::path::Path::new(&remote_path))
+            .map_err(|e| format!("Failed to create remote temp file: {}", e))?;
+
+        use std::io::Write;
+        remote_file
+            .write_all(script.as_bytes())
+            .map_err(|e| format!("Failed to write remote script file: {}", e))?;
+
+        let payload = format!(
+            " printf '\\033[1A\\033[2K\\r' && chmod +x {remote} && {remote}; rm -f {remote}\r",
+            remote = remote_path
+        );
+        let manager = state.pty_manager.lock().unwrap();
+        manager.write_to_session(&session_id, &payload)
+    } else {
+        // Local Session: Write resolved script to local temp file and execute
+        let local_temp_path = std::env::temp_dir().join(format!("termifai_run_{}.sh", &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]));
+        std::fs::write(&local_temp_path, &script).map_err(|e| format!("Failed to write local temp script: {}", e))?;
+
+        let payload = format!(
+            " printf '\\033[1A\\033[2K\\r' && bash \"{}\"; rm -f \"{}\"\r",
+            local_temp_path.to_string_lossy(),
+            local_temp_path.to_string_lossy()
+        );
+        let manager = state.pty_manager.lock().unwrap();
+        manager.write_to_session(&session_id, &payload)
+    }
 }
 
 #[tauri::command]
