@@ -17,6 +17,11 @@ const AppShell = lazy(() =>
 const SettingsWindow = lazy(() =>
   import("@/components/settings/SettingsWindow").then((m) => ({ default: m.SettingsWindow }))
 );
+const QuickTerminalWindow = lazy(() =>
+  import("@/components/quick-terminal/QuickTerminalWindow").then((m) => ({
+    default: m.QuickTerminalWindow,
+  }))
+);
 
 applyAppTheme(loadAppTheme());
 window.addEventListener("storage", (event) => {
@@ -38,12 +43,18 @@ window.addEventListener("gesturestart", (e) => e.preventDefault());
 window.addEventListener("gesturechange", (e) => e.preventDefault());
 
 const params = new URLSearchParams(window.location.search);
-const isSettings = params.get("window") === "settings";
+const windowKind = params.get("window");
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <Suspense>
-      {isSettings ? <SettingsWindow /> : <AppShell />}
+      {windowKind === "settings" ? (
+        <SettingsWindow />
+      ) : windowKind === "quick-terminal" ? (
+        <QuickTerminalWindow />
+      ) : (
+        <AppShell />
+      )}
     </Suspense>
     <Toaster />
   </StrictMode>

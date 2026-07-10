@@ -62,3 +62,27 @@ export function openSettingsWindow(): Promise<void> {
 export function quitApp(): Promise<void> {
   return call<void>("quit_app");
 }
+
+export interface GeneralSettings {
+  runInBackground: boolean;
+}
+
+export function getGeneralSettings(): Promise<GeneralSettings> {
+  return call<GeneralSettings>("get_general_settings");
+}
+
+export function setGeneralSettings(settings: GeneralSettings): Promise<void> {
+  return call<void>("set_general_settings", { settings });
+}
+
+export function isAutostartEnabled(): Promise<boolean> {
+  return call<boolean>("is_autostart_enabled");
+}
+
+export function setAutostartEnabled(enabled: boolean): Promise<void> {
+  return call<void>("set_autostart_enabled", { enabled });
+}
+
+export function forceQuitApp(): Promise<void> {
+  return call<void>("force_quit_app");
+}
