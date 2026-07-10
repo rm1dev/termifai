@@ -97,7 +97,10 @@ impl<'a> ConflictHandler<'a> {
         mode: ConflictMode,
         prompt: impl FnMut(&ConflictInfo) -> ConflictDecision + 'a,
     ) -> Self {
-        Self { mode, prompt: Box::new(prompt) }
+        Self {
+            mode,
+            prompt: Box::new(prompt),
+        }
     }
 
     /// Ok(true) = overwrite/merge, Ok(false) = skip this item, Err = abort transfer.
@@ -122,7 +125,6 @@ impl<'a> ConflictHandler<'a> {
         }
     }
 }
-
 
 pub fn list_local(path: &str) -> Result<Vec<LocalFileEntry>, String> {
     let dir = std::fs::read_dir(path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
@@ -595,10 +597,16 @@ impl SftpEntry {
 
         let (local_is_dir, local_size, local_modified) = (
             meta.is_dir(),
-            if meta.is_dir() { None } else { Some(meta.len()) },
+            if meta.is_dir() {
+                None
+            } else {
+                Some(meta.len())
+            },
             meta.modified().ok().map(|t| {
                 format_unix_timestamp(
-                    t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
                 )
             }),
         );
@@ -739,7 +747,9 @@ impl SftpEntry {
             (is_dir, remote_size, remote_modified)
         };
 
-        if let Some((dest_is_dir, dest_size, dest_modified)) = stat_local_brief(std::path::Path::new(local_path)) {
+        if let Some((dest_is_dir, dest_size, dest_modified)) =
+            stat_local_brief(std::path::Path::new(local_path))
+        {
             if dest_is_dir == is_dir {
                 let proceed = conflicts.resolve(&ConflictInfo {
                     session_id: session_id.to_string(),
@@ -853,15 +863,24 @@ fn stat_local_brief(path: &std::path::Path) -> Option<(bool, Option<u64>, Option
     let meta = std::fs::metadata(path).ok()?;
     let modified = meta.modified().ok().map(|t| {
         format_unix_timestamp(
-            t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         )
     });
-    let size = if meta.is_dir() { None } else { Some(meta.len()) };
+    let size = if meta.is_dir() {
+        None
+    } else {
+        Some(meta.len())
+    };
     Some((meta.is_dir(), size, modified))
 }
 
 fn pathbase(path: &str) -> String {
-    path.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or("file").to_string()
+    path.rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("file")
+        .to_string()
 }
 
 /// Creates `path` on the remote if it doesn't exist; errors if it exists as a non-directory.
@@ -1108,9 +1127,12 @@ mod tests {
 
     #[test]
     fn conflict_single_decisions_do_not_stick() {
-        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| ConflictDecision::Overwrite);
+        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| {
+            ConflictDecision::Overwrite
+        });
         assert_eq!(h.resolve(&conflict_info()).unwrap(), true);
-        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| ConflictDecision::Skip);
+        let mut h =
+            ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| ConflictDecision::Skip);
         assert_eq!(h.resolve(&conflict_info()).unwrap(), false);
     }
 
@@ -1145,7 +1167,9 @@ mod tests {
 
     #[test]
     fn conflict_cancel_returns_cancelled_err() {
-        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| ConflictDecision::Cancel);
+        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| {
+            ConflictDecision::Cancel
+        });
         assert_eq!(h.resolve(&conflict_info()).unwrap_err(), "Cancelled");
     }
 }
