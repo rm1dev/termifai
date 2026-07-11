@@ -734,11 +734,6 @@ function SnippetListRow({
       <div className="w-48 shrink-0 truncate text-sm font-medium text-foreground">{s.name}</div>
       <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
       <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
-      {s.createdAt && (
-        <div className="hidden shrink-0 text-xs text-muted-foreground md:block">
-          {new Date(s.createdAt).toLocaleDateString()}
-        </div>
-      )}
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
         <button
           title="Edit"
