@@ -2096,10 +2096,12 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                 let _ = std::fs::remove_file(caja_script);
             }
 
-            // Reload file managers so that context menu changes apply instantly on Linux
-            let _ = std::process::Command::new("nautilus").arg("-q").status();
-            let _ = std::process::Command::new("nemo").arg("-q").status();
-            let _ = std::process::Command::new("caja").arg("-q").status();
+            // Reload file managers so that context menu changes apply instantly on Linux.
+            // Using pkill instead of 'nautilus -q' avoids DBUS session errors and root-execution warnings
+            // if the app is running in a different privilege context.
+            let _ = std::process::Command::new("pkill").args(["-f", "nautilus"]).status();
+            let _ = std::process::Command::new("pkill").args(["-f", "nemo"]).status();
+            let _ = std::process::Command::new("pkill").args(["-f", "caja"]).status();
             let _ = std::process::Command::new("kbuildsycoca6").status();
             let _ = std::process::Command::new("kbuildsycoca5").status();
         }
