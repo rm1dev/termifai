@@ -1,6 +1,6 @@
 use crate::model::forwards::PortForwardRule;
 use crate::model::hosts::{Host, HostGroup};
-use crate::model::snippets::Snippet;
+use crate::model::snippets::{Snippet, SnippetGroup};
 use crate::model::ssh_keys::SshKey;
 use crate::model::tombstones::{EntityKind, Tombstone};
 use crate::sync::payload::{SettingsBlob, SettingsPayload};
@@ -38,6 +38,15 @@ impl Syncable for HostGroup {
 }
 
 impl Syncable for Snippet {
+    fn sync_id(&self) -> &str {
+        &self.id
+    }
+    fn sync_updated_at(&self) -> &str {
+        self.updated_at.as_deref().unwrap_or(EPOCH)
+    }
+}
+
+impl Syncable for SnippetGroup {
     fn sync_id(&self) -> &str {
         &self.id
     }

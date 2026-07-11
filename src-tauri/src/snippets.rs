@@ -1,9 +1,10 @@
 use crate::AppState;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 use termifai_core::model::snippets::migrate_snippets_vault;
 pub use termifai_core::model::snippets::{
-    Snippet, SnippetKind, SnippetVariable, SnippetVariableType, SnippetsVault,
+    Snippet, SnippetGroup, SnippetKind, SnippetOsTarget, SnippetVariable, SnippetVariableType,
+    SnippetsVault,
 };
 
 #[derive(Deserialize)]
@@ -17,6 +18,27 @@ pub struct SaveSnippetRequest {
     pub script: Option<String>,
     #[serde(default)]
     pub variables: Vec<SnippetVariable>,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub keyword: Option<String>,
+    #[serde(default)]
+    pub os_targets: Vec<SnippetOsTarget>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveSnippetGroupRequest {
+    pub id: Option<String>,
+    pub name: String,
+    pub parent_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnippetsListResult {
+    pub snippets: Vec<Snippet>,
+    pub groups: Vec<SnippetGroup>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -55,7 +77,7 @@ fn delete_script_file(dir: &std::path::Path, id: &str) {
     let _ = std::fs::remove_file(script_path(dir, id));
 }
 
-pub fn list_snippets(app: &AppHandle) -> Result<Vec<Snippet>, String> {
+pub fn list_snippets(app: &AppHandle) -> Result<SnippetsListResult, String> {
     let state = app.state::<AppState>();
     let vault = state
         .snippets_store
@@ -73,7 +95,10 @@ pub fn list_snippets(app: &AppHandle) -> Result<Vec<Snippet>, String> {
             }
         }
     }
-    Ok(snippets)
+    Ok(SnippetsListResult {
+        snippets,
+        groups: vault.groups,
+    })
 }
 
 /// One-time startup migration: move inline script bodies from the DB vault
@@ -142,6 +167,12 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
                 .find(|s| s.id == id)
                 .and_then(|s| s.created_at.clone());
 
+            let keyword = if matches!(request.kind, SnippetKind::Text) {
+                request.keyword.clone().filter(|v| !v.trim().is_empty())
+            } else {
+                None
+            };
+
             let snippet_db = Snippet {
                 id: id.clone(),
                 kind: request.kind.clone(),
@@ -150,6 +181,9 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
                 command: request.command.filter(|v| !v.trim().is_empty()),
                 script: None, // Do not store script content inline in DB
                 variables: request.variables.clone(),
+                group_id: request.group_id.clone().filter(|v| !v.trim().is_empty()),
+                keyword,
+                os_targets: request.os_targets.clone(),
                 created_at: existing_created_at.or_else(|| Some(now_iso())),
                 updated_at: Some(now_iso()),
             };
@@ -193,6 +227,123 @@ pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> 
     Ok(())
 }
 
+pub fn save_snippet_group(
+    app: &AppHandle,
+    request: SaveSnippetGroupRequest,
+) -> Result<SnippetGroup, String> {
+    let name = request.name.trim();
+    if name.is_empty() {
+        return Err("Group name is required".to_string());
+    }
+
+    let id = request
+        .id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("sg-{}", uuid::Uuid::new_v4()));
+
+    if request.parent_id.as_deref() == Some(&id) {
+        return Err("Group cannot be its own parent".to_string());
+    }
+
+    let parent_id = request
+        .parent_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+
+    let group = SnippetGroup {
+        id: id.clone(),
+        name: name.to_string(),
+        parent_id: parent_id.clone(),
+        updated_at: Some(now_iso()),
+    };
+
+    let state = app.state::<AppState>();
+    let mut error = None;
+
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            if let Some(parent_id) = parent_id.as_deref() {
+                if !vault.groups.iter().any(|g| g.id == parent_id) {
+                    error = Some("Selected group does not exist".to_string());
+                    return;
+                }
+            }
+            upsert_group_by_id(&mut vault.groups, group.clone());
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Some(err_msg) = error {
+        return Err(err_msg);
+    }
+
+    Ok(group)
+}
+
+pub fn remove_snippet_group(app: &AppHandle, id: String) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut removed_group_ids: Vec<String> = Vec::new();
+
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            let descendants = descendant_group_ids(&vault.groups, &id);
+            removed_group_ids = std::iter::once(id.clone())
+                .chain(descendants.iter().cloned())
+                .collect();
+
+            vault
+                .groups
+                .retain(|group| group.id != id && !descendants.contains(&group.id));
+            for snippet in vault.snippets.iter_mut() {
+                if snippet
+                    .group_id
+                    .as_ref()
+                    .map(|group_id| group_id == &id || descendants.contains(group_id))
+                    .unwrap_or(false)
+                {
+                    snippet.group_id = None;
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    crate::tombstones::record(
+        app,
+        crate::tombstones::EntityKind::SnippetGroup,
+        &removed_group_ids,
+    )?;
+    Ok(())
+}
+
+fn descendant_group_ids(groups: &[SnippetGroup], id: &str) -> Vec<String> {
+    let mut descendants = Vec::new();
+    let mut stack = vec![id.to_string()];
+
+    while let Some(parent_id) = stack.pop() {
+        for group in groups.iter().filter(|group| {
+            group
+                .parent_id
+                .as_ref()
+                .map(|current| current == &parent_id)
+                .unwrap_or(false)
+        }) {
+            descendants.push(group.id.clone());
+            stack.push(group.id.clone());
+        }
+    }
+
+    descendants
+}
+
+fn upsert_group_by_id(items: &mut Vec<SnippetGroup>, item: SnippetGroup) {
+    if let Some(index) = items.iter().position(|existing| existing.id == item.id) {
+        items[index] = item;
+    } else {
+        items.insert(0, item);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Internals
 // ──────────────────────────────────────────────────────────────────────────────
@@ -232,6 +383,13 @@ fn validate_snippet(request: &SaveSnippetRequest) -> Result<(), String> {
             {
                 return Err("Script is required for script snippets".to_string());
             }
+        }
+    }
+
+    if let Some(keyword) = request.keyword.as_ref() {
+        let trimmed = keyword.trim();
+        if !trimmed.is_empty() && trimmed.split_whitespace().count() > 1 {
+            return Err("Snippet keyword must be a single word".to_string());
         }
     }
 
