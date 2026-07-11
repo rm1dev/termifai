@@ -6,6 +6,7 @@ pub enum EntityKind {
     Host,
     Group,
     Snippet,
+    SnippetGroup,
     PortForward,
     SshKey,
 }

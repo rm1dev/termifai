@@ -458,6 +458,7 @@ pub fn sync_import_foreign(
         hosts: outcome.hosts.clone(),
         groups: outcome.groups.clone(),
         snippets: outcome.snippets.clone(),
+        snippet_groups: outcome.snippet_groups.clone(),
         port_forwards: outcome.port_forwards.clone(),
         ssh_keys: outcome.ssh_keys.clone(),
         settings: outcome.settings.clone(),
@@ -660,10 +661,13 @@ fn gather_local_snapshot(
         None
     };
 
+    let snippets_result = crate::snippets::list_snippets(app)?;
+
     Ok(LocalSnapshot {
         hosts,
         groups: hosts_vault.groups,
-        snippets: crate::snippets::list_snippets(app)?,
+        snippets: snippets_result.snippets,
+        snippet_groups: snippets_result.groups,
         port_forwards: crate::port_forwarding::list_port_forwards(app)?,
         ssh_keys,
         settings,
@@ -704,12 +708,14 @@ fn apply_outcome(
         .map_err(|e| e.to_string())?;
 
     let snippets = outcome.snippets.clone();
+    let snippet_groups = outcome.snippet_groups.clone();
     state
         .snippets_store
         .update_with_migration(
             termifai_core::model::snippets::migrate_snippets_vault,
             |vault| {
                 vault.snippets = snippets.clone();
+                vault.groups = snippet_groups.clone();
             },
         )
         .map_err(|e| e.to_string())?;
@@ -761,6 +767,7 @@ fn write_payload_to_local_stores(
         hosts: payload.hosts.clone(),
         groups: payload.groups.clone(),
         snippets: payload.snippets.clone(),
+        snippet_groups: payload.snippet_groups.clone(),
         port_forwards: payload.port_forwards.clone(),
         ssh_keys: payload.ssh_keys.clone(),
         settings: payload.settings.clone(),
