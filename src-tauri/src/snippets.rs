@@ -78,8 +78,9 @@ pub fn list_snippets(app: &AppHandle) -> Result<Vec<Snippet>, String> {
 
 /// One-time startup migration: move inline script bodies from the DB vault
 /// into per-snippet .sh files. The inline copy is cleared ONLY for snippets
-/// whose file write succeeded (or that already have a file on disk), so a
-/// failed write can never lose the script.
+/// whose file write succeeded, so a failed write can never lose the script.
+/// The write is unconditional (even if a .sh file already exists) because
+/// synced inline content may be newer than whatever is on disk locally.
 pub fn migrate_inline_scripts(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
     let vault = state
@@ -92,8 +93,7 @@ pub fn migrate_inline_scripts(app: &AppHandle) -> Result<(), String> {
     for s in &vault.snippets {
         if matches!(s.kind, SnippetKind::Script) {
             if let Some(ref content) = s.script {
-                let already_on_disk = script_path(&dir, &s.id).exists();
-                if already_on_disk || write_script_file(&dir, &s.id, content).is_ok() {
+                if write_script_file(&dir, &s.id, content).is_ok() {
                     migrated_ids.push(s.id.clone());
                 }
             }
@@ -128,9 +128,6 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
         if let Some(ref script_content) = request.script {
             write_script_file(&dir, &id, script_content)?;
         }
-    } else {
-        // Editing an existing Script snippet to another kind orphans its file.
-        delete_script_file(&dir, &id);
     }
 
     let state = app.state::<AppState>();
@@ -167,17 +164,18 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
         })
         .map_err(|e| e.to_string())?;
 
+    if !matches!(request.kind, SnippetKind::Script) {
+        // Editing an existing Script snippet to another kind orphans its file.
+        // Deleted only after the DB update succeeds, so a failure never loses
+        // the script while also removing the snippet's Script-kind record.
+        delete_script_file(&dir, &id);
+    }
+
     saved_snippet.ok_or_else(|| "Failed to save snippet".to_string())
 }
 
 pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
     let state = app.state::<AppState>();
-
-    if let Ok(dir) = get_snippets_dir(app) {
-        for id in &ids {
-            delete_script_file(&dir, id);
-        }
-    }
 
     state
         .snippets_store
@@ -186,6 +184,12 @@ pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> 
         })
         .map_err(|e| e.to_string())?;
     crate::tombstones::record(app, crate::tombstones::EntityKind::Snippet, &ids)?;
+
+    if let Ok(dir) = get_snippets_dir(app) {
+        for id in &ids {
+            delete_script_file(&dir, id);
+        }
+    }
     Ok(())
 }
 
@@ -293,5 +297,26 @@ mod tests {
     fn write_to_missing_dir_fails_without_panicking() {
         let dir = std::env::temp_dir().join("termifai_missing_dir_test/never_created");
         assert!(write_script_file(&dir, "abc", "x").is_err());
+    }
+
+    #[test]
+    fn write_script_file_overwrites_stale_file_on_disk() {
+        // Regression test for the migrate_inline_scripts short-circuit bug:
+        // a .sh file already on disk must not block a write-through of newer
+        // (e.g. synced) inline content.
+        let dir = temp_dir();
+        write_script_file(&dir, "abc", "OLD content").unwrap();
+        assert_eq!(
+            read_script_file(&dir, "abc").as_deref(),
+            Some("OLD content")
+        );
+
+        write_script_file(&dir, "abc", "NEW content").unwrap();
+        assert_eq!(
+            read_script_file(&dir, "abc").as_deref(),
+            Some("NEW content")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
