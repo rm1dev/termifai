@@ -827,10 +827,10 @@ const BaseTabChip = forwardRef<HTMLDivElement, BaseTabChipProps>(function BaseTa
         }
       }}
       className={[
-        "group relative flex h-9 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs font-medium outline-none",
+        "group relative flex h-9 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs font-medium outline-none border-t-2 transition-all",
         active
-          ? "bg-[var(--color-tab-active)] text-foreground"
-          : "bg-[var(--color-tab-inactive)] text-muted-foreground hover:text-foreground",
+          ? "bg-[var(--color-tab-active)] text-foreground border-primary"
+          : "bg-[var(--color-tab-inactive)] text-muted-foreground hover:text-foreground border-transparent",
       ].join(" ")}
     >
       {icon}
