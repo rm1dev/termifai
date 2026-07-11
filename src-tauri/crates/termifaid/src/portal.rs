@@ -17,7 +17,6 @@ pub fn run() {
 }
 
 async fn run_inner() -> Result<(), ashpd::Error> {
-    let _ = ashpd::desktop::register_host_app().await;
     let proxy = GlobalShortcuts::new().await?;
 
     // Activation events for every session we own; the shortcut id is the

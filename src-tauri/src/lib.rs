@@ -140,6 +140,39 @@ fn close_session(state: State<AppState>, session_id: String) -> Result<(), Strin
     manager.close_session(&session_id)
 }
 
+/// Builds the "main" webview window. Used both at startup and to recreate
+/// the window if a second launch is forwarded after the user fully closed
+/// it (possible when the "run in background" setting is off).
+fn build_main_window(
+    app: &tauri::AppHandle,
+    visible: bool,
+) -> tauri::Result<tauri::WebviewWindow> {
+    let mut main_builder =
+        WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+            .title("Termifai")
+            .inner_size(900.0, 600.0)
+            .min_inner_size(900.0, 600.0)
+            .resizable(true)
+            .transparent(true)
+            .visible(visible);
+
+    #[cfg(target_os = "macos")]
+    {
+        main_builder = main_builder
+            .decorations(true)
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .traffic_light_position(tauri::LogicalPosition::new(12.0, 25.0));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        main_builder = main_builder.decorations(false);
+    }
+
+    main_builder.build()
+}
+
 #[tauri::command]
 fn new_window(app: tauri::AppHandle) -> Result<(), String> {
     let count = WINDOW_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1505,6 +1538,177 @@ fn take_pending_open_folders(state: State<PendingOpenFolders>) -> Vec<String> {
     std::mem::take(&mut *state.0.lock().unwrap())
 }
 
+/// Per-webview initial-load progress, fed by `on_page_load`.
+///
+/// Why this exists: after a force quit, termifaid's supervisor respawns the
+/// app with `--background`, so every webview performs its initial load while
+/// the app is an invisible Accessory agent. macOS may App Nap / suspend the
+/// WebKit content process mid-navigation in that state; the load then never
+/// finishes and the window would be shown as a permanently blank shell.
+/// Every show path consults this map via `revive_webview_if_stuck` first.
+enum WebviewLoadState {
+    /// Navigation started at `since` and has not reported Finished yet.
+    Loading { since: std::time::Instant },
+    Finished,
+}
+
+#[derive(Default)]
+struct WebviewHealth(std::sync::Mutex<std::collections::HashMap<String, WebviewLoadState>>);
+
+/// How long an in-flight load is given before a show path presumes it dead.
+/// A healthy cold load takes a couple of seconds; a suspended one stays
+/// "loading" forever.
+const WEBVIEW_STALE_LOAD: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Reloads `window`'s webview if its initial load looks dead (started long
+/// ago and never finished, or never started at all). Call before showing a
+/// window that may have been loaded while hidden. Returns `true` when a
+/// reload was issued, i.e. the frontend was NOT alive; callers that depend on
+/// frontend event listeners (quick terminal slide-in) must then defer their
+/// action until the fresh page reports ready. Uses `WebviewWindow::reload`
+/// rather than an eval of `location.reload()`: eval is silently dropped by a
+/// dead WebKit content process, while a native reload respawns it.
+pub(crate) fn revive_webview_if_stuck(window: &tauri::WebviewWindow) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let health = window.app_handle().state::<WebviewHealth>();
+        let stuck = {
+            let mut map = health.0.lock().unwrap();
+            let stuck = match map.get(window.label()) {
+                Some(WebviewLoadState::Finished) => false,
+                Some(WebviewLoadState::Loading { since }) => since.elapsed() > WEBVIEW_STALE_LOAD,
+                // No Started event was ever delivered: navigation never began.
+                None => true,
+            };
+            if stuck {
+                // Restart the clock so back-to-back shows don't reload the reload.
+                map.insert(
+                    window.label().to_string(),
+                    WebviewLoadState::Loading {
+                        since: std::time::Instant::now(),
+                    },
+                );
+            }
+            stuck
+            // Lock dropped here: reload() can re-enter on_page_load synchronously.
+        };
+        if stuck {
+            log::warn!(
+                "webview '{}' looks dead (initial load never finished) — reloading",
+                window.label()
+            );
+            let _ = window.reload();
+        }
+        stuck
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window;
+        false
+    }
+}
+
+/// Holds an NSActivity for the duration of the startup webview loads of a
+/// `--background` launch, so macOS does not App Nap the invisible agent
+/// process mid-navigation (the root cause `revive_webview_if_stuck` guards
+/// against). Begun in setup, ended by `on_page_load` once every startup
+/// webview reports Finished. Ending is idempotent; a leaked token (a load
+/// that truly never finishes) merely keeps the process nap-exempt, which is
+/// the safe direction.
+#[cfg(target_os = "macos")]
+mod launch_activity {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    use std::sync::Mutex;
+
+    /// NSActivityUserInitiatedAllowingIdleSystemSleep:
+    /// NSActivityUserInitiated (0x00FFFFFF) minus
+    /// NSActivityIdleSystemSleepDisabled (1 << 20) — prevents App Nap without
+    /// keeping the machine awake.
+    const OPTIONS: u64 = 0x00EF_FFFF;
+
+    struct ActivityToken(Retained<AnyObject>);
+    // NSProcessInfo activity tokens are opaque and may be ended from any
+    // thread; the token itself is never mutated.
+    unsafe impl Send for ActivityToken {}
+
+    static TOKEN: Mutex<Option<ActivityToken>> = Mutex::new(None);
+
+    pub fn begin() {
+        let token: Retained<AnyObject> = unsafe {
+            let info: Retained<AnyObject> = msg_send![class!(NSProcessInfo), processInfo];
+            let reason: Retained<AnyObject> = msg_send![
+                class!(NSString),
+                stringWithUTF8String: c"Termifai initial webview load while hidden".as_ptr()
+            ];
+            msg_send![&*info, beginActivityWithOptions: OPTIONS, reason: &*reason]
+        };
+        *TOKEN.lock().unwrap() = Some(ActivityToken(token));
+    }
+
+    pub fn end() {
+        let token = TOKEN.lock().unwrap().take();
+        if let Some(token) = token {
+            unsafe {
+                let info: Retained<AnyObject> = msg_send![class!(NSProcessInfo), processInfo];
+                let _: () = msg_send![&*info, endActivity: &*token.0];
+            }
+        }
+    }
+}
+
+/// Best-effort directory for the panic log, resolved without an AppHandle so
+/// it works no matter how early the panic happens.
+fn panic_log_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|d| std::path::PathBuf::from(d).join("com.termifai"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::env::var_os("HOME").map(|h| {
+            std::path::PathBuf::from(h).join("Library/Application Support/com.termifai")
+        })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".local/share/com.termifai"))
+    }
+}
+
+/// Appends every panic (message + location + backtrace) to
+/// `<app-data>/panic.log` and to the regular log file, then delegates to the
+/// previous hook. Release builds on Windows are `windows_subsystem =
+/// "windows"`, so a panic — including the `.expect` that wraps a failed
+/// `setup` — is otherwise completely invisible: the window flashes open and
+/// the process silently dies.
+fn install_panic_logger() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = format!(
+            "[{:?}] panic: {}\nbacktrace:\n{}\n",
+            std::time::SystemTime::now(),
+            info,
+            std::backtrace::Backtrace::force_capture()
+        );
+        log::error!("{message}");
+        if let Some(dir) = panic_log_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("panic.log"))
+            {
+                let _ = file.write_all(message.as_bytes());
+            }
+        }
+        previous(info);
+    }));
+}
+
 #[cfg(target_os = "macos")]
 fn handle_opened_urls(app: &tauri::AppHandle, urls: Vec<tauri::Url>) {
     for url in urls {
@@ -1526,6 +1730,7 @@ fn handle_opened_urls(app: &tauri::AppHandle, urls: Vec<tauri::Url>) {
             .push(path);
 
         if let Some(window) = app.get_webview_window("main") {
+            revive_webview_if_stuck(&window);
             global_hotkey::set_dock_visible(app, true);
             let _ = window.show();
             let _ = window.set_focus();
@@ -1571,12 +1776,62 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                 ])
                 .status();
 
+            // Add Directory shell Icon
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\shell\\Termifai",
+                    "/v",
+                    "Icon",
+                    "/d",
+                    &current_exe,
+                    "/f",
+                ])
+                .status();
+
             // Add Directory command
             let cmd_val = format!("\"{}\" \"%V\"", current_exe);
             let _ = std::process::Command::new(reg_exe)
                 .args(&[
                     "add",
                     "HKCU\\Software\\Classes\\Directory\\shell\\Termifai\\command",
+                    "/ve",
+                    "/d",
+                    &cmd_val,
+                    "/f",
+                ])
+                .status();
+
+            // Add Drive shell
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Drive\\shell\\Termifai",
+                    "/ve",
+                    "/d",
+                    "Open in Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Add Drive shell Icon
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Drive\\shell\\Termifai",
+                    "/v",
+                    "Icon",
+                    "/d",
+                    &current_exe,
+                    "/f",
+                ])
+                .status();
+
+            // Add Drive command
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Drive\\shell\\Termifai\\command",
                     "/ve",
                     "/d",
                     &cmd_val,
@@ -1592,6 +1847,19 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                     "/ve",
                     "/d",
                     "Open in Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Add Background shell Icon
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\Background\\shell\\Termifai",
+                    "/v",
+                    "Icon",
+                    "/d",
+                    &current_exe,
                     "/f",
                 ])
                 .status();
@@ -1617,6 +1885,15 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                 ])
                 .status();
 
+            // Remove Drive
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "delete",
+                    "HKCU\\Software\\Classes\\Drive\\shell\\Termifai",
+                    "/f",
+                ])
+                .status();
+
             // Remove Background
             let _ = std::process::Command::new(reg_exe)
                 .args(&[
@@ -1630,64 +1907,28 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
 
     #[cfg(target_os = "linux")]
     {
-        let current_exe = std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .to_string_lossy()
-            .into_owned();
-
-        let home = std::env::var("HOME").map(std::path::PathBuf::from).ok();
-
-        // 1. KDE Dolphin ServiceMenu
-        if let Some(ref h) = home {
-            let dir = h.join(".local/share/kservices5/ServiceMenus");
-            let file_path = dir.join("termifai.desktop");
-            if _enabled {
-                let _ = std::fs::create_dir_all(&dir);
-                let content = format!(
-                    "[Desktop Entry]\n\
-                     Type=Service\n\
-                     ServiceTypes=KonqPopupMenu/Plugin,inode/directory\n\
-                     Actions=openInTermifai\n\
-                     MimeType=inode/directory;\n\n\
-                     [Desktop Action openInTermifai]\n\
-                     Name=Open in Termifai\n\
-                     Icon=utilities-terminal\n\
-                     Exec=\"{}\" \"%f\"\n",
-                    current_exe
-                );
-                let _ = std::fs::write(file_path, content);
-            } else {
-                let _ = std::fs::remove_file(file_path);
+        // Linux context menu integration is disabled. Clean up any leftover integration files.
+        let mut home = std::env::var("HOME").map(std::path::PathBuf::from).ok();
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            if !sudo_user.is_empty() {
+                let user_home = std::path::PathBuf::from(format!("/home/{}", sudo_user));
+                if user_home.exists() {
+                    home = Some(user_home);
+                }
             }
         }
-
-        // 2. GNOME Nautilus Scripts
         if let Some(ref h) = home {
-            let nautilus_dir = h.join(".local/share/nautilus/scripts");
-            let script_path = nautilus_dir.join("Open in Termifai");
-            if _enabled {
-                let _ = std::fs::create_dir_all(&nautilus_dir);
-                let content = format!(
-                    "#!/bin/sh\n\
-                     path=$(echo \"$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS\" | head -n 1)\n\
-                     if [ -z \"$path\" ]; then\n\
-                       path=\"$NAUTILUS_SCRIPT_CURRENT_URI\"\n\
-                       path=\"${{path#file://}}\"\n\
-                     fi\n\
-                     exec \"{}\" \"$path\"\n",
-                    current_exe
-                );
-                if std::fs::write(&script_path, content).is_ok() {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(metadata) = std::fs::metadata(&script_path) {
-                        let mut perms = metadata.permissions();
-                        perms.set_mode(0o755);
-                        let _ = std::fs::set_permissions(&script_path, perms);
-                    }
-                }
-            } else {
-                let _ = std::fs::remove_file(script_path);
-            }
+            let _ = std::fs::remove_file(h.join(".local/share/nautilus/scripts/Open in Termifai"));
+            let _ = std::fs::remove_file(h.join(".local/share/nautilus-python/extensions/termifai.py"));
+            let _ = std::fs::remove_file(h.join(".local/share/nemo/scripts/Open in Termifai"));
+            let _ = std::fs::remove_file(h.join(".local/share/nemo/actions/termifai.nemo_action"));
+            let _ = std::fs::remove_file(h.join(".local/share/caja/scripts/Open in Termifai"));
+            let _ = std::fs::remove_file(h.join(".local/share/kservices5/ServiceMenus/termifai.desktop"));
+            let _ = std::fs::remove_file(h.join(".local/share/kservices6/ServiceMenus/termifai.desktop"));
+            // Gracefully restart any file managers to apply cleanup
+            let _ = std::process::Command::new("pkill").args(["-f", "nautilus"]).status();
+            let _ = std::process::Command::new("pkill").args(["-f", "nemo"]).status();
+            let _ = std::process::Command::new("pkill").args(["-f", "caja"]).status();
         }
     }
 
@@ -1796,8 +2037,10 @@ fn quit_to_background(app: &tauri::AppHandle) {
     // Fresh frontend boot. Each window loads index.html?window=…, so a
     // reload equals a cold start of that webview. Windows are never
     // destroyed/recreated: dynamic creation deadlocks WebView2 on Windows.
+    // Native reload instead of eval("location.reload()"): eval is silently
+    // dropped by a dead WebKit content process, reload() revives it.
     for window in app.webview_windows().values() {
-        let _ = window.eval("window.location.reload()");
+        let _ = window.reload();
     }
 }
 
@@ -1882,21 +2125,129 @@ fn start_screen_lock_monitor(app: tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_panic_logger();
     tauri::Builder::default()
+        // Always-on file logging (LogDir = %LOCALAPPDATA%/com.termifai/logs on
+        // Windows, ~/Library/Logs/com.termifai on macOS). With
+        // windows_subsystem = "windows" release builds have no stderr, so
+        // without this a startup failure is completely silent — the app just
+        // "opens and closes itself" with nothing to diagnose.
+        .plugin(
+            tauri_plugin_log::Builder::default()
+                .level(log::LevelFilter::Info)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("termifai".into()),
+                    }),
+                ])
+                .max_file_size(512_000)
+                .build(),
+        )
         // Managed at builder level (not in setup) so it exists even for
         // RunEvent::Opened URLs delivered during early launch.
         .manage(PendingOpenFolders::default())
+        .manage(WebviewHealth::default())
+        .on_page_load(|webview, payload| {
+            let app = webview.app_handle();
+            let health = app.state::<WebviewHealth>();
+            let mut map = health.0.lock().unwrap();
+            match payload.event() {
+                tauri::webview::PageLoadEvent::Started => {
+                    log::info!("webview '{}': load started", webview.label());
+                    map.insert(
+                        webview.label().to_string(),
+                        WebviewLoadState::Loading {
+                            since: std::time::Instant::now(),
+                        },
+                    );
+                }
+                tauri::webview::PageLoadEvent::Finished => {
+                    log::info!("webview '{}': load finished", webview.label());
+                    map.insert(webview.label().to_string(), WebviewLoadState::Finished);
+                    // Once every startup webview has finished loading, the
+                    // hidden --background instance no longer needs its App
+                    // Nap exemption.
+                    #[cfg(target_os = "macos")]
+                    {
+                        let all_finished = app
+                            .webview_windows()
+                            .keys()
+                            .all(|label| matches!(map.get(label), Some(WebviewLoadState::Finished)));
+                        if all_finished {
+                            launch_activity::end();
+                        }
+                    }
+                }
+            }
+        })
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // The hotkey daemon launches us with --hotkey=<action>; when an
             // instance is already running the argument lands here and is
             // dispatched directly. Any other second launch (e.g. clicking the
             // app icon again) just surfaces the existing instance.
+            log::info!("single-instance: second launch forwarded, argv={argv:?}");
+            let mut found_folder = false;
+            for arg in &argv {
+                let mut clean_arg = arg.clone();
+                if clean_arg.ends_with('"') {
+                    clean_arg.pop();
+                }
+                let path = std::path::Path::new(&clean_arg);
+                if path.is_dir() {
+                    let path_str = path.to_string_lossy().into_owned();
+                    let clean_path = if path_str.starts_with(r"\\?\") {
+                        path_str[4..].to_string()
+                    } else {
+                        path_str
+                    };
+                    app.state::<PendingOpenFolders>()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .push(clean_path);
+                    found_folder = true;
+                }
+            }
+
+            if found_folder {
+                let _ = app.emit("open-folder-pending", ());
+            }
+
             if let Some(action) = global_hotkey::hotkey_arg(&argv) {
                 global_hotkey::dispatch(app, &action);
-            } else if let Some(window) = app.get_webview_window("main") {
-                global_hotkey::set_dock_visible(app, true);
-                let _ = window.show();
-                let _ = window.set_focus();
+            } else {
+                // The "main" window may not exist yet (setup is still running
+                // on the main thread, e.g. a --background launch racing with
+                // this forward) or may have been fully closed (the user has
+                // "run in background" disabled). Either way, rebuilding a
+                // WebView2 window off the main thread deadlocks on Windows,
+                // so hop onto it and re-check there instead of building here.
+                let app_handle = app.clone();
+                let _ = app.run_on_main_thread(move || {
+                    match app_handle.get_webview_window("main") {
+                        Some(window) => {
+                            // The resident instance may be a post-force-quit
+                            // --background respawn whose webview died while
+                            // loading hidden; recover it before surfacing it.
+                            // Only relevant for a window that already existed —
+                            // reloading one we just built below would race its
+                            // own first navigation and can hang WebView2 on
+                            // Windows.
+                            revive_webview_if_stuck(&window);
+                            global_hotkey::set_dock_visible(&app_handle, true);
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                        None => {
+                            if let Err(e) = build_main_window(&app_handle, true) {
+                                log::error!("failed to rebuild main window: {e}");
+                            } else {
+                                global_hotkey::set_dock_visible(&app_handle, true);
+                            }
+                        }
+                    }
+                });
             }
         }))
         .plugin(
@@ -2008,6 +2359,7 @@ pub fn run() {
             // tray's "Quit" item (or the menu/shortcut equivalent) is the real exit.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let label = window.label();
+                log::info!("window '{label}': close requested");
                 if label == "main"
                     || label.starts_with("window-")
                     || label == quick_terminal::WINDOW_LABEL
@@ -2017,6 +2369,10 @@ pub fn run() {
                     if settings.run_in_background {
                         let _ = window.hide();
                         api.prevent_close();
+                    } else {
+                        log::info!("run_in_background is false: quitting app");
+                        global_hotkey::kill_daemon();
+                        app.exit(0);
                     }
                 }
             }
@@ -2028,6 +2384,7 @@ pub fn run() {
             // locks in the activation policy — setting Accessory any later
             // leaves the app registered as a regular (Dock-visible) app.
             let launch_args: Vec<String> = std::env::args().collect();
+            log::info!("setup: begin, args={launch_args:?}");
             let is_background_flag = launch_args.iter().any(|arg| arg == "--background");
             let hotkey_action = global_hotkey::hotkey_arg(&launch_args);
             let is_hotkey_launch = hotkey_action.is_some();
@@ -2036,6 +2393,12 @@ pub fn run() {
             #[cfg(target_os = "macos")]
             if background_launch {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                // An invisible Accessory agent is exactly what macOS App
+                // Naps; napping the WebKit content process mid-load is what
+                // leaves the webviews permanently blank (the
+                // blank-window-after-force-quit bug). Stay nap-exempt until
+                // on_page_load sees every startup webview finish.
+                launch_activity::begin();
             }
 
             let app_data_dir = app
@@ -2097,33 +2460,31 @@ pub fn run() {
             // Build the main window programmatically.
             // On macOS: with decorations and Overlay title bar style for traffic lights.
             // On Windows/Linux: without decorations to avoid two-toned title bar.
-            let mut main_builder =
-                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                    .title("Termifai")
-                    .inner_size(900.0, 600.0)
-                    .min_inner_size(900.0, 600.0)
-                    .resizable(true)
-                    .transparent(true)
-                    // On a quick-terminal cold launch the main window must
-                    // never appear — creating it visible and hiding later
-                    // makes it (and the Dock icon) flash.
-                    .visible(!background_launch);
-
-            #[cfg(target_os = "macos")]
-            {
-                main_builder = main_builder
-                    .decorations(true)
-                    .title_bar_style(tauri::TitleBarStyle::Overlay)
-                    .hidden_title(true)
-                    .traffic_light_position(tauri::LogicalPosition::new(12.0, 25.0));
+            // Process folder arguments on startup:
+            for arg in &launch_args {
+                let mut clean_arg = arg.clone();
+                if clean_arg.ends_with('"') {
+                    clean_arg.pop();
+                }
+                let path = std::path::Path::new(&clean_arg);
+                if path.is_dir() {
+                    let path_str = path.to_string_lossy().into_owned();
+                    let clean_path = if path_str.starts_with(r"\\?\") {
+                        path_str[4..].to_string()
+                    } else {
+                        path_str
+                    };
+                    app.state::<PendingOpenFolders>()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .push(clean_path);
+                }
             }
 
-            #[cfg(not(target_os = "macos"))]
-            {
-                main_builder = main_builder.decorations(false);
-            }
 
-            let _main_win = main_builder.build()?;
+
+            let _main_win = build_main_window(app.handle(), !background_launch)?;
 
             // Create the settings window hidden at startup — creating it dynamically after
             // the event loop starts deadlocks on Windows because WebView2 initialization
@@ -2293,13 +2654,6 @@ pub fn run() {
                 });
             }
 
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
             app.handle().plugin(tauri_plugin_autostart::init(
                 MacosLauncher::LaunchAgent,
                 Some(vec!["--background"]),
@@ -2337,6 +2691,7 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "tray-show" => {
                         if let Some(window) = app.get_webview_window("main") {
+                            revive_webview_if_stuck(&window);
                             global_hotkey::set_dock_visible(app, true);
                             let _ = window.show();
                             let _ = window.set_focus();
@@ -2389,6 +2744,7 @@ pub fn run() {
                 global_hotkey::set_dock_visible(app.handle(), true);
             }
 
+            log::info!("setup: complete");
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -2396,6 +2752,10 @@ pub fn run() {
         .run(|app_handle, event| match event {
             tauri::RunEvent::ExitRequested { api, .. } => {
                 let run_in_background = load_general_settings(app_handle).run_in_background;
+                log::info!(
+                    "exit requested (run_in_background={run_in_background}, should_exit={})",
+                    SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst)
+                );
                 if !run_in_background {
                     global_hotkey::kill_daemon();
                 } else if !SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
@@ -2407,6 +2767,7 @@ pub fn run() {
                 }
             }
             tauri::RunEvent::Exit => {
+                log::info!("exiting");
                 vault::on_app_exit(app_handle);
             }
             #[cfg(target_os = "macos")]
@@ -2419,6 +2780,7 @@ pub fn run() {
                 ..
             } => {
                 if let Some(window) = app_handle.get_webview_window("main") {
+                    revive_webview_if_stuck(&window);
                     global_hotkey::set_dock_visible(app_handle, true);
                     let _ = window.show();
                     let _ = window.set_focus();
@@ -2465,6 +2827,10 @@ fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
             }
         }
     };
+
+    // The settings webview loads once at startup and then sits hidden — the
+    // same suspended-while-hidden risk as the main window.
+    revive_webview_if_stuck(&window);
 
     // Position before showing so the window doesn't flash at its old spot.
     center_on_main(&window);

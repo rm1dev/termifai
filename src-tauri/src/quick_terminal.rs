@@ -390,6 +390,17 @@ pub fn toggle(app: &AppHandle) {
     if window.is_visible().unwrap_or(false) {
         hide_panel(app, window, &settings);
     } else {
+        // A panel whose webview died while loading hidden would slide in as
+        // an empty transparent shell (i.e. nothing visible at all). Reload it
+        // and defer this toggle through the existing PendingToggle handshake:
+        // the fresh page calls quick_terminal_frontend_ready once its event
+        // listeners are mounted, which performs the slide-in.
+        if crate::revive_webview_if_stuck(&window) {
+            app.state::<PendingToggle>()
+                .0
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         show_panel(app, window, &settings);
     }
 }

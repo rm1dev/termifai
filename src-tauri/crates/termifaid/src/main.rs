@@ -43,6 +43,7 @@ struct ServiceInfo {
     #[serde(default)]
     port: Option<u16>,
     #[serde(default)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     uds_path: Option<String>,
     #[serde(default)]
     supervise: bool,
