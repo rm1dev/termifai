@@ -16,6 +16,8 @@ export interface Host {
   showStatusInDashboard?: boolean;
   workingDirectory?: string;
   defaultSftpPath?: string;
+  /** Marks this host as the SFTP sync target (Settings → Sync → My Server). At most one host can have this set. */
+  syncServer?: boolean;
 }
 
 export interface HostGroup {
@@ -42,7 +44,8 @@ export interface AppTab {
   closable: boolean;
   sessionId?: string; // for terminal tabs to preserve session across switches
   initialCommand?: string;
-  initialPassword?: string;
+  cwd?: string; // starting directory for local terminal tabs
+
   readyMarker?: string;
   connectionLabel?: string;
   connectionTitle?: string;
@@ -53,6 +56,22 @@ export interface AppTab {
 }
 
 export type SnippetKind = "text" | "command" | "script";
+
+export type SnippetOsTarget =
+  | "all"
+  | "local"
+  | "linux"
+  | "windows"
+  | "ubuntu"
+  | "debian"
+  | "centos"
+  | "alpine";
+
+export interface SnippetGroup {
+  id: string;
+  name: string;
+  parentId: string | null;
+}
 
 export type SnippetVariableType = "text" | "enum";
 
@@ -76,6 +95,11 @@ export interface Snippet {
   /** For "script" kind — a full bash script */
   script?: string;
   variables?: SnippetVariable[];
+  groupId?: string | null;
+  /** For "text" kind only — typing this word in the terminal auto-expands it to `body`. */
+  keyword?: string;
+  /** Restricts which hosts this snippet is offered on. Empty/absent = all OS. */
+  osTargets?: SnippetOsTarget[];
   createdAt?: string; // ISO date string
 }
 
@@ -141,3 +165,16 @@ export interface TransferProgress {
   bytes_transferred: number;
   total_bytes: number;
 }
+
+export interface SftpConflictInfo {
+  session_id: string;
+  file_name: string;
+  dest_path: string;
+  kind: "file" | "dir";
+  direction: "upload" | "download";
+  existing_size: number | null;
+  existing_modified: string | null;
+  incoming_size: number | null;
+  incoming_modified: string | null;
+}
+
