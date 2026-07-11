@@ -1,35 +1,12 @@
+use crate::AppState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
 use std::io::{Read, Write};
-use std::path::PathBuf;
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
 use tauri::{AppHandle, Manager};
-
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum TunnelDirection {
-    Local,
-    Remote,
-    Dynamic,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortForwardRule {
-    pub id: String,
-    pub name: String,
-    pub host_id: String,
-    pub direction: TunnelDirection,
-    pub local_host: String,
-    pub local_port: u16,
-    pub remote_host: String,
-    pub remote_port: u16,
-    pub auto_connect: bool,
-    pub created_at: String,
-}
+use termifai_core::model::forwards::migrate_port_forward_vault;
+pub use termifai_core::model::forwards::{PortForwardRule, PortForwardVault, TunnelDirection};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -54,12 +31,6 @@ pub struct SavePortForwardRequest {
     pub auto_connect: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct PortForwardVault {
-    rules: Vec<PortForwardRule>,
-}
-
 /// Manages running SSH tunnel processes.
 pub struct TunnelManager {
     /// Map from rule_id to child process handle
@@ -72,6 +43,13 @@ impl TunnelManager {
             processes: HashMap::new(),
         }
     }
+
+    /// Kills every running tunnel process — used by quit-to-background reset.
+    pub fn stop_all(&mut self) {
+        for (_, mut child) in self.processes.drain() {
+            let _ = child.kill();
+        }
+    }
 }
 
 pub type TunnelManagerState = Mutex<TunnelManager>;
@@ -81,7 +59,11 @@ pub fn new_tunnel_manager() -> TunnelManagerState {
 }
 
 pub fn list_port_forwards(app: &AppHandle) -> Result<Vec<PortForwardRule>, String> {
-    let vault = read_vault(app)?;
+    let state = app.state::<AppState>();
+    let vault = state
+        .port_forward_store
+        .load_with_migration(migrate_port_forward_vault)
+        .map_err(|e| e.to_string())?;
     Ok(vault.rules)
 }
 
@@ -103,43 +85,52 @@ pub fn save_port_forward(
         return Err("Remote port must be between 1 and 65535".to_string());
     }
 
-    let mut vault = read_vault(app)?;
     let id = request
         .id
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("pf-{}", uuid::Uuid::new_v4()));
 
     let now = now_iso();
-    let existing_created = vault
-        .rules
-        .iter()
-        .find(|r| r.id == id)
-        .map(|r| r.created_at.clone());
+    let state = app.state::<AppState>();
+    let mut saved_rule = None;
 
-    let rule = PortForwardRule {
-        id: id.clone(),
-        name: name.to_string(),
-        host_id: request.host_id.trim().to_string(),
-        direction: request.direction,
-        local_host: if request.local_host.trim().is_empty() {
-            "127.0.0.1".to_string()
-        } else {
-            request.local_host.trim().to_string()
-        },
-        local_port: request.local_port,
-        remote_host: if request.remote_host.trim().is_empty() {
-            "127.0.0.1".to_string()
-        } else {
-            request.remote_host.trim().to_string()
-        },
-        remote_port: request.remote_port,
-        auto_connect: request.auto_connect,
-        created_at: existing_created.unwrap_or(now),
-    };
+    state
+        .port_forward_store
+        .update_with_migration(migrate_port_forward_vault, |vault| {
+            let existing_created = vault
+                .rules
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.created_at.clone());
 
-    upsert_by_id(&mut vault.rules, rule.clone(), |r| &r.id);
-    write_vault(app, &vault)?;
-    Ok(rule)
+            let rule = PortForwardRule {
+                id: id.clone(),
+                name: name.to_string(),
+                host_id: request.host_id.trim().to_string(),
+                direction: request.direction,
+                local_host: if request.local_host.trim().is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    request.local_host.trim().to_string()
+                },
+                local_port: request.local_port,
+                remote_host: if request.remote_host.trim().is_empty() {
+                    "127.0.0.1".to_string()
+                } else {
+                    request.remote_host.trim().to_string()
+                },
+                remote_port: request.remote_port,
+                auto_connect: request.auto_connect,
+                created_at: existing_created.unwrap_or_else(|| now.clone()),
+                updated_at: Some(now.clone()),
+            };
+
+            upsert_by_id(&mut vault.rules, rule.clone(), |r| &r.id);
+            saved_rule = Some(rule);
+        })
+        .map_err(|e| e.to_string())?;
+
+    saved_rule.ok_or_else(|| "Failed to save rule".to_string())
 }
 
 pub fn remove_port_forwards(
@@ -156,17 +147,58 @@ pub fn remove_port_forwards(
         }
     }
 
-    let mut vault = read_vault(app)?;
-    vault.rules.retain(|r| !ids.contains(&r.id));
-    write_vault(app, &vault)
+    let state = app.state::<AppState>();
+    state
+        .port_forward_store
+        .update_with_migration(migrate_port_forward_vault, |vault| {
+            vault.rules.retain(|r| !ids.contains(&r.id));
+        })
+        .map_err(|e| e.to_string())?;
+    crate::tombstones::record(app, crate::tombstones::EntityKind::PortForward, &ids)?;
+    Ok(())
 }
 
-pub fn start_tunnel(
+fn check_fatal_errors(output: &str) -> Option<String> {
+    if output.contains("could not resolve hostname")
+        || output.contains("name or service not known")
+        || output.contains("nodename nor servname provided")
+    {
+        Some("Hostname could not be resolved".to_string())
+    } else if output.contains("connection refused") {
+        Some("SSH connection was refused by the server".to_string())
+    } else if output.contains("operation timed out")
+        || output.contains("connection timed out")
+        || output.contains("no route to host")
+        || output.contains("network is unreachable")
+    {
+        Some("SSH connection timed out".to_string())
+    } else if output.contains("host key verification failed") {
+        Some("Host key verification failed".to_string())
+    } else if output.contains("permission denied")
+        || output.contains("too many authentication failures")
+        || output.contains("authentication failed")
+    {
+        Some("SSH authentication failed".to_string())
+    } else if output.contains("connection closed")
+        || output.contains("connection reset")
+        || output.contains("broken pipe")
+    {
+        Some("SSH connection closed prematurely".to_string())
+    } else {
+        None
+    }
+}
+
+pub async fn start_tunnel(
     app: &AppHandle,
     tunnel_mgr: &TunnelManagerState,
     rule_id: String,
 ) -> Result<TunnelStatus, String> {
-    let vault = read_vault(app)?;
+    let state = app.state::<AppState>();
+    let vault = state
+        .port_forward_store
+        .load_with_migration(migrate_port_forward_vault)
+        .map_err(|e| e.to_string())?;
     let rule = vault
         .rules
         .iter()
@@ -184,10 +216,9 @@ pub fn start_tunnel(
     // Build the SSH tunnel command
     let mut command = portable_pty::CommandBuilder::new("ssh");
     command.arg("-N"); // no remote command
+    command.arg("-v"); // verbose output so we can detect success/failure quickly
     command.arg("-o");
-    command.arg("StrictHostKeyChecking=no");
-    command.arg("-o");
-    command.arg("UserKnownHostsFile=/dev/null");
+    command.arg("StrictHostKeyChecking=accept-new");
     command.arg("-o");
     command.arg("ExitOnForwardFailure=yes");
     command.arg("-o");
@@ -199,7 +230,10 @@ pub fn start_tunnel(
 
     // If no password, use BatchMode to avoid hanging on prompts
     let host_password = crate::hosts::decrypt_host_password(host);
-    let has_password = host_password.as_ref().map(|p| !p.is_empty()).unwrap_or(false);
+    let has_password = host_password
+        .as_ref()
+        .map(|p| !p.is_empty())
+        .unwrap_or(false);
     if !has_password {
         command.arg("-o");
         command.arg("BatchMode=yes");
@@ -280,6 +314,9 @@ pub fn start_tunnel(
 
     // Handle password in a background thread, then keep reading to drain output
     let password = host_password.clone().unwrap_or_default();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
+    let mut tx = Some(tx);
+
     thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut output = String::new();
@@ -288,75 +325,126 @@ pub fn start_tunnel(
 
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    if let Some(t) = tx.take() {
+                        let _ = t.send(Err("SSH tunnel exited prematurely".to_string()));
+                    }
+                    break;
+                }
                 Ok(n) => {
-                    if !password_sent {
-                        let chunk = String::from_utf8_lossy(&buf[..n]);
-                        output.push_str(&chunk);
-                        if output.to_lowercase().contains("password:") {
-                            if let Some(ref mut w) = writer {
-                                let _ = w.write_all(format!("{}\r", password).as_bytes());
-                            }
-                            password_sent = true;
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    output.push_str(&chunk);
+
+                    let lower = output.to_lowercase();
+
+                    if !password_sent && lower.contains("password:") {
+                        if let Some(ref mut w) = writer {
+                            let _ = w.write_all(format!("{}\r", password).as_bytes());
+                        }
+                        password_sent = true;
+                    }
+
+                    if let Some(err) = check_fatal_errors(&lower) {
+                        if let Some(t) = tx.take() {
+                            let _ = t.send(Err(err));
                         }
                     }
-                    // Keep draining output so PTY buffer doesn't fill up
+
+                    if lower.contains("entering interactive session")
+                        || lower.contains("authenticated to")
+                        || lower.contains("authentication succeeded")
+                    {
+                        if let Some(t) = tx.take() {
+                            let _ = t.send(Ok(()));
+                        }
+                    }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    if let Some(t) = tx.take() {
+                        let _ = t.send(Err("Failed to read from PTY".to_string()));
+                    }
+                    break;
+                }
             }
         }
         // Drop writer when done
         drop(writer);
     });
 
-    // Wait for SSH to establish connection or fail
-    thread::sleep(Duration::from_millis(3000));
+    // Wait for SSH to establish connection or fail within bounded 3 seconds
+    let timeout_res = tokio::time::timeout(std::time::Duration::from_millis(3000), rx).await;
 
-    // Check if child is still running (borrow as mutable temporarily)
-    // We need to wrap child for shared ownership
     let mut child = child;
-    match child.try_wait() {
-        Ok(Some(_status)) => {
+
+    let success = match timeout_res {
+        Ok(Ok(Ok(()))) => true,
+        Ok(Ok(Err(err))) => {
+            let _ = child.kill();
+            let _ = child.wait();
             return Ok(TunnelStatus {
                 rule_id,
                 active: false,
                 pid: None,
-                error: Some("SSH tunnel exited immediately. Check host credentials and ports.".to_string()),
+                error: Some(err),
             });
         }
-        Ok(None) => { /* still running, good */ }
-        Err(e) => {
+        Ok(Err(_)) => {
+            let _ = child.kill();
+            let _ = child.wait();
             return Ok(TunnelStatus {
                 rule_id,
                 active: false,
                 pid: None,
-                error: Some(format!("Failed to check tunnel status: {}", e)),
+                error: Some("SSH tunnel failed to start (internal error)".to_string()),
             });
         }
+        Err(_) => {
+            // Timeout! Check if process is still running
+            match child.try_wait() {
+                Ok(None) => true, // Still running, assume success fallback
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok(TunnelStatus {
+                        rule_id,
+                        active: false,
+                        pid: None,
+                        error: Some("SSH tunnel timed out or exited".to_string()),
+                    });
+                }
+            }
+        }
+    };
+
+    if success {
+        let pid = child.process_id();
+
+        let mut mgr = tunnel_mgr
+            .lock()
+            .map_err(|_| "Failed to lock tunnel manager".to_string())?;
+
+        // Kill existing tunnel for this rule if any
+        if let Some(mut old) = mgr.processes.remove(&rule_id) {
+            let _ = old.kill();
+        }
+
+        mgr.processes.insert(rule_id.clone(), child);
+
+        Ok(TunnelStatus {
+            rule_id,
+            active: true,
+            pid,
+            error: None,
+        })
+    } else {
+        Err("Failed to start tunnel".to_string())
     }
-
-    let pid = child.process_id();
-
-    let mut mgr = tunnel_mgr
-        .lock()
-        .map_err(|_| "Failed to lock tunnel manager".to_string())?;
-
-    // Kill existing tunnel for this rule if any
-    if let Some(mut old) = mgr.processes.remove(&rule_id) {
-        let _ = old.kill();
-    }
-
-    mgr.processes.insert(rule_id.clone(), child);
-
-    Ok(TunnelStatus {
-        rule_id,
-        active: true,
-        pid,
-        error: None,
-    })
 }
 
-pub fn stop_tunnel(tunnel_mgr: &TunnelManagerState, rule_id: String) -> Result<TunnelStatus, String> {
+pub fn stop_tunnel(
+    tunnel_mgr: &TunnelManagerState,
+    rule_id: String,
+) -> Result<TunnelStatus, String> {
     let mut mgr = tunnel_mgr
         .lock()
         .map_err(|_| "Failed to lock tunnel manager".to_string())?;
@@ -374,10 +462,23 @@ pub fn stop_tunnel(tunnel_mgr: &TunnelManagerState, rule_id: String) -> Result<T
     })
 }
 
-pub fn get_tunnel_statuses(tunnel_mgr: &TunnelManagerState, rule_ids: Vec<String>) -> Vec<TunnelStatus> {
+pub fn get_tunnel_statuses(
+    tunnel_mgr: &TunnelManagerState,
+    rule_ids: Vec<String>,
+) -> Vec<TunnelStatus> {
     let mut mgr = match tunnel_mgr.lock() {
         Ok(m) => m,
-        Err(_) => return rule_ids.iter().map(|id| TunnelStatus { rule_id: id.clone(), active: false, pid: None, error: None }).collect(),
+        Err(_) => {
+            return rule_ids
+                .iter()
+                .map(|id| TunnelStatus {
+                    rule_id: id.clone(),
+                    active: false,
+                    pid: None,
+                    error: None,
+                })
+                .collect()
+        }
     };
 
     let mut statuses = Vec::new();
@@ -415,38 +516,6 @@ pub fn get_tunnel_statuses(tunnel_mgr: &TunnelManagerState, rule_ids: Vec<String
     statuses
 }
 
-// --- Storage helpers ---
-
-fn read_vault(app: &AppHandle) -> Result<PortForwardVault, String> {
-    let path = vault_path(app)?;
-    if !path.exists() {
-        return Ok(PortForwardVault::default());
-    }
-    let contents =
-        fs::read_to_string(path).map_err(|e| format!("Failed to read port forward vault: {}", e))?;
-    serde_json::from_str(&contents)
-        .map_err(|e| format!("Failed to parse port forward vault: {}", e))
-}
-
-fn write_vault(app: &AppHandle, vault: &PortForwardVault) -> Result<(), String> {
-    let path = vault_path(app)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create port forward vault directory: {}", e))?;
-    }
-    let json = serde_json::to_string_pretty(vault)
-        .map_err(|e| format!("Failed to serialize port forward vault: {}", e))?;
-    fs::write(path, json).map_err(|e| format!("Failed to save port forward vault: {}", e))
-}
-
-fn vault_path(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?
-        .join("port_forwards.json"))
-}
-
 fn upsert_by_id<T, F>(items: &mut Vec<T>, item: T, id: F)
 where
     F: Fn(&T) -> &String,
@@ -462,4 +531,16 @@ fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod quit_reset_tests {
+    use super::*;
+
+    #[test]
+    fn stop_all_on_empty_manager_is_noop() {
+        let mut mgr = TunnelManager::new();
+        mgr.stop_all();
+        assert!(mgr.processes.is_empty());
+    }
 }

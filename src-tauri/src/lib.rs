@@ -1,24 +1,28 @@
-mod crypto;
+pub mod dashboard;
+mod global_hotkey;
 mod hosts;
-mod vault;
 mod port_forwarding;
 mod pty_manager;
+mod quick_terminal;
 mod sftp;
+mod snippet_exec;
 mod snippets;
+mod ssh;
 mod ssh_keys;
-pub mod dashboard;
+mod sync;
+mod tombstones;
+mod vault;
 use dashboard::DashboardManager;
+use termifai_core::store;
 
 use hosts::{
     Host, HostGroup, HostsVault, SaveHostGroupRequest, SaveHostRequest, TestHostConnectionRequest,
     TestHostConnectionResult,
 };
-use port_forwarding::{
-    PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus,
-};
+use port_forwarding::{PortForwardRule, SavePortForwardRequest, TunnelManagerState, TunnelStatus};
 use pty_manager::{PtyManager, TabInfo};
-use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
 use serde::Serialize;
+use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
 
 #[derive(Serialize, Clone)]
 struct SftpConnectEvent {
@@ -38,16 +42,26 @@ struct SftpTransferDone {
     ok: bool,
     error: Option<String>,
 }
-use snippets::{SaveSnippetRequest, Snippet};
+use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
+use quick_terminal::{
+    get_quick_terminal_info, hide_quick_terminal, quick_terminal_frontend_ready,
+    resize_quick_terminal, set_quick_terminal_edge, set_quick_terminal_enabled,
+    set_quick_terminal_opacity, toggle_quick_terminal,
+};
+use snippets::{SaveSnippetRequest, Snippet, SnippetGroup};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::menu::{Menu, MenuItem};
 #[cfg(target_os = "macos")]
 use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
+use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_window_state::StateFlags;
 
 static WINDOW_COUNTER: AtomicU64 = AtomicU64::new(0);
+static SHOULD_EXIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct AppState {
     pty_manager: Mutex<PtyManager>,
@@ -55,7 +69,16 @@ struct AppState {
     sftp_manager: Mutex<SftpManager>,
     watch_handles: Mutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<()>>>,
     transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
+    transfer_conflict_tx:
+        Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<sftp::ConflictDecision>>>,
     dashboard_manager: Mutex<DashboardManager>,
+    hosts_store: store::JsonStore<hosts::HostsVault>,
+    port_forward_store: store::JsonStore<port_forwarding::PortForwardVault>,
+    snippets_store: store::JsonStore<snippets::SnippetsVault>,
+    vault_settings_store: store::JsonStore<vault::VaultSettings>,
+    vault_crypto_store: store::JsonStore<vault::CryptoVault>,
+    tombstones_store: store::JsonStore<tombstones::TombstonesVault>,
+    sync_state_store: store::JsonStore<termifai_core::model::sync_state::SyncState>,
 }
 
 #[tauri::command]
@@ -64,16 +87,29 @@ fn create_session(
     state: State<AppState>,
     cwd: String,
     initial_command: Option<String>,
-    initial_password: Option<String>,
+    host_id: Option<String>,
     ready_marker: Option<String>,
 ) -> Result<TabInfo, String> {
+    let password = if let Some(ref h_id) = host_id {
+        let vault = hosts::list_hosts(&app)?;
+        let host = vault
+            .hosts
+            .iter()
+            .find(|h| h.id == *h_id)
+            .ok_or_else(|| "Host not found".to_string())?;
+        hosts::decrypt_host_password(host)
+    } else {
+        None
+    };
+
     let manager = state.pty_manager.lock().unwrap();
     manager.create_session(
         &app,
         &cwd,
         initial_command.as_deref(),
-        initial_password.as_deref(),
+        password.as_deref(),
         ready_marker.as_deref(),
+        host_id.as_deref(),
     )
 }
 
@@ -194,6 +230,11 @@ fn remove_hosts(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn get_host_password(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
+    hosts::get_host_password(&app, &id)
+}
+
+#[tauri::command]
 fn save_host_group(
     app: tauri::AppHandle,
     request: SaveHostGroupRequest,
@@ -213,12 +254,16 @@ fn vault_status(app: tauri::AppHandle) -> Result<vault::VaultStatus, String> {
 
 #[tauri::command]
 fn vault_init(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
-    vault::op_init(&app, &master_password)
+    vault::op_init(&app, &master_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
 fn vault_unlock(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
-    vault::op_unlock(&app, &master_password)
+    vault::op_unlock(&app, &master_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -233,7 +278,9 @@ fn vault_change_master_password(
     old_password: String,
     new_password: String,
 ) -> Result<(), String> {
-    vault::op_change_master_password(&app, &old_password, &new_password)
+    vault::op_change_master_password(&app, &old_password, &new_password)?;
+    hosts::migrate_plaintext_passwords(&app)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -252,14 +299,61 @@ fn set_vault_lock_policy(app: tauri::AppHandle, policy: String) -> Result<(), St
 }
 
 #[tauri::command]
-fn get_host_password(app: tauri::AppHandle, host_id: String) -> Result<Option<String>, String> {
-    let vault = hosts::list_hosts(&app)?;
-    let host = vault
-        .hosts
-        .iter()
-        .find(|h| h.id == host_id)
-        .ok_or_else(|| "Host not found".to_string())?;
-    Ok(hosts::decrypt_host_password(host))
+fn sync_get_config(app: tauri::AppHandle) -> Result<sync::SyncStatusDto, String> {
+    sync::sync_get_config(&app)
+}
+
+#[tauri::command]
+async fn sync_connect_provider(app: tauri::AppHandle, provider: String) -> Result<String, String> {
+    sync::sync_connect_provider(app, provider).await
+}
+
+#[tauri::command]
+fn sync_set_config(
+    app: tauri::AppHandle,
+    request: sync::SetSyncConfigRequest,
+) -> Result<(), String> {
+    sync::sync_set_config(&app, request)
+}
+
+#[tauri::command]
+fn sync_status(app: tauri::AppHandle) -> Result<sync::SyncStatusDto, String> {
+    sync::sync_status(&app)
+}
+
+#[tauri::command]
+fn sync_disconnect(app: tauri::AppHandle, delete_remote: bool) -> Result<(), String> {
+    sync::sync_disconnect(&app, delete_remote)
+}
+
+#[tauri::command]
+async fn sync_now(
+    app: tauri::AppHandle,
+    request: sync::SyncNowRequest,
+) -> Result<sync::SyncNowResult, String> {
+    tauri::async_runtime::spawn_blocking(move || sync::sync_now(&app, request))
+        .await
+        .map_err(|e| format!("Sync task error: {}", e))?
+}
+
+#[tauri::command]
+async fn vault_init_from_sync(
+    app: tauri::AppHandle,
+    request: sync::VaultInitFromSyncRequest,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || sync::vault_init_from_sync(&app, request))
+        .await
+        .map_err(|e| format!("Sync task error: {}", e))?
+}
+
+#[tauri::command]
+async fn sync_import_foreign(
+    app: tauri::AppHandle,
+    request: sync::SyncImportForeignRequest,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || sync::sync_import_foreign(&app, request))
+        .await
+        .map_err(|e| format!("Sync task error: {}", e))?
 }
 
 #[tauri::command]
@@ -295,12 +389,12 @@ fn remove_port_forwards(
 }
 
 #[tauri::command]
-fn start_tunnel(
+async fn start_tunnel(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     rule_id: String,
 ) -> Result<TunnelStatus, String> {
-    port_forwarding::start_tunnel(&app, &state.tunnel_manager, rule_id)
+    port_forwarding::start_tunnel(&app, &state.tunnel_manager, rule_id).await
 }
 
 #[tauri::command]
@@ -309,15 +403,12 @@ fn stop_tunnel(state: State<AppState>, rule_id: String) -> Result<TunnelStatus, 
 }
 
 #[tauri::command]
-fn get_tunnel_statuses(
-    state: State<AppState>,
-    rule_ids: Vec<String>,
-) -> Vec<TunnelStatus> {
+fn get_tunnel_statuses(state: State<AppState>, rule_ids: Vec<String>) -> Vec<TunnelStatus> {
     port_forwarding::get_tunnel_statuses(&state.tunnel_manager, rule_ids)
 }
 
 #[tauri::command]
-fn list_snippets(app: tauri::AppHandle) -> Result<Vec<Snippet>, String> {
+fn list_snippets(app: tauri::AppHandle) -> Result<snippets::SnippetsListResult, String> {
     snippets::list_snippets(&app)
 }
 
@@ -332,9 +423,26 @@ fn remove_snippets(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String
 }
 
 #[tauri::command]
-fn run_snippet_script(
+fn reorder_snippets(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
+    snippets::reorder_snippets(&app, ids)
+}
+
+#[tauri::command]
+fn save_snippet_group(
     app: tauri::AppHandle,
-    state: State<AppState>,
+    request: snippets::SaveSnippetGroupRequest,
+) -> Result<SnippetGroup, String> {
+    snippets::save_snippet_group(&app, request)
+}
+
+#[tauri::command]
+fn remove_snippet_group(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    snippets::remove_snippet_group(&app, id)
+}
+
+#[tauri::command]
+async fn run_snippet_script(
+    app: tauri::AppHandle,
     session_id: String,
     title: String,
     script: String,
@@ -347,37 +455,188 @@ fn run_snippet_script(
     let event_name = format!("term:{}:output", session_id);
     let _ = app.emit(&event_name, title_msg);
 
-    // Strategy for hiding the command from terminal display AND supporting remote SSH:
-    // We cannot write to the remote filesystem from Rust directly.
-    // Instead we use heredoc via PTY to write the script to /tmp on the target machine,
-    // then execute it. The heredoc content is NOT echoed by the shell (only the cat command is).
-    // A wrapper script erases the visible command line with ANSI escapes.
-    //
-    // The full sequence sent to PTY:
-    //   printf '\033[1A\033[2K\r' && cat > /tmp/termifai_s_ID.sh << 'TERMIFAI_SNIPPET_EOF'
-    //   [script content - not echoed by shell]
-    //   TERMIFAI_SNIPPET_EOF
-    //   chmod +x /tmp/termifai_s_ID.sh && bash /tmp/termifai_s_ID.sh; rm -f /tmp/termifai_s_ID.sh
+    let script = snippet_exec::normalize_script(&script);
 
-    let script_id = uuid::Uuid::new_v4().to_string().replace('-', "");
-    let script_id = &script_id[..8];
-    let tmp_path = format!("/tmp/termifai_s_{}.sh", script_id);
-    let eof_marker = "TERMIFAI_SNIPPET_EOF";
+    // All PTY/SFTP work is blocking I/O (network for SSH sessions) — keep it
+    // off the main thread so the UI never freezes while a connection is made.
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let host_id = {
+            let manager = state.pty_manager.lock().unwrap();
+            manager.get_host_id(&session_id)?
+        };
 
-    // Build the full payload to send to PTY
-    // Line 1: erase the echoed command + write script via heredoc
-    // Line 2..N: script content (shell does NOT echo heredoc body)
-    // Last line: EOF marker
-    // Then: chmod + execute + cleanup
-    let payload = format!(
-        " printf '\\033[1A\\033[2K\\r' && cat > {path} << '{eof}'\r{script}\r{eof}\rchmod +x {path} && bash {path}; rm -f {path}\r",
-        path = tmp_path,
-        eof = eof_marker,
-        script = script.replace('\r', ""),
-    );
+        match host_id {
+            Some(h_id) => run_script_over_ssh(&app, &session_id, &h_id, &script),
+            None => run_script_locally(&app, &session_id, &script),
+        }
+    })
+    .await
+    .map_err(|e| format!("Script task failed: {}", e))?
+}
 
+/// SSH session: upload via SFTP and execute; fall back to a heredoc over the
+/// PTY when SFTP is unavailable (subsystem disabled, auth not stored, etc.).
+fn run_script_over_ssh(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    host_id: &str,
+    script: &str,
+) -> Result<(), String> {
+    match upload_script_via_sftp(app, session_id, host_id, script) {
+        Ok(remote_path) => {
+            let state = app.state::<AppState>();
+            let payload = snippet_exec::remote_exec_payload(&remote_path);
+            let manager = state.pty_manager.lock().unwrap();
+            manager.write_to_session(session_id, &payload)
+        }
+        Err(sftp_err) => {
+            // Surface the fallback reason: in the terminal (the heredoc path
+            // is visibly noisier, so the user deserves to know why) and on
+            // stderr for diagnostics.
+            eprintln!(
+                "run_snippet_script: SFTP upload failed for session {}: {}",
+                session_id, sftp_err
+            );
+            let warn = format!(
+                "\x1b[38;2;255;180;90m⚠ SFTP upload failed ({}) — falling back to inline execution\x1b[0m\r\n",
+                sftp_err
+            );
+            let _ = app.emit(&format!("term:{}:output", session_id), warn);
+            run_script_via_heredoc(app, session_id, script).map_err(|heredoc_err| {
+                format!(
+                    "SFTP upload failed ({}); heredoc fallback failed: {}",
+                    sftp_err, heredoc_err
+                )
+            })
+        }
+    }
+}
+
+/// Ensure an SFTP session exists for `session_id`, upload the script to a
+/// random /tmp path, and return that path. Errors carry the real cause
+/// (connect/auth/subsystem/write) so callers can report or fall back.
+fn upload_script_via_sftp(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    host_id: &str,
+    script: &str,
+) -> Result<String, String> {
+    let state = app.state::<AppState>();
+
+    let has_sftp = {
+        let sftp_mgr = state.sftp_manager.lock().unwrap();
+        sftp_mgr.get_session(session_id).is_ok()
+    };
+
+    if !has_sftp {
+        let request = build_sftp_request_from_host(app, session_id, host_id)?;
+        let mut sftp_mgr = state.sftp_manager.lock().unwrap();
+        sftp_mgr
+            .connect(request, |_, _| {})
+            .map_err(|e| format!("SFTP connect failed: {}", e))?;
+    }
+
+    let sftp_entry_arc = {
+        let sftp_mgr = state.sftp_manager.lock().unwrap();
+        sftp_mgr.get_session(session_id)?
+    };
+    let sftp_entry = sftp_entry_arc.lock().unwrap();
+    let sftp = sftp_entry
+        .session
+        .sftp()
+        .map_err(|e| format!("SFTP subsystem: {}", e))?;
+
+    let remote_path = format!("/tmp/termifai_run_{}.sh", snippet_exec::short_id());
+
+    use ssh2::{OpenFlags, OpenType};
+    let mut remote_file = sftp
+        .open_mode(
+            std::path::Path::new(&remote_path),
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            0o600,
+            OpenType::File,
+        )
+        .map_err(|e| format!("Failed to create remote temp file: {}", e))?;
+
+    use std::io::Write;
+    remote_file
+        .write_all(script.as_bytes())
+        .map_err(|e| format!("Failed to write remote script file: {}", e))?;
+    // Close the SFTP handle before anything executes the file — close is what
+    // makes the server flush; Drop-at-end-of-scope would race the PTY exec.
+    drop(remote_file);
+
+    Ok(remote_path)
+}
+
+/// Write the script into the PTY as a non-echoed heredoc — works on any host
+/// the PTY is already connected to, with no SFTP or second connection needed.
+fn run_script_via_heredoc(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    script: &str,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let payload = snippet_exec::heredoc_payload(script, &snippet_exec::short_id());
     let manager = state.pty_manager.lock().unwrap();
-    manager.write_to_session(&session_id, &payload)
+    manager.write_to_session(session_id, &payload)
+}
+
+/// Local session: write the script to a local temp file and execute via bash.
+fn run_script_locally(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    script: &str,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let local_temp_path =
+        std::env::temp_dir().join(format!("termifai_run_{}.sh", snippet_exec::short_id()));
+    std::fs::write(&local_temp_path, script)
+        .map_err(|e| format!("Failed to write local temp script: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&local_temp_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    let payload = snippet_exec::local_exec_payload(&local_temp_path.to_string_lossy());
+    let manager = state.pty_manager.lock().unwrap();
+    manager.write_to_session(session_id, &payload)
+}
+
+/// Resolve a host from the vault into a ready-to-use SFTP connect request
+/// (host lookup, ssh-key path resolution, password decryption).
+fn build_sftp_request_from_host(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    host_id: &str,
+) -> Result<SftpConnectRequest, String> {
+    let vault = hosts::list_hosts(app)?;
+    let host = vault
+        .hosts
+        .into_iter()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| format!("Host '{}' not found", host_id))?;
+
+    let private_key_path = if let Some(key_id) = &host.ssh_key_id {
+        let keys = ssh_keys::list_ssh_keys(app)?;
+        keys.into_iter()
+            .find(|k| &k.id == key_id)
+            .map(|k| k.private_key_path)
+    } else {
+        None
+    };
+
+    Ok(SftpConnectRequest {
+        session_id: session_id.to_string(),
+        hostname: host.hostname.clone(),
+        port: host.port,
+        username: host.user.clone(),
+        password: hosts::decrypt_host_password(&host),
+        private_key_path,
+        default_remote_path: host.default_sftp_path.clone(),
+    })
 }
 
 #[tauri::command]
@@ -387,31 +646,7 @@ async fn sftp_connect_from_host(
     session_id: String,
 ) -> Result<(), String> {
     // Resolve credentials synchronously (fast local file reads) before spawning
-    let vault = hosts::list_hosts(&app)?;
-    let host = vault
-        .hosts
-        .into_iter()
-        .find(|h| h.id == host_id)
-        .ok_or_else(|| format!("Host '{}' not found", host_id))?;
-
-    let private_key_path = if let Some(key_id) = &host.ssh_key_id {
-        let keys = ssh_keys::list_ssh_keys(&app)?;
-        keys.into_iter()
-            .find(|k| &k.id == key_id)
-            .map(|k| k.private_key_path)
-    } else {
-        None
-    };
-
-    let request = SftpConnectRequest {
-        session_id: session_id.clone(),
-        hostname: host.hostname.clone(),
-        port: host.port,
-        username: host.user.clone(),
-        password: hosts::decrypt_host_password(&host),
-        private_key_path,
-        default_remote_path: host.default_sftp_path.clone(),
-    };
+    let request = build_sftp_request_from_host(&app, &session_id, &host_id)?;
 
     // Spawn blocking work in background — command returns immediately so the
     // loading screen appears before any network round-trips begin.
@@ -426,7 +661,10 @@ async fn sftp_connect_from_host(
             let log = move |stage: &str, msg: &str| {
                 let _ = app_log.emit(
                     &format!("sftp:{}:connect", sid_log),
-                    SftpConnectEvent { stage: stage.to_string(), message: msg.to_string() },
+                    SftpConnectEvent {
+                        stage: stage.to_string(),
+                        message: msg.to_string(),
+                    },
                 );
             };
             let state = app_inner.state::<AppState>();
@@ -436,9 +674,21 @@ async fn sftp_connect_from_host(
         .await;
 
         let done = match result {
-            Ok(Ok(info)) => SftpConnectDone { ok: true, remote_path: Some(info.remote_path), error: None },
-            Ok(Err(e)) => SftpConnectDone { ok: false, remote_path: None, error: Some(e) },
-            Err(e) => SftpConnectDone { ok: false, remote_path: None, error: Some(format!("Task panic: {e}")) },
+            Ok(Ok(info)) => SftpConnectDone {
+                ok: true,
+                remote_path: Some(info.remote_path),
+                error: None,
+            },
+            Ok(Err(e)) => SftpConnectDone {
+                ok: false,
+                remote_path: None,
+                error: Some(e),
+            },
+            Err(e) => SftpConnectDone {
+                ok: false,
+                remote_path: None,
+                error: Some(format!("Task panic: {e}")),
+            },
         };
         let _ = app_bg.emit(&format!("sftp:{}:done", session_id), done);
     });
@@ -447,8 +697,10 @@ async fn sftp_connect_from_host(
 }
 
 #[tauri::command]
-fn sftp_list_local(path: String) -> Result<Vec<LocalFileEntry>, String> {
-    sftp::list_local(&path)
+async fn sftp_list_local(path: String) -> Result<Vec<LocalFileEntry>, String> {
+    tokio::task::spawn_blocking(move || sftp::list_local(&path))
+        .await
+        .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
@@ -459,13 +711,22 @@ fn get_home_dir() -> Result<String, String> {
 }
 
 #[tauri::command]
-fn sftp_list_remote(
-    state: State<AppState>,
+async fn sftp_list_remote(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
 ) -> Result<Vec<RemoteFileEntry>, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.list_remote(&session_id, &path)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.list_remote(&path)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
@@ -489,18 +750,87 @@ async fn sftp_download(
             let app_prog = app_bg.clone();
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.download_file(&sid, &remote_path, &local_path, Arc::clone(&cancel_flag), move |progress| {
-                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-            })
+            let entry = {
+                let manager = state.sftp_manager.lock().unwrap();
+                manager.get_session(&sid)
+            };
+            match entry {
+                Ok(entry_arc) => {
+                    let app_conflict = app_bg.clone();
+                    let sid_conflict = sid.clone();
+                    let cancel_conflict = Arc::clone(&cancel_flag);
+                    let prompt = move |info: &sftp::ConflictInfo| -> sftp::ConflictDecision {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        app_conflict
+                            .state::<AppState>()
+                            .transfer_conflict_tx
+                            .lock()
+                            .unwrap()
+                            .insert(sid_conflict.clone(), tx);
+                        let _ = app_conflict
+                            .emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
+                        let decision = loop {
+                            if cancel_conflict.load(Ordering::Relaxed) {
+                                break sftp::ConflictDecision::Cancel;
+                            }
+                            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                                Ok(d) => break d,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    break sftp::ConflictDecision::Cancel
+                                }
+                            }
+                        };
+                        app_conflict
+                            .state::<AppState>()
+                            .transfer_conflict_tx
+                            .lock()
+                            .unwrap()
+                            .remove(&sid_conflict);
+                        decision
+                    };
+                    let mut conflicts = sftp::ConflictHandler::new(sftp::ConflictMode::Ask, prompt);
+
+                    let entry_guard = entry_arc.lock().unwrap();
+                    entry_guard.download_path(
+                        &sid,
+                        &remote_path,
+                        &local_path,
+                        Arc::clone(&cancel_flag),
+                        &mut conflicts,
+                        move |progress| {
+                            let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+                        },
+                    )
+                }
+                Err(e) => Err(e),
+            }
         })
         .await;
         let state = app.state::<AppState>();
-        state.transfer_cancel_flags.lock().unwrap().remove(&session_id);
+        state
+            .transfer_cancel_flags
+            .lock()
+            .unwrap()
+            .remove(&session_id);
+        state
+            .transfer_conflict_tx
+            .lock()
+            .unwrap()
+            .remove(&session_id);
         let done = match result {
-            Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
-            Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
-            Err(e) => SftpTransferDone { ok: false, error: Some(format!("Task panic: {e}")) },
+            Ok(Ok(())) => SftpTransferDone {
+                ok: true,
+                error: None,
+            },
+            Ok(Err(e)) => SftpTransferDone {
+                ok: false,
+                error: Some(e),
+            },
+            Err(e) => SftpTransferDone {
+                ok: false,
+                error: Some(format!("Task panic: {e}")),
+            },
         };
         let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
     });
@@ -513,6 +843,7 @@ async fn sftp_upload(
     session_id: String,
     local_path: String,
     remote_path: String,
+    overwrite: Option<bool>,
 ) -> Result<(), String> {
     let app_bg = app.clone();
     let sid = session_id.clone();
@@ -528,18 +859,92 @@ async fn sftp_upload(
             let app_prog = app_bg.clone();
             let sid_prog = sid.clone();
             let state = app_bg.state::<AppState>();
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.upload_file(&sid, &local_path, &remote_path, Arc::clone(&cancel_flag), move |progress| {
-                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-            })
+            let entry = {
+                let manager = state.sftp_manager.lock().unwrap();
+                manager.get_session(&sid)
+            };
+            match entry {
+                Ok(entry_arc) => {
+                    let app_conflict = app_bg.clone();
+                    let sid_conflict = sid.clone();
+                    let cancel_conflict = Arc::clone(&cancel_flag);
+                    let prompt = move |info: &sftp::ConflictInfo| -> sftp::ConflictDecision {
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        app_conflict
+                            .state::<AppState>()
+                            .transfer_conflict_tx
+                            .lock()
+                            .unwrap()
+                            .insert(sid_conflict.clone(), tx);
+                        let _ = app_conflict
+                            .emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
+                        let decision = loop {
+                            if cancel_conflict.load(Ordering::Relaxed) {
+                                break sftp::ConflictDecision::Cancel;
+                            }
+                            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                                Ok(d) => break d,
+                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                    break sftp::ConflictDecision::Cancel
+                                }
+                            }
+                        };
+                        app_conflict
+                            .state::<AppState>()
+                            .transfer_conflict_tx
+                            .lock()
+                            .unwrap()
+                            .remove(&sid_conflict);
+                        decision
+                    };
+                    let initial_mode = if overwrite.unwrap_or(false) {
+                        sftp::ConflictMode::OverwriteAll
+                    } else {
+                        sftp::ConflictMode::Ask
+                    };
+                    let mut conflicts = sftp::ConflictHandler::new(initial_mode, prompt);
+
+                    let entry_guard = entry_arc.lock().unwrap();
+                    entry_guard.upload_path(
+                        &sid,
+                        &local_path,
+                        &remote_path,
+                        Arc::clone(&cancel_flag),
+                        &mut conflicts,
+                        move |progress| {
+                            let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+                        },
+                    )
+                }
+                Err(e) => Err(e),
+            }
         })
         .await;
         let state = app.state::<AppState>();
-        state.transfer_cancel_flags.lock().unwrap().remove(&session_id);
+        state
+            .transfer_cancel_flags
+            .lock()
+            .unwrap()
+            .remove(&session_id);
+        state
+            .transfer_conflict_tx
+            .lock()
+            .unwrap()
+            .remove(&session_id);
         let done = match result {
-            Ok(Ok(())) => SftpTransferDone { ok: true, error: None },
-            Ok(Err(e)) => SftpTransferDone { ok: false, error: Some(e) },
-            Err(e) => SftpTransferDone { ok: false, error: Some(format!("Task panic: {e}")) },
+            Ok(Ok(())) => SftpTransferDone {
+                ok: true,
+                error: None,
+            },
+            Ok(Err(e)) => SftpTransferDone {
+                ok: false,
+                error: Some(e),
+            },
+            Err(e) => SftpTransferDone {
+                ok: false,
+                error: Some(format!("Task panic: {e}")),
+            },
         };
         let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
     });
@@ -547,34 +952,89 @@ async fn sftp_upload(
 }
 
 #[tauri::command]
-fn sftp_delete_remote(
+fn sftp_resolve_conflict(
     state: State<AppState>,
     session_id: String,
-    paths: Vec<String>,
+    decision: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.delete_remote(&session_id, &paths)
+    let decision = match decision.as_str() {
+        "overwrite" => sftp::ConflictDecision::Overwrite,
+        "skip" => sftp::ConflictDecision::Skip,
+        "overwrite_all" => sftp::ConflictDecision::OverwriteAll,
+        "skip_all" => sftp::ConflictDecision::SkipAll,
+        "cancel" => sftp::ConflictDecision::Cancel,
+        other => return Err(format!("Unknown decision '{}'", other)),
+    };
+    let tx = state
+        .transfer_conflict_tx
+        .lock()
+        .unwrap()
+        .remove(&session_id);
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(decision);
+            Ok(())
+        }
+        None => Err("No pending conflict for this session".to_string()),
+    }
 }
 
 #[tauri::command]
-fn sftp_rename_remote(
-    state: State<AppState>,
+async fn sftp_delete_remote(
+    app: tauri::AppHandle,
+    session_id: String,
+    paths: Vec<String>,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.delete_remote(&paths)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
+}
+
+#[tauri::command]
+async fn sftp_rename_remote(
+    app: tauri::AppHandle,
     session_id: String,
     from_path: String,
     to_path: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.rename_remote(&session_id, &from_path, &to_path)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.rename_remote(&from_path, &to_path)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_mkdir_remote(
-    state: State<AppState>,
+async fn sftp_mkdir_remote(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.mkdir_remote(&session_id, &path)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.mkdir_remote(&path)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
@@ -584,10 +1044,7 @@ fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), Str
 }
 
 #[tauri::command]
-fn sftp_cancel_transfer(
-    state: State<AppState>,
-    session_id: String,
-) -> Result<(), String> {
+fn sftp_cancel_transfer(state: State<AppState>, session_id: String) -> Result<(), String> {
     let flags = state.transfer_cancel_flags.lock().unwrap();
     if let Some(flag) = flags.get(&session_id) {
         flag.store(true, Ordering::Relaxed);
@@ -596,57 +1053,79 @@ fn sftp_cancel_transfer(
 }
 
 #[tauri::command]
-fn sftp_stat_remote(
-    state: State<AppState>,
+async fn sftp_stat_remote(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
 ) -> Result<sftp::RemoteStatResult, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.stat_remote(&session_id, &path)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.stat_remote(&path)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
-    let dest = p.parent()
-        .ok_or("No parent dir")?
-        .join(&new_name);
-    std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
+async fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let p = std::path::Path::new(&path);
+        let dest = p.parent().ok_or("No parent dir")?.join(&new_name);
+        std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
-    for path in &paths {
-        let p = std::path::Path::new(path);
-        if p.is_dir() {
-            std::fs::remove_dir_all(p).map_err(|e| format!("Delete dir '{}': {}", path, e))?;
-        } else {
-            std::fs::remove_file(p).map_err(|e| format!("Delete '{}': {}", path, e))?;
+async fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        for path in &paths {
+            let p = std::path::Path::new(path);
+            if p.is_dir() {
+                std::fs::remove_dir_all(p).map_err(|e| format!("Delete dir '{}': {}", path, e))?;
+            } else {
+                std::fs::remove_file(p).map_err(|e| format!("Delete '{}': {}", path, e))?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_mkdir_local(path: String) -> Result<(), String> {
-    std::fs::create_dir_all(&path)
-        .map_err(|e| format!("Create dir '{}': {}", path, e))
+async fn sftp_mkdir_local(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&path).map_err(|e| format!("Create dir '{}': {}", path, e))
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_copy_local(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
-    let dest = std::path::Path::new(&dest_dir);
-    for path in &paths {
-        let src = std::path::Path::new(path);
-        let name = src.file_name().ok_or("No file name")?;
-        let target = dest.join(name);
-        if src.is_dir() {
-            copy_dir_all(src, &target).map_err(|e| format!("Copy dir '{}': {}", path, e))?;
-        } else {
-            std::fs::copy(src, &target).map_err(|e| format!("Copy '{}': {}", path, e))?;
+async fn sftp_copy_local(paths: Vec<String>, dest_dir: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        let dest = std::path::Path::new(&dest_dir);
+        for path in &paths {
+            let src = std::path::Path::new(path);
+            let name = src.file_name().ok_or("No file name")?;
+            let target = dest.join(name);
+            if src.is_dir() {
+                copy_dir_all(src, &target).map_err(|e| format!("Copy dir '{}': {}", path, e))?;
+            } else {
+                std::fs::copy(src, &target).map_err(|e| format!("Copy '{}': {}", path, e))?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
@@ -666,11 +1145,20 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
 #[tauri::command]
 fn sftp_open_local(path: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
-    std::process::Command::new("xdg-open").arg(&path).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("xdg-open")
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd").args(["/c", "start", "", &path]).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", &path])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return Err("Platform not supported for open_local".to_string());
     Ok(())
@@ -679,11 +1167,20 @@ fn sftp_open_local(path: String) -> Result<(), String> {
 #[tauri::command]
 fn sftp_open_with_local(path: String, app: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    std::process::Command::new("open").args(["-a", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("open")
+        .args(["-a", &app, &path])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "linux")]
-    std::process::Command::new(&app).arg(&path).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new(&app)
+        .arg(&path)
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd").args(["/c", "start", "", &app, &path]).spawn().map_err(|e| e.to_string())?;
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", &app, &path])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return Err("Platform not supported for open_with_local".to_string());
     Ok(())
@@ -703,15 +1200,23 @@ async fn sftp_open_remote(
     remote_path: String,
 ) -> Result<String, String> {
     let tmp_path = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.open_remote(&session_id, &remote_path)?
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.open_remote(&session_id, &remote_path)?
     };
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&tmp_path).spawn();
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open").arg(&tmp_path).spawn();
+    let _ = std::process::Command::new("xdg-open")
+        .arg(&tmp_path)
+        .spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd").args(["/c", "start", "", &tmp_path]).spawn();
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", &tmp_path])
+        .spawn();
     Ok(tmp_path)
 }
 
@@ -737,9 +1242,7 @@ async fn sftp_watch_remote(
     let tp = tmp_path.clone();
     let rp = remote_path.clone();
     tokio::spawn(async move {
-        let initial_mtime = std::fs::metadata(&tp)
-            .and_then(|m| m.modified())
-            .ok();
+        let initial_mtime = std::fs::metadata(&tp).and_then(|m| m.modified()).ok();
         let mut last_mtime = initial_mtime;
         let mut rx = rx;
         loop {
@@ -762,10 +1265,7 @@ async fn sftp_watch_remote(
 }
 
 #[tauri::command]
-fn sftp_stop_watch(
-    state: State<AppState>,
-    tmp_path: String,
-) -> Result<(), String> {
+fn sftp_stop_watch(state: State<AppState>, tmp_path: String) -> Result<(), String> {
     let mut handles = state.watch_handles.lock().unwrap();
     if let Some(tx) = handles.remove(&tmp_path) {
         let _ = tx.send(());
@@ -775,39 +1275,66 @@ fn sftp_stop_watch(
 }
 
 #[tauri::command]
-fn sftp_chmod(
-    state: State<AppState>,
+async fn sftp_chmod(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
     mode: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.chmod(&session_id, &path, &mode, recursive)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.chmod(&path, &mode, recursive)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_chown(
-    state: State<AppState>,
+async fn sftp_chown(
+    app: tauri::AppHandle,
     session_id: String,
     path: String,
     user: String,
     group: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.chown(&session_id, &path, &user, &group, recursive)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.chown(&path, &user, &group, recursive)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
-fn sftp_copy_remote(
-    state: State<AppState>,
+async fn sftp_copy_remote(
+    app: tauri::AppHandle,
     session_id: String,
     paths: Vec<String>,
     dest_dir: String,
 ) -> Result<(), String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.copy_remote(&session_id, &paths, &dest_dir)
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.copy_remote(&paths, &dest_dir)
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
@@ -815,8 +1342,12 @@ fn sftp_get_users_groups(
     state: State<AppState>,
     session_id: String,
 ) -> Result<sftp::UsersGroups, String> {
-    let manager = state.sftp_manager.lock().unwrap();
-    manager.get_users_groups(&session_id)
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(&session_id)?
+    };
+    let entry_guard = entry.lock().unwrap();
+    entry_guard.get_users_groups()
 }
 
 #[tauri::command]
@@ -863,24 +1394,35 @@ async fn dashboard_poll(
     let senders = {
         let dm = state.dashboard_manager.lock().unwrap();
         match &host_id {
-            Some(id) => dm.sender(id).map(|s| vec![(id.clone(), s)]).unwrap_or_default(),
+            Some(id) => dm
+                .sender(id)
+                .map(|s| vec![(id.clone(), s)])
+                .unwrap_or_default(),
             None => dm.senders(),
         }
     };
 
-    let handles: Vec<_> = senders.into_iter().map(|(_id, tx)| {
-        let app = app.clone();
-        tokio::spawn(async move {
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let cmd = dashboard::ActorCmd::Poll { want_detail, reply: reply_tx };
+    let handles: Vec<_> = senders
+        .into_iter()
+        .map(|(_id, tx)| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                let cmd = dashboard::ActorCmd::Poll {
+                    want_detail,
+                    reply: reply_tx,
+                };
 
-            if tx.try_send(cmd).is_err() { return; }
+                if tx.try_send(cmd).is_err() {
+                    return;
+                }
 
-            if let Ok(result) = reply_rx.await {
-                let _ = app.emit("dash:stat", result);
-            }
+                if let Ok(result) = reply_rx.await {
+                    let _ = app.emit("dash:stat", result);
+                }
+            })
         })
-    }).collect();
+        .collect();
 
     futures::future::join_all(handles).await;
     Ok(())
@@ -898,9 +1440,365 @@ fn dashboard_disconnect(
     Ok(())
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneralSettings {
+    pub run_in_background: bool,
+    #[serde(default)]
+    pub open_in_context_menu: bool,
+    // User's explicit "Run at Startup" preference. The global-hotkey daemon
+    // also drives the same OS autolaunch entry (it needs to run at login to
+    // supervise hotkeys), so this flag lets it avoid overriding a user who
+    // explicitly turned autostart off in Settings.
+    #[serde(default = "default_true")]
+    pub run_at_startup: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for GeneralSettings {
+    fn default() -> Self {
+        Self {
+            run_in_background: true,
+            open_in_context_menu: false,
+            run_at_startup: true,
+        }
+    }
+}
+
+fn general_settings_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("general_settings.json"))
+}
+
+pub(crate) fn load_general_settings(app: &tauri::AppHandle) -> GeneralSettings {
+    general_settings_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<GeneralSettings>(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_general_settings(app: &tauri::AppHandle, settings: &GeneralSettings) {
+    if let Some(path) = general_settings_path(app) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+}
+
+/// Folder paths received from the FinderSync extension (via the termifai://
+/// URL scheme) that the frontend has not consumed yet. The frontend drains
+/// this on mount and whenever the `open-folder-pending` event fires, so paths
+/// arriving before the webview is ready are not lost.
+#[derive(Default)]
+struct PendingOpenFolders(std::sync::Mutex<Vec<String>>);
+
+#[tauri::command]
+fn take_pending_open_folders(state: State<PendingOpenFolders>) -> Vec<String> {
+    std::mem::take(&mut *state.0.lock().unwrap())
+}
+
+#[cfg(target_os = "macos")]
+fn handle_opened_urls(app: &tauri::AppHandle, urls: Vec<tauri::Url>) {
+    for url in urls {
+        if url.scheme() != "termifai" || url.host_str() != Some("open-folder") {
+            continue;
+        }
+        let Some(path) = url
+            .query_pairs()
+            .find(|(key, _)| key == "path")
+            .map(|(_, value)| value.into_owned())
+        else {
+            continue;
+        };
+
+        app.state::<PendingOpenFolders>()
+            .0
+            .lock()
+            .unwrap()
+            .push(path);
+
+        if let Some(window) = app.get_webview_window("main") {
+            global_hotkey::set_dock_visible(app, true);
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+        let _ = app.emit("open-folder-pending", ());
+    }
+}
+
+fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // The context menu item comes from the bundled FinderSync extension
+        // (PlugIns/TermifaiFinder.appex); pluginkit toggles the same switch as
+        // System Settings > General > Login Items & Extensions > File Providers.
+        let action = if _enabled { "use" } else { "ignore" };
+        let status = std::process::Command::new("pluginkit")
+            .args(["-e", action, "-i", "com.termifai.finder"])
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("pluginkit failed to update the Finder extension".into());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+
+        let reg_exe = "reg.exe";
+        if _enabled {
+            // Add Directory shell
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\shell\\Termifai",
+                    "/ve",
+                    "/d",
+                    "Open in Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Add Directory command
+            let cmd_val = format!("\"{}\" \"%V\"", current_exe);
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\shell\\Termifai\\command",
+                    "/ve",
+                    "/d",
+                    &cmd_val,
+                    "/f",
+                ])
+                .status();
+
+            // Add Background shell
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\Background\\shell\\Termifai",
+                    "/ve",
+                    "/d",
+                    "Open in Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Add Background command
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\Background\\shell\\Termifai\\command",
+                    "/ve",
+                    "/d",
+                    &cmd_val,
+                    "/f",
+                ])
+                .status();
+        } else {
+            // Remove Directory
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "delete",
+                    "HKCU\\Software\\Classes\\Directory\\shell\\Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Remove Background
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "delete",
+                    "HKCU\\Software\\Classes\\Directory\\Background\\shell\\Termifai",
+                    "/f",
+                ])
+                .status();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let current_exe = std::env::current_exe()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+
+        let home = std::env::var("HOME").map(std::path::PathBuf::from).ok();
+
+        // 1. KDE Dolphin ServiceMenu
+        if let Some(ref h) = home {
+            let dir = h.join(".local/share/kservices5/ServiceMenus");
+            let file_path = dir.join("termifai.desktop");
+            if _enabled {
+                let _ = std::fs::create_dir_all(&dir);
+                let content = format!(
+                    "[Desktop Entry]\n\
+                     Type=Service\n\
+                     ServiceTypes=KonqPopupMenu/Plugin,inode/directory\n\
+                     Actions=openInTermifai\n\
+                     MimeType=inode/directory;\n\n\
+                     [Desktop Action openInTermifai]\n\
+                     Name=Open in Termifai\n\
+                     Icon=utilities-terminal\n\
+                     Exec=\"{}\" \"%f\"\n",
+                    current_exe
+                );
+                let _ = std::fs::write(file_path, content);
+            } else {
+                let _ = std::fs::remove_file(file_path);
+            }
+        }
+
+        // 2. GNOME Nautilus Scripts
+        if let Some(ref h) = home {
+            let nautilus_dir = h.join(".local/share/nautilus/scripts");
+            let script_path = nautilus_dir.join("Open in Termifai");
+            if _enabled {
+                let _ = std::fs::create_dir_all(&nautilus_dir);
+                let content = format!(
+                    "#!/bin/sh\n\
+                     path=$(echo \"$NAUTILUS_SCRIPT_SELECTED_FILE_PATHS\" | head -n 1)\n\
+                     if [ -z \"$path\" ]; then\n\
+                       path=\"$NAUTILUS_SCRIPT_CURRENT_URI\"\n\
+                       path=\"${{path#file://}}\"\n\
+                     fi\n\
+                     exec \"{}\" \"$path\"\n",
+                    current_exe
+                );
+                if std::fs::write(&script_path, content).is_ok() {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&script_path) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&script_path, perms);
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_file(script_path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn get_general_settings(app: tauri::AppHandle) -> GeneralSettings {
+    load_general_settings(&app)
+}
+
+#[tauri::command]
+fn set_general_settings(app: tauri::AppHandle, settings: GeneralSettings) {
+    let old_settings = load_general_settings(&app);
+    if old_settings.open_in_context_menu != settings.open_in_context_menu {
+        let _ = update_os_context_menu(&app, settings.open_in_context_menu);
+    }
+    save_general_settings(&app, &settings);
+}
+
+#[tauri::command]
+fn is_autostart_enabled(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_autostart_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    // Persist the user's explicit choice so the hotkey daemon (which also
+    // drives this same OS autolaunch entry) doesn't silently re-enable it.
+    let mut settings = load_general_settings(&app);
+    settings.run_at_startup = enabled;
+    save_general_settings(&app, &settings);
+    if enabled {
+        app.autolaunch().enable().map_err(|e| e.to_string())
+    } else {
+        app.autolaunch().disable().map_err(|e| e.to_string())
+    }
+}
+
+#[tauri::command]
+fn force_quit_app(app: tauri::AppHandle) {
+    // Without this flag the ExitRequested handler treats the exit as a
+    // window close and hides the app instead of quitting it.
+    SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    global_hotkey::kill_daemon();
+    app.exit(0);
+}
+
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
+    if load_general_settings(&app).run_in_background {
+        quit_to_background(&app);
+    } else {
+        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+        global_hotkey::clean_quit(&app);
+        app.exit(0);
+    }
+}
+
+/// "Quit" while `run_in_background` is on: the process stays resident (tray,
+/// global hotkeys, quick terminal) but everything else resets so the next
+/// open is indistinguishable from a cold launch. Steps are best-effort — one
+/// failing teardown must not abort the rest. Reload comes last so the UI is
+/// never shown half-torn-down.
+fn quit_to_background(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+
+    if let Ok(pty) = state.pty_manager.lock() {
+        pty.kill_all();
+    }
+    if let Ok(mut tunnels) = state.tunnel_manager.lock() {
+        tunnels.stop_all();
+    }
+    if let Ok(mut sftp) = state.sftp_manager.lock() {
+        sftp.clear_all();
+    }
+    if let Ok(mut watchers) = state.watch_handles.lock() {
+        for (_, stop) in watchers.drain() {
+            let _ = stop.send(());
+        }
+    }
+    if let Ok(mut flags) = state.transfer_cancel_flags.lock() {
+        for (_, flag) in flags.drain() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    if let Ok(mut dash) = state.dashboard_manager.lock() {
+        dash.disconnect_all();
+    }
+
+    // Vault: exactly what a relaunch does. on_app_exit covers the OnAppClose
+    // policy (forget keychain cache + lock). For every other policy a real
+    // relaunch silently re-unlocks from the keychain cache in setup(), so
+    // keeping the in-memory unlock is equivalent — do NOT call op_lock()
+    // here: it wipes the keychain cache and session token, which would force
+    // a master-password prompt even under the OnRestart policy.
+    vault::on_app_exit(app);
+
+    for window in app.webview_windows().values() {
+        let _ = window.hide();
+    }
+    global_hotkey::set_dock_visible(app, false);
+
+    // Fresh frontend boot. Each window loads index.html?window=…, so a
+    // reload equals a cold start of that webview. Windows are never
+    // destroyed/recreated: dynamic creation deadlocks WebView2 on Windows.
+    for window in app.webview_windows().values() {
+        let _ = window.eval("window.location.reload()");
+    }
 }
 
 /// Global AppHandle for the screen-lock notification callback.
@@ -985,22 +1883,31 @@ fn start_screen_lock_monitor(app: tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Managed at builder level (not in setup) so it exists even for
+        // RunEvent::Opened URLs delivered during early launch.
+        .manage(PendingOpenFolders::default())
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // The hotkey daemon launches us with --hotkey=<action>; when an
+            // instance is already running the argument lands here and is
+            // dispatched directly. Any other second launch (e.g. clicking the
+            // app icon again) just surfaces the existing instance.
+            if let Some(action) = global_hotkey::hotkey_arg(&argv) {
+                global_hotkey::dispatch(app, &action);
+            } else if let Some(window) = app.get_webview_window("main") {
+                global_hotkey::set_dock_visible(app, true);
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(
             tauri_plugin_window_state::Builder::new()
-                .with_state_flags(
-                    StateFlags::all() & !StateFlags::VISIBLE,
-                )
+                .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                .with_filter(|label| label != "settings" && label != quick_terminal::WINDOW_LABEL)
                 .build(),
         )
-        .manage(AppState {
-            pty_manager: Mutex::new(PtyManager::new()),
-            tunnel_manager: port_forwarding::new_tunnel_manager(),
-            sftp_manager: Mutex::new(SftpManager::new()),
-            watch_handles: Mutex::new(std::collections::HashMap::new()),
-            transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
-            dashboard_manager: Mutex::new(DashboardManager::new()),
-        })
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
+            take_pending_open_folders,
             create_session,
             write_to_session,
             resize_session,
@@ -1015,6 +1922,7 @@ pub fn run() {
             list_hosts,
             save_host,
             remove_hosts,
+            get_host_password,
             save_host_group,
             remove_host_group,
             vault_status,
@@ -1024,7 +1932,14 @@ pub fn run() {
             vault_change_master_password,
             get_vault_lock_policy,
             set_vault_lock_policy,
-            get_host_password,
+            sync_get_config,
+            sync_connect_provider,
+            sync_set_config,
+            sync_status,
+            sync_disconnect,
+            sync_now,
+            vault_init_from_sync,
+            sync_import_foreign,
             test_host_connection,
             list_port_forwards,
             save_port_forward,
@@ -1035,10 +1950,14 @@ pub fn run() {
             list_snippets,
             save_snippet,
             remove_snippets,
+            reorder_snippets,
+            save_snippet_group,
+            remove_snippet_group,
             run_snippet_script,
             sftp_connect_from_host,
             sftp_disconnect,
             sftp_cancel_transfer,
+            sftp_resolve_conflict,
             sftp_download,
             sftp_upload,
             sftp_list_local,
@@ -1065,20 +1984,96 @@ pub fn run() {
             dashboard_poll,
             dashboard_disconnect,
             quit_app,
+            get_general_settings,
+            set_general_settings,
+            is_autostart_enabled,
+            set_autostart_enabled,
+            force_quit_app,
+            enable_global_hotkey,
+            disable_global_hotkey,
+            get_global_hotkey_status,
+            toggle_quick_terminal,
+            hide_quick_terminal,
+            resize_quick_terminal,
+            get_quick_terminal_info,
+            set_quick_terminal_edge,
+            set_quick_terminal_enabled,
+            set_quick_terminal_opacity,
+            quick_terminal_frontend_ready,
         ])
         .on_window_event(|window, event| {
-            #[cfg(target_os = "macos")]
+            // Closing the main/extra windows hides them rather than exiting the
+            // process on every platform: the tray icon + optional global hotkey
+            // only make sense if the app keeps running in the background. The
+            // tray's "Quit" item (or the menu/shortcut equivalent) is the real exit.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let label = window.label();
-                if label == "main" || label.starts_with("window-") {
-                    let _ = window.hide();
-                    api.prevent_close();
+                if label == "main"
+                    || label.starts_with("window-")
+                    || label == quick_terminal::WINDOW_LABEL
+                {
+                    let app = window.app_handle();
+                    let settings = load_general_settings(app);
+                    if settings.run_in_background {
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
                 }
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (window, event);
         })
         .setup(|app| {
+            // Cold launch triggered by the termifaid hotkey service?
+            // This must be decided FIRST: Tauri pumps the event loop while
+            // building the webviews below, which fires didFinishLaunching and
+            // locks in the activation policy — setting Accessory any later
+            // leaves the app registered as a regular (Dock-visible) app.
+            let launch_args: Vec<String> = std::env::args().collect();
+            let is_background_flag = launch_args.iter().any(|arg| arg == "--background");
+            let hotkey_action = global_hotkey::hotkey_arg(&launch_args);
+            let is_hotkey_launch = hotkey_action.is_some();
+            let background_launch = is_background_flag || is_hotkey_launch;
+
+            #[cfg(target_os = "macos")]
+            if background_launch {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
+
+            // One-time, idempotent move of pre-multi-vault top-level files into
+            // vaults/default/. Every store below reads from vault_dir, never
+            // app_data_dir directly, so this runs before any store is opened.
+            termifai_core::layout::migrate_legacy_layout(&app_data_dir)
+                .map_err(|e| format!("Failed to migrate to vault layout: {}", e))?;
+            let vault_dir = termifai_core::layout::vault_dir(
+                &app_data_dir,
+                termifai_core::layout::DEFAULT_VAULT_ID,
+            );
+
+            app.manage(AppState {
+                pty_manager: Mutex::new(PtyManager::new()),
+                tunnel_manager: port_forwarding::new_tunnel_manager(),
+                sftp_manager: Mutex::new(SftpManager::new()),
+                watch_handles: Mutex::new(std::collections::HashMap::new()),
+                transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
+                transfer_conflict_tx: Mutex::new(std::collections::HashMap::new()),
+                dashboard_manager: Mutex::new(DashboardManager::new()),
+                hosts_store: store::JsonStore::new(vault_dir.join("hosts.json")),
+                port_forward_store: store::JsonStore::new(vault_dir.join("port_forwards.json")),
+                snippets_store: store::JsonStore::new(vault_dir.join("snippets.json")),
+                vault_settings_store: store::JsonStore::new(vault_dir.join("vault_settings.json")),
+                vault_crypto_store: store::JsonStore::new(vault_dir.join("vault.json")),
+                tombstones_store: store::JsonStore::new(vault_dir.join("tombstones.json")),
+                sync_state_store: store::JsonStore::new(vault_dir.join("sync_state.json")),
+            });
+            // One-time move of legacy inline snippet scripts into .sh files.
+            // Non-fatal: a failure keeps scripts inline (still readable).
+            if let Err(e) = snippets::migrate_inline_scripts(app.handle()) {
+                eprintln!("Snippet script migration failed: {}", e);
+            }
             // On Windows: pre-allocate a hidden console so that ConPTY session creation
             // doesn't flash a black console window each time a terminal tab is opened.
             // Also set UTF-8 (codepage 65001) so ConPTY correctly interprets multi-byte
@@ -1099,12 +2094,36 @@ pub fn run() {
             }
 
             // On Linux and Windows, remove native decorations so the custom frontend titlebar takes over
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            // Build the main window programmatically.
+            // On macOS: with decorations and Overlay title bar style for traffic lights.
+            // On Windows/Linux: without decorations to avoid two-toned title bar.
+            let mut main_builder =
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("Termifai")
+                    .inner_size(900.0, 600.0)
+                    .min_inner_size(900.0, 600.0)
+                    .resizable(true)
+                    .transparent(true)
+                    // On a quick-terminal cold launch the main window must
+                    // never appear — creating it visible and hiding later
+                    // makes it (and the Dock icon) flash.
+                    .visible(!background_launch);
+
+            #[cfg(target_os = "macos")]
             {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.set_decorations(false);
-                }
+                main_builder = main_builder
+                    .decorations(true)
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .hidden_title(true)
+                    .traffic_light_position(tauri::LogicalPosition::new(12.0, 25.0));
             }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                main_builder = main_builder.decorations(false);
+            }
+
+            let _main_win = main_builder.build()?;
 
             // Create the settings window hidden at startup — creating it dynamically after
             // the event loop starts deadlocks on Windows because WebView2 initialization
@@ -1125,6 +2144,69 @@ pub fn run() {
             .visible(false)
             .build()?;
 
+            // Quick Terminal panel — same create-hidden-at-startup pattern as the
+            // settings window (dynamic creation deadlocks WebView2 on Windows).
+            // Not draggable (no drag region in its HTML) and not natively
+            // resizable: sizing happens only via the in-panel drag handle.
+            WebviewWindowBuilder::new(
+                app,
+                quick_terminal::WINDOW_LABEL,
+                WebviewUrl::App("index.html?window=quick-terminal".into()),
+            )
+            .title("Quick Terminal")
+            .decorations(false)
+            .resizable(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .minimizable(false)
+            .maximizable(false)
+            // Transparent + shadowless so the native window itself is invisible:
+            // what the user sees sliding in is the panel div inside the webview.
+            .transparent(true)
+            .shadow(false)
+            // Native backdrop blur for the glass look: the first effect the
+            // platform supports is applied (HudWindow → macOS vibrancy,
+            // Acrylic/Blur → Windows; no-op on Linux). Only visible where the
+            // frontend makes its backgrounds translucent (panel transparency
+            // setting below 100%).
+            .effects(
+                tauri::window::EffectsBuilder::new()
+                    .effect(tauri::window::Effect::HudWindow)
+                    .effect(tauri::window::Effect::Acrylic)
+                    .effect(tauri::window::Effect::Blur)
+                    // Pin the effect to its active look — by default macOS
+                    // vibrancy follows window focus and dims when the panel
+                    // loses key status, which reads as the panel "darkening".
+                    .state(tauri::window::EffectState::Active)
+                    .build(),
+            )
+            .visible(false)
+            .build()?;
+
+            let app_handle = app.handle().clone();
+            if let Some(main_win) = app.get_webview_window("main") {
+                let _ = main_win.set_effects(
+                    tauri::window::EffectsBuilder::new()
+                        .effect(tauri::window::Effect::HudWindow)
+                        .effect(tauri::window::Effect::Acrylic)
+                        .effect(tauri::window::Effect::Blur)
+                        .state(tauri::window::EffectState::Active)
+                        .build(),
+                );
+
+                main_win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { .. } = event {
+                        // Closing "main" now only hides it on every platform (the app
+                        // keeps running via the tray), so the settings window — created
+                        // once at startup — must survive too, or it becomes unopenable
+                        // for the rest of the session.
+                        if let Some(settings_win) = app_handle.get_webview_window("settings") {
+                            let _ = settings_win.hide();
+                        }
+                    }
+                });
+            }
+
             // On Linux and Windows the native menubar is replaced by a frontend hamburger menu
             #[cfg(target_os = "macos")]
             {
@@ -1137,6 +2219,12 @@ pub fn run() {
                 let lock_vault = MenuItemBuilder::with_id("lock-vault", "Lock Vault")
                     .accelerator("CmdOrCtrl+Shift+L")
                     .build(app)?;
+                let custom_quit = MenuItemBuilder::with_id("custom-quit", "Quit Termifai")
+                    .accelerator("CmdOrCtrl+Q")
+                    .build(app)?;
+                let custom_force_quit = MenuItemBuilder::with_id("custom-force-quit", "Force Quit")
+                    .accelerator("CmdOrCtrl+Alt+Q")
+                    .build(app)?;
 
                 let file_menu = SubmenuBuilder::new(app, "File")
                     .item(&new_terminal)
@@ -1146,7 +2234,8 @@ pub fn run() {
                     .separator()
                     .item(&PredefinedMenuItem::close_window(app, None)?)
                     .separator()
-                    .item(&PredefinedMenuItem::quit(app, None)?)
+                    .item(&custom_quit)
+                    .item(&custom_force_quit)
                     .build()?;
 
                 let edit_menu = SubmenuBuilder::new(app, "Edit")
@@ -1186,6 +2275,20 @@ pub fn run() {
                         vault::op_lock();
                         let _ = handle.emit("vault-locked", ());
                     }
+                    "custom-quit" => {
+                        if load_general_settings(&handle).run_in_background {
+                            quit_to_background(&handle);
+                        } else {
+                            SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                            global_hotkey::clean_quit(&handle);
+                            handle.exit(0);
+                        }
+                    }
+                    "custom-force-quit" => {
+                        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        global_hotkey::kill_daemon();
+                        handle.exit(0);
+                    }
                     _ => {}
                 });
             }
@@ -1197,31 +2300,131 @@ pub fn run() {
                         .build(),
                 )?;
             }
+            app.handle().plugin(tauri_plugin_autostart::init(
+                MacosLauncher::LaunchAgent,
+                Some(vec!["--background"]),
+            ))?;
             // Try to unlock the vault silently using the keychain-cached master password,
-            // so a returning user on this device isn't prompted again.
-            let _ = vault::op_try_cached_unlock(app.handle());
+            // so a returning user on this device isn't prompted again. This bypasses the
+            // vault_unlock command, so — same as that command — it must also trigger the
+            // legacy-plaintext-password migration; otherwise a user whose vault always
+            // auto-unlocks (the default OnRestart policy) would never get migrated.
+            if let Ok(true) = vault::op_try_cached_unlock(app.handle()) {
+                let _ = hosts::migrate_plaintext_passwords(app.handle());
+            }
 
             // Start background screen-lock monitor (macOS only).
             #[cfg(target_os = "macos")]
             start_screen_lock_monitor(app.handle().clone());
 
+            // Tray icon so the app can keep running in the background (required
+            // for the optional global hotkey to mean anything) with an explicit
+            // way to show the window or quit.
+            let show_item =
+                MenuItem::with_id(app, "tray-show", "Show Termifai", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "tray-quit", "Quit", true, None::<&str>)?;
+            let force_quit_item =
+                MenuItem::with_id(app, "tray-force-quit", "Force Quit", true, None::<&str>)?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item, &force_quit_item])?;
+            TrayIconBuilder::new()
+                .icon(
+                    app.default_window_icon()
+                        .cloned()
+                        .ok_or("Missing default window icon")?,
+                )
+                .menu(&tray_menu)
+                .show_menu_on_left_click(true)
+                .on_menu_event(|app, event| match event.id().as_ref() {
+                    "tray-show" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            global_hotkey::set_dock_visible(app, true);
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                    "tray-quit" => {
+                        if load_general_settings(app).run_in_background {
+                            quit_to_background(app);
+                        } else {
+                            SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                            global_hotkey::clean_quit(app);
+                            app.exit(0);
+                        }
+                    }
+                    "tray-force-quit" => {
+                        SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        global_hotkey::kill_daemon();
+                        app.exit(0);
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+
+            // Record our exe path for the hotkey daemon and make sure the
+            // daemon is running if any hotkey is enabled.
+            global_hotkey::restore_on_startup(&app.handle().clone());
+
+            // Cold launch triggered by the hotkey daemon (--hotkey=<action>).
+            // main-window needs nothing: the main window shows by default.
+            // quick-terminal: the user asked for the panel, not the app — hide
+            // the main window and slide the panel in once its webview reports
+            // ready (see quick_terminal_frontend_ready).
+            app.manage(quick_terminal::PendingToggle::default());
+            // Finish the cold-launch handling decided at the top of setup:
+            // the panel slides in once its webview reports ready. The bundle
+            // is marked LSUIElement (agent) to cover the instant before
+            // didFinishLaunching; normal launches opt back into being a
+            // regular app here, which is what shows the Dock icon.
+            if hotkey_action.as_deref() == Some(global_hotkey::ACTION_QUICK_TERMINAL) {
+                app.state::<quick_terminal::PendingToggle>()
+                    .0
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            } else if hotkey_action.as_deref() == Some(global_hotkey::ACTION_MAIN_WINDOW) {
+                if let Some(main_win) = app.get_webview_window("main") {
+                    global_hotkey::set_dock_visible(app.handle(), true);
+                    let _ = main_win.show();
+                    let _ = main_win.set_focus();
+                }
+            } else if !background_launch {
+                global_hotkey::set_dock_visible(app.handle(), true);
+            }
+
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|app_handle, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                let run_in_background = load_general_settings(app_handle).run_in_background;
+                if !run_in_background {
+                    global_hotkey::kill_daemon();
+                } else if !SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
+                    api.prevent_exit();
+                    for window in app_handle.webview_windows().values() {
+                        let _ = window.hide();
+                    }
+                    global_hotkey::set_dock_visible(app_handle, false);
+                }
+            }
+            tauri::RunEvent::Exit => {
                 vault::on_app_exit(app_handle);
             }
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { has_visible_windows, .. } = event {
-                if !has_visible_windows {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.show();
-                        let _ = window.set_focus();
-                    }
+            tauri::RunEvent::Opened { urls } => {
+                handle_opened_urls(app_handle, urls);
+            }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } => {
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    global_hotkey::set_dock_visible(app_handle, true);
+                    let _ = window.show();
+                    let _ = window.set_focus();
                 }
             }
+            _ => {}
         });
 }
 
@@ -1231,8 +2434,52 @@ fn open_settings_window_inner(app: &tauri::AppHandle) -> Result<(), String> {
         .get_webview_window("settings")
         .ok_or_else(|| "Settings window not found".to_string())?;
 
-    window.show().map_err(|e| format!("Failed to show settings window: {}", e))?;
-    window.set_focus().map_err(|e| format!("Failed to focus settings window: {}", e))?;
+    // The settings window is a normal window (not always-on-top), so it would
+    // end up *behind* the always-on-top Quick Terminal panel. Collapse the
+    // panel instead — it's a transient overlay, and this keeps the settings
+    // window from having to sit above other apps' windows.
+    if let Some(quick) = app.get_webview_window(quick_terminal::WINDOW_LABEL) {
+        if quick.is_visible().unwrap_or(false) {
+            let _ = app.emit("quick-terminal:hide", ());
+        }
+    }
+
+    // Center on the main window using *logical* coordinates: physical
+    // coordinates are interpreted with the scale factor of the monitor the
+    // settings window currently sits on, so when the main window is on a
+    // monitor with a different scale factor the position lands on the wrong
+    // screen. Logical coordinates are global across monitors.
+    let center_on_main = |window: &tauri::WebviewWindow| {
+        if let Some(main_window) = app.get_webview_window("main") {
+            if let (Ok(main_pos), Ok(main_size), Ok(scale_factor)) = (
+                main_window.outer_position(),
+                main_window.outer_size(),
+                main_window.scale_factor(),
+            ) {
+                let main_pos = main_pos.to_logical::<f64>(scale_factor);
+                let main_size = main_size.to_logical::<f64>(scale_factor);
+                let x = main_pos.x + (main_size.width - 800.0) / 2.0;
+                let y = main_pos.y + (main_size.height - 600.0) / 2.0;
+                let _ = window
+                    .set_position(tauri::Position::Logical(tauri::LogicalPosition::new(x, y)));
+            }
+        }
+    };
+
+    // Position before showing so the window doesn't flash at its old spot.
+    center_on_main(&window);
+
+    window
+        .show()
+        .map_err(|e| format!("Failed to show settings window: {}", e))?;
+
+    // Re-apply after show: on Windows the window's DPI is only updated once it
+    // actually moves to the other monitor, so the first pass can be slightly off.
+    center_on_main(&window);
+
+    window
+        .set_focus()
+        .map_err(|e| format!("Failed to focus settings window: {}", e))?;
 
     Ok(())
 }

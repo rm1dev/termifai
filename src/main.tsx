@@ -1,6 +1,6 @@
 import { lazy, StrictMode, Suspense } from "react";
 import { createRoot } from "react-dom/client";
-import { listen } from "@tauri-apps/api/event";
+import { subscribe } from "@/lib/api/transport";
 import { Toaster } from "@/components/ui/sonner";
 import {
   appThemeChangedEvent,
@@ -17,6 +17,11 @@ const AppShell = lazy(() =>
 const SettingsWindow = lazy(() =>
   import("@/components/settings/SettingsWindow").then((m) => ({ default: m.SettingsWindow }))
 );
+const QuickTerminalWindow = lazy(() =>
+  import("@/components/quick-terminal/QuickTerminalWindow").then((m) => ({
+    default: m.QuickTerminalWindow,
+  }))
+);
 
 applyAppTheme(loadAppTheme());
 window.addEventListener("storage", (event) => {
@@ -24,7 +29,7 @@ window.addEventListener("storage", (event) => {
     applyAppTheme(loadAppTheme());
   }
 });
-void listen<AppTheme>(appThemeChangedEvent, (event) => {
+void subscribe<AppTheme>(appThemeChangedEvent, (event) => {
   applyAppTheme(event.payload);
 }).catch(() => {
   /* Non-Tauri environments rely on storage events. */
@@ -38,12 +43,18 @@ window.addEventListener("gesturestart", (e) => e.preventDefault());
 window.addEventListener("gesturechange", (e) => e.preventDefault());
 
 const params = new URLSearchParams(window.location.search);
-const isSettings = params.get("window") === "settings";
+const windowKind = params.get("window");
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <Suspense>
-      {isSettings ? <SettingsWindow /> : <AppShell />}
+      {windowKind === "settings" ? (
+        <SettingsWindow />
+      ) : windowKind === "quick-terminal" ? (
+        <QuickTerminalWindow />
+      ) : (
+        <AppShell />
+      )}
     </Suspense>
     <Toaster />
   </StrictMode>
