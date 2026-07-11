@@ -48,7 +48,7 @@ use quick_terminal::{
     resize_quick_terminal, set_quick_terminal_edge, set_quick_terminal_enabled,
     set_quick_terminal_opacity, toggle_quick_terminal,
 };
-use snippets::{SaveSnippetRequest, Snippet};
+use snippets::{SaveSnippetRequest, Snippet, SnippetGroup};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -408,7 +408,7 @@ fn get_tunnel_statuses(state: State<AppState>, rule_ids: Vec<String>) -> Vec<Tun
 }
 
 #[tauri::command]
-fn list_snippets(app: tauri::AppHandle) -> Result<Vec<Snippet>, String> {
+fn list_snippets(app: tauri::AppHandle) -> Result<snippets::SnippetsListResult, String> {
     snippets::list_snippets(&app)
 }
 
@@ -420,6 +420,19 @@ fn save_snippet(app: tauri::AppHandle, request: SaveSnippetRequest) -> Result<Sn
 #[tauri::command]
 fn remove_snippets(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
     snippets::remove_snippets(&app, ids)
+}
+
+#[tauri::command]
+fn save_snippet_group(
+    app: tauri::AppHandle,
+    request: snippets::SaveSnippetGroupRequest,
+) -> Result<SnippetGroup, String> {
+    snippets::save_snippet_group(&app, request)
+}
+
+#[tauri::command]
+fn remove_snippet_group(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    snippets::remove_snippet_group(&app, id)
 }
 
 #[tauri::command]
@@ -1932,6 +1945,8 @@ pub fn run() {
             list_snippets,
             save_snippet,
             remove_snippets,
+            save_snippet_group,
+            remove_snippet_group,
             run_snippet_script,
             sftp_connect_from_host,
             sftp_disconnect,
