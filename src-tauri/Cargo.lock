@@ -5175,6 +5175,7 @@ dependencies = [
  "keyring",
  "log",
  "oauth2",
+ "objc2",
  "portable-pty",
  "serde",
  "serde_json",
