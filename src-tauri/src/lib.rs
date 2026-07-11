@@ -48,7 +48,7 @@ use quick_terminal::{
     resize_quick_terminal, set_quick_terminal_edge, set_quick_terminal_enabled,
     set_quick_terminal_opacity, toggle_quick_terminal,
 };
-use snippets::{SaveSnippetRequest, Snippet};
+use snippets::{SaveSnippetRequest, Snippet, SnippetGroup};
 use ssh_keys::{GenerateSshKeyRequest, ImportSshKeyRequest, SshKey};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -408,7 +408,7 @@ fn get_tunnel_statuses(state: State<AppState>, rule_ids: Vec<String>) -> Vec<Tun
 }
 
 #[tauri::command]
-fn list_snippets(app: tauri::AppHandle) -> Result<Vec<Snippet>, String> {
+fn list_snippets(app: tauri::AppHandle) -> Result<snippets::SnippetsListResult, String> {
     snippets::list_snippets(&app)
 }
 
@@ -420,6 +420,24 @@ fn save_snippet(app: tauri::AppHandle, request: SaveSnippetRequest) -> Result<Sn
 #[tauri::command]
 fn remove_snippets(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
     snippets::remove_snippets(&app, ids)
+}
+
+#[tauri::command]
+fn reorder_snippets(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
+    snippets::reorder_snippets(&app, ids)
+}
+
+#[tauri::command]
+fn save_snippet_group(
+    app: tauri::AppHandle,
+    request: snippets::SaveSnippetGroupRequest,
+) -> Result<SnippetGroup, String> {
+    snippets::save_snippet_group(&app, request)
+}
+
+#[tauri::command]
+fn remove_snippet_group(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    snippets::remove_snippet_group(&app, id)
 }
 
 #[tauri::command]
@@ -1428,6 +1446,16 @@ pub struct GeneralSettings {
     pub run_in_background: bool,
     #[serde(default)]
     pub open_in_context_menu: bool,
+    // User's explicit "Run at Startup" preference. The global-hotkey daemon
+    // also drives the same OS autolaunch entry (it needs to run at login to
+    // supervise hotkeys), so this flag lets it avoid overriding a user who
+    // explicitly turned autostart off in Settings.
+    #[serde(default = "default_true")]
+    pub run_at_startup: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for GeneralSettings {
@@ -1435,6 +1463,7 @@ impl Default for GeneralSettings {
         Self {
             run_in_background: true,
             open_in_context_menu: false,
+            run_at_startup: true,
         }
     }
 }
@@ -1446,7 +1475,7 @@ fn general_settings_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
         .map(|d| d.join("general_settings.json"))
 }
 
-fn load_general_settings(app: &tauri::AppHandle) -> GeneralSettings {
+pub(crate) fn load_general_settings(app: &tauri::AppHandle) -> GeneralSettings {
     general_settings_path(app)
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<GeneralSettings>(&s).ok())
@@ -1688,6 +1717,11 @@ fn is_autostart_enabled(app: tauri::AppHandle) -> bool {
 #[tauri::command]
 fn set_autostart_enabled(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
+    // Persist the user's explicit choice so the hotkey daemon (which also
+    // drives this same OS autolaunch entry) doesn't silently re-enable it.
+    let mut settings = load_general_settings(&app);
+    settings.run_at_startup = enabled;
+    save_general_settings(&app, &settings);
     if enabled {
         app.autolaunch().enable().map_err(|e| e.to_string())
     } else {
@@ -1916,6 +1950,9 @@ pub fn run() {
             list_snippets,
             save_snippet,
             remove_snippets,
+            reorder_snippets,
+            save_snippet_group,
+            remove_snippet_group,
             run_snippet_script,
             sftp_connect_from_host,
             sftp_disconnect,
