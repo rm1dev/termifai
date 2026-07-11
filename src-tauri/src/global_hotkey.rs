@@ -72,24 +72,42 @@ pub fn set_dock_visible(app: &AppHandle, visible: bool) {
 }
 
 fn toggle_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let visible = window.is_visible().unwrap_or(false);
-        if visible {
-            let _ = window.hide();
-        } else {
-            set_dock_visible(app, true);
-            let _ = window.show();
-            let _ = window.set_focus();
+    match app.get_webview_window("main") {
+        Some(window) => {
+            let visible = window.is_visible().unwrap_or(false);
+            if visible {
+                let _ = window.hide();
+            } else {
+                crate::revive_webview_if_stuck(&window);
+                set_dock_visible(app, true);
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        // The window may have been fully closed (e.g. "run in background" is
+        // off) — rebuild it rather than silently doing nothing. Don't revive
+        // it: that reloads mid-navigation and can hang WebView2 on Windows.
+        None => {
+            if let Err(e) = crate::build_main_window(app, true) {
+                log::error!("failed to rebuild main window: {e}");
+            } else {
+                set_dock_visible(app, true);
+            }
         }
     }
 }
 
 /// Routes a hotkey action (delivered by the daemon via `--hotkey=<action>`).
+/// Callers may be off the main thread (the loopback IPC listener thread on
+/// Windows/Linux), and building or showing a window off the main thread can
+/// hang WebView2 on Windows, so the actual work always hops onto it.
 pub fn dispatch(app: &AppHandle, action: &str) {
-    match action {
-        ACTION_QUICK_TERMINAL => crate::quick_terminal::toggle(app),
-        _ => toggle_main_window(app),
-    }
+    let app = app.clone();
+    let action = action.to_string();
+    let _ = app.clone().run_on_main_thread(move || match action.as_str() {
+        ACTION_QUICK_TERMINAL => crate::quick_terminal::toggle(&app),
+        _ => toggle_main_window(&app),
+    });
 }
 
 /// Extracts the action from a `--hotkey=<action>` argument list.
