@@ -966,7 +966,7 @@ function Sidebar({
         })}
       </nav>
       <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground text-center truncate">
-        {isCurrentlyCollapsed ? "v0.1" : "v0.1 · Termifai"}
+        {isCurrentlyCollapsed ? "v0.9.1" : "v0.9.1 · Termifai"}
       </div>
     </aside>
   );

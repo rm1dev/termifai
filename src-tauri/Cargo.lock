@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "Termifaid"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "ashpd",
  "dirs 5.0.1",
@@ -5166,7 +5166,7 @@ dependencies = [
 
 [[package]]
 name = "termifai"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "auto-launch",
  "base64 0.22.1",
@@ -5197,7 +5197,7 @@ dependencies = [
 
 [[package]]
 name = "termifai-core"
-version = "0.1.0"
+version = "0.9.1"
 dependencies = [
  "argon2",
  "base64 0.22.1",

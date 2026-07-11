@@ -3,7 +3,7 @@ members = ["crates/termifai-core", "crates/termifaid"]
 
 [package]
 name = "termifai"
-version = "0.1.0"
+version = "0.9.1"
 description = "A modern terminal emulator"
 authors = ["you"]
 license = "MIT"
