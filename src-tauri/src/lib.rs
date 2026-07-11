@@ -1914,32 +1914,32 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
 
         let home = std::env::var("HOME").map(std::path::PathBuf::from).ok();
 
-        // 1. KDE Dolphin ServiceMenu
         if let Some(ref h) = home {
-            let dir = h.join(".local/share/kservices5/ServiceMenus");
-            let file_path = dir.join("termifai.desktop");
-            if _enabled {
-                let _ = std::fs::create_dir_all(&dir);
-                let content = format!(
-                    "[Desktop Entry]\n\
-                     Type=Service\n\
-                     ServiceTypes=KonqPopupMenu/Plugin,inode/directory\n\
-                     Actions=openInTermifai\n\
-                     MimeType=inode/directory;\n\n\
-                     [Desktop Action openInTermifai]\n\
-                     Name=Open in Termifai\n\
-                     Icon=utilities-terminal\n\
-                     Exec=\"{}\" \"%f\"\n",
-                    current_exe
-                );
-                let _ = std::fs::write(file_path, content);
-            } else {
-                let _ = std::fs::remove_file(file_path);
+            // 1. KDE Dolphin ServiceMenu (KDE 5 & 6)
+            for kservice in &["kservices5", "kservices6"] {
+                let dir = h.join(format!(".local/share/{}/ServiceMenus", kservice));
+                let file_path = dir.join("termifai.desktop");
+                if _enabled {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let content = format!(
+                        "[Desktop Entry]\n\
+                         Type=Service\n\
+                         ServiceTypes=KonqPopupMenu/Plugin,inode/directory\n\
+                         Actions=openInTermifai\n\
+                         MimeType=inode/directory;\n\n\
+                         [Desktop Action openInTermifai]\n\
+                         Name=Open in Termifai\n\
+                         Icon=utilities-terminal\n\
+                         Exec=\"{}\" \"%f\"\n",
+                        current_exe
+                    );
+                    let _ = std::fs::write(file_path, content);
+                } else {
+                    let _ = std::fs::remove_file(file_path);
+                }
             }
-        }
 
-        // 2. GNOME Nautilus Scripts
-        if let Some(ref h) = home {
+            // 2. GNOME Nautilus Scripts (Legacy/Fallback)
             let nautilus_dir = h.join(".local/share/nautilus/scripts");
             let script_path = nautilus_dir.join("Open in Termifai");
             if _enabled {
@@ -1964,6 +1964,128 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                 }
             } else {
                 let _ = std::fs::remove_file(script_path);
+            }
+
+            // 3. GNOME Nautilus Python Extension (Direct Top-Level Right Click Menu)
+            let python_dir = h.join(".local/share/nautilus-python/extensions");
+            let python_path = python_dir.join("termifai.py");
+            if _enabled {
+                let _ = std::fs::create_dir_all(&python_dir);
+                let content = format!(
+                    "import os\n\
+                     from gi.repository import Nautilus, GObject\n\n\
+                     class TermifaiExtension(GObject.GObject, Nautilus.MenuProvider):\n\
+                         def __init__(self):\n\
+                             pass\n\n\
+                         def get_file_items(self, *args):\n\
+                             files = args[-1] if len(args) > 0 else []\n\
+                             if len(files) != 1:\n\
+                                 return []\n\
+                             file_item = files[0]\n\
+                             if not file_item.is_directory():\n\
+                                 return []\n\
+                             filepath = file_item.get_location().get_path()\n\
+                             item = Nautilus.MenuItem(\n\
+                                 name=\"Termifai::open_in_termifai\",\n\
+                                 label=\"Open in Termifai\",\n\
+                                 tip=\"Open this directory in Termifai\",\n\
+                                 icon=\"utilities-terminal\"\n\
+                             )\n\
+                             item.connect(\"activate\", self.menu_activate_cb, filepath)\n\
+                             return [item]\n\n\
+                         def get_background_items(self, *args):\n\
+                             current_folder = args[-1] if len(args) > 0 else None\n\
+                             if not current_folder:\n\
+                                 return []\n\
+                             filepath = current_folder.get_location().get_path()\n\
+                             item = Nautilus.MenuItem(\n\
+                                 name=\"Termifai::open_in_termifai_bg\",\n\
+                                 label=\"Open in Termifai\",\n\
+                                 tip=\"Open this directory in Termifai\",\n\
+                                 icon=\"utilities-terminal\"\n\
+                             )\n\
+                             item.connect(\"activate\", self.menu_activate_cb, filepath)\n\
+                             return [item]\n\n\
+                         def menu_activate_cb(self, menu, filepath):\n\
+                             os.system('\"{}\" \"{{}}\" &'.format(filepath))\n",
+                    current_exe
+                );
+                let _ = std::fs::write(python_path, content);
+            } else {
+                let _ = std::fs::remove_file(python_path);
+            }
+
+            // 4. Cinnamon Nemo Actions & Scripts
+            let nemo_script_dir = h.join(".local/share/nemo/scripts");
+            let nemo_script = nemo_script_dir.join("Open in Termifai");
+            let nemo_action_dir = h.join(".local/share/nemo/actions");
+            let nemo_action = nemo_action_dir.join("termifai.nemo_action");
+            if _enabled {
+                // Scripts
+                let _ = std::fs::create_dir_all(&nemo_script_dir);
+                let content = format!(
+                    "#!/bin/sh\n\
+                     path=$(echo \"$NEMO_SCRIPT_SELECTED_FILE_PATHS\" | head -n 1)\n\
+                     if [ -z \"$path\" ]; then\n\
+                       path=\"$NEMO_SCRIPT_CURRENT_URI\"\n\
+                       path=\"${{path#file://}}\"\n\
+                     fi\n\
+                     exec \"{}\" \"$path\"\n",
+                    current_exe
+                );
+                if std::fs::write(&nemo_script, content).is_ok() {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&nemo_script) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&nemo_script, perms);
+                    }
+                }
+                // Actions (Top-Level Menu)
+                let _ = std::fs::create_dir_all(&nemo_action_dir);
+                let action_content = format!(
+                    "[Nemo Action]\n\
+                     Active=true\n\
+                     Name=Open in Termifai\n\
+                     Comment=Open this folder in Termifai\n\
+                     Exec=\"{}\" \"%F\"\n\
+                     Icon-Name=utilities-terminal\n\
+                     Selection=any\n\
+                     Extensions=dir;\n\
+                     Quote=double\n",
+                    current_exe
+                );
+                let _ = std::fs::write(nemo_action, action_content);
+            } else {
+                let _ = std::fs::remove_file(nemo_script);
+                let _ = std::fs::remove_file(nemo_action);
+            }
+
+            // 5. MATE Caja Scripts
+            let caja_dir = h.join(".local/share/caja/scripts");
+            let caja_script = caja_dir.join("Open in Termifai");
+            if _enabled {
+                let _ = std::fs::create_dir_all(&caja_dir);
+                let content = format!(
+                    "#!/bin/sh\n\
+                     path=$(echo \"$CAJA_SCRIPT_SELECTED_FILE_PATHS\" | head -n 1)\n\
+                     if [ -z \"$path\" ]; then\n\
+                       path=\"$CAJA_SCRIPT_CURRENT_URI\"\n\
+                       path=\"${{path#file://}}\"\n\
+                     fi\n\
+                     exec \"{}\" \"$path\"\n",
+                    current_exe
+                );
+                if std::fs::write(&caja_script, content).is_ok() {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&caja_script) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&caja_script, perms);
+                    }
+                }
+            } else {
+                let _ = std::fs::remove_file(caja_script);
             }
         }
     }
