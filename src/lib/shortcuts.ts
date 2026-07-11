@@ -11,7 +11,8 @@ export type ShortcutActionId =
   | "open-snippets"
   | "lock-vault"
   | "terminal-copy"
-  | "terminal-paste";
+  | "terminal-paste"
+  | "clear-terminal";
 
 export interface ShortcutBinding {
   key: string;
@@ -88,6 +89,12 @@ export const shortcutDefinitions: ShortcutDefinition[] = [
     label: "Terminal paste",
     description: "Paste into the terminal",
     defaultBinding: binding("v", { ctrlKey: true, shiftKey: true, code: "KeyV" }),
+  },
+  {
+    id: "clear-terminal",
+    label: "Clear terminal",
+    description: "Clear the terminal screen and scrollback buffer",
+    defaultBinding: cmdOrCtrl("k", { code: "KeyK" }),
   },
 ];
 
