@@ -47,6 +47,7 @@ pub struct SyncStatusDto {
 pub struct SetSyncConfigRequest {
     pub backend: SyncBackendConfig,
     #[serde(default)]
+    #[allow(dead_code)]
     pub sync_ssh_keys: bool,
 }
 
@@ -274,7 +275,7 @@ pub fn sync_set_config(app: &AppHandle, request: SetSyncConfigRequest) -> Result
         .sync_state_store
         .update_with_migration(migrate_sync_state, |s| {
             s.backend = Some(request.backend.clone());
-            s.sync_ssh_keys = request.sync_ssh_keys;
+            s.sync_ssh_keys = false;
             // A backend switch targets a different remote — start it fresh.
             s.last_synced_blob_version = 0;
             s.last_sync_at = None;
@@ -382,7 +383,6 @@ pub fn vault_init_from_sync(
     // Decrypt succeeded — safe to start writing local state now.
     crate::vault::op_init(app, &request.master_password)?;
 
-    let sync_ssh_keys = payload.ssh_keys.is_some();
     write_payload_to_local_stores(app, &payload)?;
 
     let device_id = ensure_device_id(app)?;
@@ -391,7 +391,7 @@ pub fn vault_init_from_sync(
         .sync_state_store
         .update_with_migration(migrate_sync_state, |s| {
             s.backend = Some(request.backend.clone());
-            s.sync_ssh_keys = sync_ssh_keys;
+            s.sync_ssh_keys = false;
             s.last_synced_blob_version = manifest.blob_version;
             s.last_sync_at = Some(now_iso());
             s.dirty = false;
@@ -503,10 +503,12 @@ pub fn sync_import_foreign(
 
 pub(crate) fn load_state(app: &AppHandle) -> Result<SyncState, String> {
     let state = app.state::<AppState>();
-    state
+    let mut s = state
         .sync_state_store
         .load_with_migration(migrate_sync_state)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    s.sync_ssh_keys = false;
+    Ok(s)
 }
 
 fn to_status_dto(state: &SyncState) -> SyncStatusDto {
@@ -777,7 +779,7 @@ fn write_payload_to_local_stores(
         tombstones: payload.tombstones.clone(),
         blob_version: 0,
     };
-    apply_outcome(app, &outcome, payload.ssh_keys.is_some())
+    apply_outcome(app, &outcome, false)
 }
 
 fn now_iso() -> String {
