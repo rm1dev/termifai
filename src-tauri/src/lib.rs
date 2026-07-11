@@ -1776,12 +1776,62 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                 ])
                 .status();
 
+            // Add Directory shell Icon
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\shell\\Termifai",
+                    "/v",
+                    "Icon",
+                    "/d",
+                    &current_exe,
+                    "/f",
+                ])
+                .status();
+
             // Add Directory command
             let cmd_val = format!("\"{}\" \"%V\"", current_exe);
             let _ = std::process::Command::new(reg_exe)
                 .args(&[
                     "add",
                     "HKCU\\Software\\Classes\\Directory\\shell\\Termifai\\command",
+                    "/ve",
+                    "/d",
+                    &cmd_val,
+                    "/f",
+                ])
+                .status();
+
+            // Add Drive shell
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Drive\\shell\\Termifai",
+                    "/ve",
+                    "/d",
+                    "Open in Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Add Drive shell Icon
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Drive\\shell\\Termifai",
+                    "/v",
+                    "Icon",
+                    "/d",
+                    &current_exe,
+                    "/f",
+                ])
+                .status();
+
+            // Add Drive command
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Drive\\shell\\Termifai\\command",
                     "/ve",
                     "/d",
                     &cmd_val,
@@ -1797,6 +1847,19 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                     "/ve",
                     "/d",
                     "Open in Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Add Background shell Icon
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "add",
+                    "HKCU\\Software\\Classes\\Directory\\Background\\shell\\Termifai",
+                    "/v",
+                    "Icon",
+                    "/d",
+                    &current_exe,
                     "/f",
                 ])
                 .status();
@@ -1818,6 +1881,15 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                 .args(&[
                     "delete",
                     "HKCU\\Software\\Classes\\Directory\\shell\\Termifai",
+                    "/f",
+                ])
+                .status();
+
+            // Remove Drive
+            let _ = std::process::Command::new(reg_exe)
+                .args(&[
+                    "delete",
+                    "HKCU\\Software\\Classes\\Drive\\shell\\Termifai",
                     "/f",
                 ])
                 .status();
@@ -2151,6 +2223,33 @@ pub fn run() {
             // dispatched directly. Any other second launch (e.g. clicking the
             // app icon again) just surfaces the existing instance.
             log::info!("single-instance: second launch forwarded, argv={argv:?}");
+            let mut found_folder = false;
+            for arg in &argv {
+                let mut clean_arg = arg.clone();
+                if clean_arg.ends_with('"') {
+                    clean_arg.pop();
+                }
+                let path = std::path::Path::new(&clean_arg);
+                if path.is_dir() {
+                    let path_str = path.to_string_lossy().into_owned();
+                    let clean_path = if path_str.starts_with(r"\\?\") {
+                        path_str[4..].to_string()
+                    } else {
+                        path_str
+                    };
+                    app.state::<PendingOpenFolders>()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .push(clean_path);
+                    found_folder = true;
+                }
+            }
+
+            if found_folder {
+                let _ = app.emit("open-folder-pending", ());
+            }
+
             if let Some(action) = global_hotkey::hotkey_arg(&argv) {
                 global_hotkey::dispatch(app, &action);
             } else {
@@ -2397,6 +2496,30 @@ pub fn run() {
             // Build the main window programmatically.
             // On macOS: with decorations and Overlay title bar style for traffic lights.
             // On Windows/Linux: without decorations to avoid two-toned title bar.
+            // Process folder arguments on startup:
+            for arg in &launch_args {
+                let mut clean_arg = arg.clone();
+                if clean_arg.ends_with('"') {
+                    clean_arg.pop();
+                }
+                let path = std::path::Path::new(&clean_arg);
+                if path.is_dir() {
+                    let path_str = path.to_string_lossy().into_owned();
+                    let clean_path = if path_str.starts_with(r"\\?\") {
+                        path_str[4..].to_string()
+                    } else {
+                        path_str
+                    };
+                    app.state::<PendingOpenFolders>()
+                        .0
+                        .lock()
+                        .unwrap()
+                        .push(clean_path);
+                }
+            }
+
+
+
             let _main_win = build_main_window(app.handle(), !background_launch)?;
 
             // Create the settings window hidden at startup — creating it dynamically after
