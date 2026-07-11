@@ -1,7 +1,7 @@
 use crate::crypto::{self, CryptoError, VaultKey};
 use crate::model::forwards::PortForwardRule;
 use crate::model::hosts::{Host, HostGroup};
-use crate::model::snippets::Snippet;
+use crate::model::snippets::{Snippet, SnippetGroup};
 use crate::model::ssh_keys::SshKey;
 use crate::model::tombstones::Tombstone;
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
@@ -51,6 +51,8 @@ pub struct SyncPayload {
     pub groups: Vec<HostGroup>,
     #[serde(default)]
     pub snippets: Vec<Snippet>,
+    #[serde(default)]
+    pub snippet_groups: Vec<SnippetGroup>,
     #[serde(default)]
     pub port_forwards: Vec<PortForwardRule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

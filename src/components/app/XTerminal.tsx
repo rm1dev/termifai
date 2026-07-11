@@ -14,6 +14,9 @@ import {
 } from "@/lib/api/terminal";
 import { subscribe, type UnlistenFn } from "@/lib/api/transport";
 import { listSnippets } from "@/lib/api/snippets";
+import { listHosts } from "@/lib/api/hosts";
+import { onSnippetsChanged } from "@/lib/snippets-events";
+import { matchesOsTarget } from "@/features/snippets/osTargets";
 import {
   ensureTerminalFontLoaded,
   getTerminalFontStack,
@@ -35,7 +38,7 @@ import {
   shortcutsStorageKey,
   type ShortcutMap,
 } from "@/lib/shortcuts";
-import type { Snippet } from "@/components/app/types";
+import type { OsKind, Snippet } from "@/components/app/types";
 import { Search } from "lucide-react";
 
 interface Props {
@@ -174,6 +177,21 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [snippetQuery, setSnippetQuery] = useState("");
   const [snippetIndex, setSnippetIndex] = useState(0);
   const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
+  // Resolved once per mount: local terminal tabs have no hostId, so `isLocal`
+  // is true; SSH tabs look up the host's OS to gate OS-restricted snippets.
+  const osContextRef = useRef<{ isLocal: boolean; hostOs?: OsKind }>({ isLocal: !hostId });
+  // keyword -> snippet, for the text-only auto-expand feature. Only snippets
+  // with no variables are eligible (mid-line variable prompts would be jarring).
+  const keywordSnippetsRef = useRef<Map<string, Snippet>>(new Map());
+  // Raw text typed since the last Enter, tracked from keystrokes directly
+  // rather than read from the terminal's rendered buffer — the buffer only
+  // reflects a keystroke once the PTY echoes it back asynchronously, which
+  // isn't done yet at the moment the next keystroke (e.g. the space that
+  // triggers a keyword match) arrives. Used both for keyword auto-expand
+  // and to gate command/script snippets to "cursor at start of line" (a
+  // shell prompt already occupies columns before the cursor, so absolute
+  // terminal column can't be used for that either).
+  const currentLineRef = useRef("");
   const shortcutsRefLocal = useRef<ShortcutMap>(loadShortcuts());
   const termRef = useRef<Terminal | null>(null);
   const sessionRef = useRef<string | null>(sessionId ?? null);
@@ -185,6 +203,55 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const mountCountRef = useRef(0);
   const notifiedSessionRef = useRef<string | null>(sessionId ?? null);
   const appearanceRequestRef = useRef(0);
+
+  const loadSnippets = useCallback(() => {
+    return listSnippets().then((data) => {
+      setSnippets(data.snippets);
+      const map = new Map<string, Snippet>();
+      for (const s of data.snippets) {
+        if (
+          s.kind === "text" &&
+          s.keyword &&
+          (!s.variables || s.variables.length === 0) &&
+          matchesOsTarget(s.osTargets, osContextRef.current)
+        ) {
+          map.set(s.keyword, s);
+        }
+      }
+      keywordSnippetsRef.current = map;
+    });
+  }, []);
+
+  // Resolve this tab's OS context once, then (re)build the keyword map with it.
+  useEffect(() => {
+    let cancelled = false;
+    if (!hostId) {
+      osContextRef.current = { isLocal: true };
+      void loadSnippets();
+      return;
+    }
+    listHosts()
+      .then(({ hosts }) => {
+        if (cancelled) return;
+        const host = hosts.find((h) => h.id === hostId);
+        osContextRef.current = { isLocal: false, hostOs: host?.os };
+        void loadSnippets();
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId]);
+
+  // Refresh the palette + keyword map whenever a snippet is created, edited,
+  // removed, or moved — otherwise changes made in the Snippets panel would
+  // have no effect on terminals that were already open.
+  useEffect(() => {
+    const { unlisten } = onSnippetsChanged(() => void loadSnippets());
+    return unlisten;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
 
   // Constant per window (the quick-terminal window always passes true).
@@ -226,8 +293,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       if (shortcuts["open-snippets"] && isShortcutMatch(event, shortcuts["open-snippets"])) {
         if (event.type === "keydown") {
           event.preventDefault();
-          listSnippets().then((data) => {
-            setSnippets(data);
+          loadSnippets().then(() => {
             setSnippetQuery("");
             setSnippetIndex(0);
             setSnippetPalette(true);
@@ -336,10 +402,42 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     // Send keystrokes to backend PTY
     const dataDisp = term.onData((data) => {
       const sid = sessionRef.current;
-      if (sid) {
-        writeToSession(sid, data).catch((err) =>
-          console.error("write_to_session failed:", err)
-        );
+      if (!sid) return;
+
+      const send = (payload: string) =>
+        writeToSession(sid, payload).catch((err) => console.error("write_to_session failed:", err));
+
+      if (data === "\r") {
+        currentLineRef.current = "";
+        send(data);
+        return;
+      }
+      if (data === "\x7f") {
+        currentLineRef.current = currentLineRef.current.slice(0, -1);
+        send(data);
+        return;
+      }
+      if (data.length === 0 || data.startsWith("\x1b")) {
+        send(data);
+        return;
+      }
+
+      currentLineRef.current += data;
+      send(data);
+
+      // Immediate keyword match: as soon as the word just typed (tracked
+      // locally from raw keystrokes, not read from the terminal's rendered
+      // buffer — the buffer only reflects a keystroke once the PTY echoes it
+      // back asynchronously) exactly equals a known keyword, expand it right
+      // away without waiting for a boundary character. Only eligible on
+      // kind === "text" snippets with no variables.
+      const match = /(\S+)$/.exec(currentLineRef.current);
+      const word = match?.[1];
+      const snippet = word ? keywordSnippetsRef.current.get(word) : undefined;
+      if (snippet) {
+        currentLineRef.current = currentLineRef.current.slice(0, -word!.length);
+        const erase = "\x7f".repeat(word!.length);
+        send(erase + (snippet.body ?? ""));
       }
     });
 
@@ -504,7 +602,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   // ── Snippet Palette Logic ──────────────────────────────────────────────────
 
+  // command/script snippets are only offered when the cursor is at column 0 —
+  // if the user has typed anything on the current line, they're hidden.
+  const cursorAtLineStart = () => currentLineRef.current.length === 0;
+
   const filteredSnippets = snippets.filter((s) => {
+    if (!matchesOsTarget(s.osTargets, osContextRef.current)) return false;
+    if ((s.kind === "command" || s.kind === "script") && !cursorAtLineStart()) return false;
     // Filter by search query
     if (!snippetQuery.trim()) return true;
     const q = snippetQuery.toLowerCase();
@@ -515,6 +619,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const executeSnippet = useCallback((snippet: Snippet, varValues?: Record<string, string>) => {
     const sid = sessionRef.current;
     if (!sid) return;
+    if ((snippet.kind === "command" || snippet.kind === "script") && !cursorAtLineStart()) return;
 
     const resolveVars = (text: string) => {
       if (!snippet.variables?.length) return text;
