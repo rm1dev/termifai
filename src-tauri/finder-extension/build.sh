@@ -3,6 +3,11 @@
 # Output: src-tauri/finder-extension/build/TermifaiFinder.appex
 set -euo pipefail
 
+if [[ "$(uname -s)" != "Darwin" ]]; then
+    echo "Skipping Finder extension build (not on macOS)."
+    exit 0
+fi
+
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$DIR/build"
 APPEX="$BUILD_DIR/TermifaiFinder.appex"
