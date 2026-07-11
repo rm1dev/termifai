@@ -1,34 +1,9 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::{AppHandle, Manager};
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SshKey {
-    pub id: String,
-    pub name: String,
-    #[serde(rename = "type")]
-    pub key_type: SshKeyType,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub size: Option<u16>,
-    pub fingerprint: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub remark: Option<String>,
-    pub has_passphrase: bool,
-    pub created_at: String,
-    pub public_key: String,
-    pub public_key_path: String,
-    pub private_key_path: String,
-}
-
-#[derive(Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SshKeyType {
-    Ed25519,
-    Rsa,
-}
+pub use termifai_core::model::ssh_keys::{SshKey, SshKeyType};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -194,20 +169,21 @@ pub fn import_ssh_key(app: &AppHandle, request: ImportSshKeyRequest) -> Result<S
 
 pub fn remove_ssh_keys(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
     let dir = keys_dir(app)?;
-    for id in ids {
-        if !is_valid_key_id(&id) {
+    for id in &ids {
+        if !is_valid_key_id(id) {
             return Err("Invalid SSH key id".to_string());
         }
 
-        let key_path = dir.join(&id);
+        let key_path = dir.join(id);
         let public_key_path = key_path.with_extension("pub");
-        let metadata_path = metadata_path(app, &id)?;
+        let metadata_path = metadata_path(app, id)?;
 
         remove_if_exists(&key_path)?;
         remove_if_exists(&public_key_path)?;
         remove_if_exists(&metadata_path)?;
     }
 
+    crate::tombstones::record(app, crate::tombstones::EntityKind::SshKey, &ids)?;
     Ok(())
 }
 
@@ -235,7 +211,16 @@ struct KeyMetadataRequest {
 }
 
 fn build_key_metadata(req: KeyMetadataRequest) -> Result<SshKey, String> {
-    let KeyMetadataRequest { id, name, key_type, size, remark, has_passphrase, private_key_path, public_key_path } = req;
+    let KeyMetadataRequest {
+        id,
+        name,
+        key_type,
+        size,
+        remark,
+        has_passphrase,
+        private_key_path,
+        public_key_path,
+    } = req;
     let public_key = fs::read_to_string(&public_key_path)
         .map_err(|e| format!("Failed to read public key: {}", e))?;
     let fingerprint = fingerprint(&public_key_path)?;
@@ -253,7 +238,51 @@ fn build_key_metadata(req: KeyMetadataRequest) -> Result<SshKey, String> {
         public_key: public_key.trim().to_string(),
         public_key_path: public_key_path.to_string_lossy().to_string(),
         private_key_path: private_key_path.to_string_lossy().to_string(),
+        private_key_pem: None,
     })
+}
+
+/// Reads this key's private key file content — only ever called when the
+/// user has opted in to syncing SSH keys.
+pub fn read_private_key_pem(key: &SshKey) -> Result<String, String> {
+    fs::read_to_string(&key.private_key_path)
+        .map_err(|e| format!("Failed to read private key for sync: {}", e))
+}
+
+/// Writes a key received from sync that doesn't exist locally yet. Reuses
+/// the same id (so future deletes/tombstones stay keyed consistently across
+/// devices) and re-derives nothing — the payload already carries everything.
+pub fn import_synced_key(app: &AppHandle, key: &SshKey) -> Result<(), String> {
+    if !is_valid_key_id(&key.id) {
+        return Err("Invalid SSH key id".to_string());
+    }
+    let Some(pem) = key.private_key_pem.as_deref() else {
+        return Err("Synced key is missing private key content".to_string());
+    };
+
+    let dir = keys_dir(app)?;
+    ensure_dir(&dir)?;
+    let key_path = dir.join(&key.id);
+    let public_key_path = key_path.with_extension("pub");
+
+    if key_path.exists() {
+        return Ok(()); // already imported on a previous sync cycle
+    }
+
+    fs::write(&key_path, ensure_trailing_newline(pem.trim())?)
+        .map_err(|e| format!("Failed to write synced private key: {}", e))?;
+    set_private_key_permissions(&key_path)?;
+    fs::write(
+        &public_key_path,
+        ensure_trailing_newline(key.public_key.trim())?,
+    )
+    .map_err(|e| format!("Failed to write synced public key: {}", e))?;
+
+    let mut local_key = key.clone();
+    local_key.private_key_pem = None;
+    local_key.public_key_path = public_key_path.to_string_lossy().to_string();
+    local_key.private_key_path = key_path.to_string_lossy().to_string();
+    save_metadata(app, &local_key)
 }
 
 fn save_metadata(app: &AppHandle, key: &SshKey) -> Result<(), String> {
@@ -302,11 +331,14 @@ fn parse_public_key_type(public_key: &str) -> Result<(SshKeyType, Option<u16>), 
 }
 
 fn keys_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    Ok(app
+    let app_data_dir = app
         .path()
         .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?
-        .join("ssh-keys"))
+        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?;
+    Ok(
+        termifai_core::layout::vault_dir(&app_data_dir, termifai_core::layout::DEFAULT_VAULT_ID)
+            .join("ssh-keys"),
+    )
 }
 
 fn metadata_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {

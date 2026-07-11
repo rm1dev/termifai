@@ -1,4 +1,4 @@
-import { emit } from "@tauri-apps/api/event";
+import { publish } from "./api/transport";
 
 const isMac = typeof navigator !== "undefined" && navigator.platform.toLowerCase().startsWith("mac");
 
@@ -11,7 +11,8 @@ export type ShortcutActionId =
   | "open-snippets"
   | "lock-vault"
   | "terminal-copy"
-  | "terminal-paste";
+  | "terminal-paste"
+  | "clear-terminal";
 
 export interface ShortcutBinding {
   key: string;
@@ -88,6 +89,12 @@ export const shortcutDefinitions: ShortcutDefinition[] = [
     label: "Terminal paste",
     description: "Paste into the terminal",
     defaultBinding: binding("v", { ctrlKey: true, shiftKey: true, code: "KeyV" }),
+  },
+  {
+    id: "clear-terminal",
+    label: "Clear terminal",
+    description: "Clear the terminal screen and scrollback buffer",
+    defaultBinding: cmdOrCtrl("k", { code: "KeyK" }),
   },
 ];
 
@@ -186,15 +193,20 @@ export function loadShortcuts(): ShortcutMap {
   }
 }
 
+export function getShortcutsUpdatedAt(): string | undefined {
+  return localStorage.getItem(`${shortcutsStorageKey}:updatedAt`) ?? undefined;
+}
+
 export function saveShortcuts(shortcuts: ShortcutMap) {
   localStorage.setItem(shortcutsStorageKey, JSON.stringify(shortcuts));
+  localStorage.setItem(`${shortcutsStorageKey}:updatedAt`, new Date().toISOString());
   window.dispatchEvent(
     new CustomEvent<ShortcutMap>(shortcutsChangedEvent, {
       detail: shortcuts,
     })
   );
 
-  void emit(shortcutsChangedEvent, shortcuts).catch(() => {
+  void publish(shortcutsChangedEvent, shortcuts).catch(() => {
     /* Non-Tauri environments fall back to localStorage + storage events. */
   });
 }
