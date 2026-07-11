@@ -26,6 +26,10 @@ export function removeSnippets(ids: string[]): Promise<void> {
   return call<void>("remove_snippets", { ids });
 }
 
+export function reorderSnippets(ids: string[]): Promise<void> {
+  return call<void>("reorder_snippets", { ids });
+}
+
 export function saveSnippetGroup(
   name: string,
   parentId: string | null,
