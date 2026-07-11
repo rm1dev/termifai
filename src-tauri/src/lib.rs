@@ -472,12 +472,26 @@ fn run_script_over_ssh(
             let manager = state.pty_manager.lock().unwrap();
             manager.write_to_session(session_id, &payload)
         }
-        Err(sftp_err) => run_script_via_heredoc(app, session_id, script).map_err(|heredoc_err| {
-            format!(
-                "SFTP upload failed ({}); heredoc fallback failed: {}",
-                sftp_err, heredoc_err
-            )
-        }),
+        Err(sftp_err) => {
+            // Surface the fallback reason: in the terminal (the heredoc path
+            // is visibly noisier, so the user deserves to know why) and on
+            // stderr for diagnostics.
+            eprintln!(
+                "run_snippet_script: SFTP upload failed for session {}: {}",
+                session_id, sftp_err
+            );
+            let warn = format!(
+                "\x1b[38;2;255;180;90m⚠ SFTP upload failed ({}) — falling back to inline execution\x1b[0m\r\n",
+                sftp_err
+            );
+            let _ = app.emit(&format!("term:{}:output", session_id), warn);
+            run_script_via_heredoc(app, session_id, script).map_err(|heredoc_err| {
+                format!(
+                    "SFTP upload failed ({}); heredoc fallback failed: {}",
+                    sftp_err, heredoc_err
+                )
+            })
+        }
     }
 }
 
