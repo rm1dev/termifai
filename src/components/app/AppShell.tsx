@@ -108,7 +108,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
   };
   const openFolderTab = (folderPath: string) => {
     const id = `t-terminal-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const title = folderPath.split("/").filter(Boolean).pop() || folderPath;
+    const title = folderPath.split(/[/\\]/).filter(Boolean).pop() || folderPath;
     setTabs((t) => [...t, { id, kind: "terminal", title, closable: true, cwd: folderPath }]);
     setActiveTab(id);
   };
