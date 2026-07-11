@@ -81,9 +81,12 @@ fn open_url(url: &str) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .spawn();
+    {
+        let escaped = url.replace("&", "^&");
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", &escaped])
+            .spawn();
+    }
     Ok(())
 }
 
