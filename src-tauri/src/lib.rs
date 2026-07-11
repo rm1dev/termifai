@@ -2127,23 +2127,6 @@ fn start_screen_lock_monitor(app: tauri::AppHandle) {
 pub fn run() {
     install_panic_logger();
     tauri::Builder::default()
-        // Always-on file logging (LogDir = %LOCALAPPDATA%/com.termifai/logs on
-        // Windows, ~/Library/Logs/com.termifai on macOS). With
-        // windows_subsystem = "windows" release builds have no stderr, so
-        // without this a startup failure is completely silent — the app just
-        // "opens and closes itself" with nothing to diagnose.
-        .plugin(
-            tauri_plugin_log::Builder::default()
-                .level(log::LevelFilter::Info)
-                .targets([
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
-                        file_name: Some("termifai".into()),
-                    }),
-                ])
-                .max_file_size(512_000)
-                .build(),
-        )
         // Managed at builder level (not in setup) so it exists even for
         // RunEvent::Opened URLs delivered during early launch.
         .manage(PendingOpenFolders::default())
@@ -2378,6 +2361,13 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            #[cfg(debug_assertions)]
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .build(),
+            )?;
+
             // Cold launch triggered by the termifaid hotkey service?
             // This must be decided FIRST: Tauri pumps the event loop while
             // building the webviews below, which fires didFinishLaunching and
