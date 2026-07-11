@@ -95,6 +95,7 @@ import {
 } from "@/lib/api/terminal";
 
 export function SettingsWindow() {
+  const isMac = platform === "macos";
   const [terminalAppearance, setTerminalAppearance] = useState(loadTerminalAppearance);
   const [selectedThemeId, setSelectedThemeId] = useState(loadAppTheme().id);
   const [mainWindowOpacity, setMainWindowOpacity] = useState(() => {
@@ -390,12 +391,14 @@ export function SettingsWindow() {
   };
 
   useEffect(() => {
-    const previousBackground = document.body.style.backgroundColor;
-    document.body.style.backgroundColor = "transparent";
-    return () => {
-      document.body.style.backgroundColor = previousBackground;
-    };
-  }, []);
+    if (isMac) {
+      const previousBackground = document.body.style.backgroundColor;
+      document.body.style.backgroundColor = "transparent";
+      return () => {
+        document.body.style.backgroundColor = previousBackground;
+      };
+    }
+  }, [isMac]);
   useEffect(() => {
     const onStorageChanged = (event: StorageEvent) => {
       if (event.key === shortcutsStorageKey) {
@@ -640,7 +643,7 @@ export function SettingsWindow() {
     }
   };
 
-  const isMac = platform === "macos";
+
 
   const renderHotkeyRow = (
     action: HotkeyAction,
@@ -699,7 +702,7 @@ export function SettingsWindow() {
   };
 
   return (
-    <div className={`flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground ${isMac ? "rounded-lg" : ""}`}>
+    <div className={`flex h-full w-full flex-col overflow-hidden bg-background text-foreground ${isMac ? "rounded-lg" : ""}`}>
       <header className="relative flex h-8 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none">
         {/* Drag region covers the full header but excludes button areas */}
         <div className="absolute inset-0" data-tauri-drag-region />
