@@ -38,7 +38,7 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Field, ModalActions, ModalShell } from "@/components/shared/modal-primitives";
+import { Field, ModalActions, ModalShell, SplitButton } from "@/components/shared/modal-primitives";
 import type { Snippet, SnippetGroup, SnippetKind, SnippetOsTarget, SnippetVariable } from "@/components/app/types";
 import {
   listSnippets,
@@ -191,18 +191,14 @@ export function SnippetsView() {
       {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setEditor({ open: true, snippet: null, groupId: null })}
-            className="flex h-7 items-center gap-1 rounded-md bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-white/5"
-          >
-            <Plus className="h-3.5 w-3.5" /> New snippet
-          </button>
-          <button
-            onClick={() => setGroupModal({ open: true, parentId: null, group: null })}
-            className="flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-          >
-            <FolderPlus className="h-3.5 w-3.5" /> New group
-          </button>
+          <SplitButton
+            primary={<><Plus className="h-3.5 w-3.5" /> New snippet</>}
+            onPrimary={() => setEditor({ open: true, snippet: null, groupId: null })}
+            menu={[
+              { label: "New snippet", icon: <Plus className="h-3.5 w-3.5" />, onClick: () => setEditor({ open: true, snippet: null, groupId: null }) },
+              { label: "New group", icon: <FolderPlus className="h-3.5 w-3.5" />, onClick: () => setGroupModal({ open: true, parentId: null, group: null }) },
+            ]}
+          />
           {selectedIds.length > 0 && (
             <button
               onClick={() => setRemoving(selectedIds)}
