@@ -52,6 +52,80 @@ pub struct TransferProgress {
     pub total_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictDecision {
+    Overwrite,
+    Skip,
+    OverwriteAll,
+    SkipAll,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictMode {
+    Ask,
+    OverwriteAll,
+    SkipAll,
+}
+
+/// Payload for the `sftp:{sid}:conflict` event: what already exists at the
+/// destination vs. what is about to be written, so the dialog can compare.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConflictInfo {
+    pub session_id: String,
+    pub file_name: String,
+    pub dest_path: String,
+    /// "file" | "dir"
+    pub kind: String,
+    /// "upload" | "download"
+    pub direction: String,
+    pub existing_size: Option<u64>,
+    pub existing_modified: Option<String>,
+    pub incoming_size: Option<u64>,
+    pub incoming_modified: Option<String>,
+}
+
+/// Per-transfer conflict policy. `resolve` consults the sticky mode first and
+/// only prompts (blocking) while the mode is `Ask`.
+pub struct ConflictHandler<'a> {
+    mode: ConflictMode,
+    prompt: Box<dyn FnMut(&ConflictInfo) -> ConflictDecision + 'a>,
+}
+
+impl<'a> ConflictHandler<'a> {
+    pub fn new(
+        mode: ConflictMode,
+        prompt: impl FnMut(&ConflictInfo) -> ConflictDecision + 'a,
+    ) -> Self {
+        Self {
+            mode,
+            prompt: Box::new(prompt),
+        }
+    }
+
+    /// Ok(true) = overwrite/merge, Ok(false) = skip this item, Err = abort transfer.
+    pub fn resolve(&mut self, info: &ConflictInfo) -> Result<bool, String> {
+        match self.mode {
+            ConflictMode::OverwriteAll => return Ok(true),
+            ConflictMode::SkipAll => return Ok(false),
+            ConflictMode::Ask => {}
+        }
+        match (self.prompt)(info) {
+            ConflictDecision::Overwrite => Ok(true),
+            ConflictDecision::Skip => Ok(false),
+            ConflictDecision::OverwriteAll => {
+                self.mode = ConflictMode::OverwriteAll;
+                Ok(true)
+            }
+            ConflictDecision::SkipAll => {
+                self.mode = ConflictMode::SkipAll;
+                Ok(false)
+            }
+            ConflictDecision::Cancel => Err("Cancelled".to_string()),
+        }
+    }
+}
+
 pub fn list_local(path: &str) -> Result<Vec<LocalFileEntry>, String> {
     let dir = std::fs::read_dir(path).map_err(|e| format!("Cannot read '{}': {}", path, e))?;
 
@@ -504,6 +578,396 @@ impl SftpEntry {
             .map_err(|e| format!("Copy to tmp: {}", e))?;
         Ok(tmp_path.to_string_lossy().to_string())
     }
+
+    /// Uploads a local file OR directory (recursively) to the remote path.
+    pub fn upload_path<F>(
+        &self,
+        session_id: &str,
+        local_path: &str,
+        remote_path: &str,
+        cancel: Arc<AtomicBool>,
+        conflicts: &mut ConflictHandler,
+        on_progress: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(TransferProgress),
+    {
+        let meta = std::fs::metadata(local_path)
+            .map_err(|e| format!("stat local '{}': {}", local_path, e))?;
+
+        let (local_is_dir, local_size, local_modified) = (
+            meta.is_dir(),
+            if meta.is_dir() {
+                None
+            } else {
+                Some(meta.len())
+            },
+            meta.modified().ok().map(|t| {
+                format_unix_timestamp(
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                )
+            }),
+        );
+        {
+            let sftp = self
+                .session
+                .sftp()
+                .map_err(|e| format!("SFTP subsystem: {}", e))?;
+            if let Some((dest_is_dir, dest_size, dest_modified)) =
+                stat_remote_brief(&sftp, remote_path)
+            {
+                if dest_is_dir == local_is_dir {
+                    let proceed = conflicts.resolve(&ConflictInfo {
+                        session_id: session_id.to_string(),
+                        file_name: pathbase(remote_path),
+                        dest_path: remote_path.to_string(),
+                        kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
+                        direction: "upload".to_string(),
+                        existing_size: dest_size,
+                        existing_modified: dest_modified,
+                        incoming_size: local_size,
+                        incoming_modified: local_modified,
+                    })?;
+                    if !proceed {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        if !meta.is_dir() {
+            return self.upload_file(session_id, local_path, remote_path, cancel, on_progress);
+        }
+
+        let mut remote_dirs: Vec<String> = Vec::new();
+        let mut files: Vec<(std::path::PathBuf, String, u64)> = Vec::new();
+        walk_local_tree(
+            std::path::Path::new(local_path),
+            remote_path,
+            &mut remote_dirs,
+            &mut files,
+        )?;
+
+        {
+            let sftp = self
+                .session
+                .sftp()
+                .map_err(|e| format!("SFTP subsystem: {}", e))?;
+            for dir in &remote_dirs {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("Cancelled".to_string());
+                }
+                ensure_remote_dir(&sftp, dir)?;
+            }
+        }
+
+        let sftp = self
+            .session
+            .sftp()
+            .map_err(|e| format!("SFTP subsystem: {}", e))?;
+
+        let grand_total: u64 = files.iter().map(|(_, _, size)| size).sum();
+        let mut offset = 0u64;
+        for (lp, rp, size) in &files {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".to_string());
+            }
+
+            if let Some((dest_is_dir, dest_size, dest_modified)) = stat_remote_brief(&sftp, rp) {
+                let incoming = stat_local_brief(lp);
+                let proceed = conflicts.resolve(&ConflictInfo {
+                    session_id: session_id.to_string(),
+                    file_name: pathbase(rp),
+                    dest_path: rp.clone(),
+                    kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
+                    direction: "upload".to_string(),
+                    existing_size: dest_size,
+                    existing_modified: dest_modified,
+                    incoming_size: incoming.as_ref().and_then(|(_, s, _)| *s),
+                    incoming_modified: incoming.and_then(|(_, _, m)| m),
+                })?;
+                if !proceed {
+                    offset += size;
+                    on_progress(TransferProgress {
+                        session_id: session_id.to_string(),
+                        file_name: pathbase(rp),
+                        bytes_transferred: offset,
+                        total_bytes: grand_total,
+                    });
+                    continue;
+                }
+            }
+
+            let base = offset;
+            self.upload_file(
+                session_id,
+                &lp.to_string_lossy(),
+                rp,
+                Arc::clone(&cancel),
+                |p| {
+                    on_progress(TransferProgress {
+                        session_id: p.session_id,
+                        file_name: p.file_name,
+                        bytes_transferred: base + p.bytes_transferred,
+                        total_bytes: grand_total,
+                    })
+                },
+            )?;
+            offset += size;
+        }
+        Ok(())
+    }
+
+    /// Downloads a remote file OR directory (recursively) to the local path.
+    pub fn download_path<F>(
+        &self,
+        session_id: &str,
+        remote_path: &str,
+        local_path: &str,
+        cancel: Arc<AtomicBool>,
+        conflicts: &mut ConflictHandler,
+        on_progress: F,
+    ) -> Result<(), String>
+    where
+        F: Fn(TransferProgress),
+    {
+        let (is_dir, remote_size, remote_modified) = {
+            let sftp = self
+                .session
+                .sftp()
+                .map_err(|e| format!("SFTP subsystem: {}", e))?;
+            let stat = sftp
+                .stat(std::path::Path::new(remote_path))
+                .map_err(|e| format!("stat '{}': {}", remote_path, e))?;
+            let is_dir = stat.file_type().is_dir();
+            let remote_size = if is_dir { None } else { stat.size };
+            let remote_modified = stat.mtime.map(format_unix_timestamp);
+            (is_dir, remote_size, remote_modified)
+        };
+
+        if let Some((dest_is_dir, dest_size, dest_modified)) =
+            stat_local_brief(std::path::Path::new(local_path))
+        {
+            if dest_is_dir == is_dir {
+                let proceed = conflicts.resolve(&ConflictInfo {
+                    session_id: session_id.to_string(),
+                    file_name: pathbase(remote_path),
+                    dest_path: local_path.to_string(),
+                    kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
+                    direction: "download".to_string(),
+                    existing_size: dest_size,
+                    existing_modified: dest_modified,
+                    incoming_size: remote_size,
+                    incoming_modified: remote_modified,
+                })?;
+                if !proceed {
+                    return Ok(());
+                }
+            }
+        }
+
+        if !is_dir {
+            return self.download_file(session_id, remote_path, local_path, cancel, on_progress);
+        }
+
+        let mut local_dirs: Vec<std::path::PathBuf> = Vec::new();
+        let mut files: Vec<(String, std::path::PathBuf, u64)> = Vec::new();
+        {
+            let sftp = self
+                .session
+                .sftp()
+                .map_err(|e| format!("SFTP subsystem: {}", e))?;
+            collect_remote_tree(
+                &sftp,
+                remote_path,
+                std::path::Path::new(local_path),
+                &mut local_dirs,
+                &mut files,
+            )?;
+        }
+
+        for dir in &local_dirs {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".to_string());
+            }
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("create local dir '{}': {}", dir.display(), e))?;
+        }
+
+        let grand_total: u64 = files.iter().map(|(_, _, size)| size).sum();
+        let mut offset = 0u64;
+        for (rp, lp, size) in &files {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".to_string());
+            }
+
+            if let Some((_, dest_size, dest_modified)) = stat_local_brief(lp) {
+                let proceed = conflicts.resolve(&ConflictInfo {
+                    session_id: session_id.to_string(),
+                    file_name: pathbase(rp),
+                    dest_path: lp.to_string_lossy().to_string(),
+                    kind: "file".to_string(),
+                    direction: "download".to_string(),
+                    existing_size: dest_size,
+                    existing_modified: dest_modified,
+                    incoming_size: Some(*size),
+                    incoming_modified: None,
+                })?;
+                if !proceed {
+                    offset += size;
+                    on_progress(TransferProgress {
+                        session_id: session_id.to_string(),
+                        file_name: pathbase(rp),
+                        bytes_transferred: offset,
+                        total_bytes: grand_total,
+                    });
+                    continue;
+                }
+            }
+
+            let base = offset;
+            self.download_file(
+                session_id,
+                rp,
+                &lp.to_string_lossy(),
+                Arc::clone(&cancel),
+                |p| {
+                    on_progress(TransferProgress {
+                        session_id: p.session_id,
+                        file_name: p.file_name,
+                        bytes_transferred: base + p.bytes_transferred,
+                        total_bytes: grand_total,
+                    })
+                },
+            )?;
+            offset += size;
+        }
+        Ok(())
+    }
+}
+
+/// (is_dir, size, modified) of a remote path, or None if it doesn't exist.
+fn stat_remote_brief(sftp: &ssh2::Sftp, path: &str) -> Option<(bool, Option<u64>, Option<String>)> {
+    let stat = sftp.stat(std::path::Path::new(path)).ok()?;
+    Some((
+        stat.file_type().is_dir(),
+        stat.size,
+        stat.mtime.map(format_unix_timestamp),
+    ))
+}
+
+/// (is_dir, size, modified) of a local path, or None if it doesn't exist.
+fn stat_local_brief(path: &std::path::Path) -> Option<(bool, Option<u64>, Option<String>)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok().map(|t| {
+        format_unix_timestamp(
+            t.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+    });
+    let size = if meta.is_dir() {
+        None
+    } else {
+        Some(meta.len())
+    };
+    Some((meta.is_dir(), size, modified))
+}
+
+fn pathbase(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or("file")
+        .to_string()
+}
+
+/// Creates `path` on the remote if it doesn't exist; errors if it exists as a non-directory.
+fn ensure_remote_dir(sftp: &ssh2::Sftp, path: &str) -> Result<(), String> {
+    if let Ok(stat) = sftp.stat(std::path::Path::new(path)) {
+        if stat.file_type().is_dir() {
+            return Ok(());
+        }
+        return Err(format!(
+            "Remote path '{}' exists and is not a directory",
+            path
+        ));
+    }
+    sftp.mkdir(std::path::Path::new(path), 0o755)
+        .map_err(|e| format!("mkdir '{}': {}", path, e))
+}
+
+/// Recursively walks a local directory, collecting remote directories to create
+/// (parents before children) and `(local file, remote path, size)` tuples.
+/// Symlinks are followed via `metadata()`; broken links are skipped.
+fn walk_local_tree(
+    local_dir: &std::path::Path,
+    remote_dir: &str,
+    remote_dirs: &mut Vec<String>,
+    files: &mut Vec<(std::path::PathBuf, String, u64)>,
+) -> Result<(), String> {
+    remote_dirs.push(remote_dir.to_string());
+    let rd = std::fs::read_dir(local_dir)
+        .map_err(|e| format!("read dir '{}': {}", local_dir.display(), e))?;
+    for entry in rd.filter_map(|e| e.ok()) {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let remote_child = format!("{}/{}", remote_dir.trim_end_matches('/'), name);
+        let meta = match std::fs::metadata(entry.path()) {
+            Ok(m) => m,
+            Err(_) => continue, // broken symlink or unreadable — skip
+        };
+        if meta.is_dir() {
+            walk_local_tree(&entry.path(), &remote_child, remote_dirs, files)?;
+        } else if meta.is_file() {
+            files.push((entry.path(), remote_child, meta.len()));
+        }
+    }
+    Ok(())
+}
+
+/// Recursively walks a remote directory, collecting local directories to create
+/// (parents before children) and `(remote path, local path, size)` tuples.
+/// Symlinks are resolved with a follow-stat; broken links are skipped.
+fn collect_remote_tree(
+    sftp: &ssh2::Sftp,
+    remote_dir: &str,
+    local_dir: &std::path::Path,
+    local_dirs: &mut Vec<std::path::PathBuf>,
+    files: &mut Vec<(String, std::path::PathBuf, u64)>,
+) -> Result<(), String> {
+    local_dirs.push(local_dir.to_path_buf());
+    let entries = sftp
+        .readdir(std::path::Path::new(remote_dir))
+        .map_err(|e| format!("readdir '{}': {}", remote_dir, e))?;
+    for (pb, stat) in entries {
+        let name = match pb.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        if name == "." || name == ".." {
+            continue;
+        }
+        let remote_child = pb.to_string_lossy().to_string();
+        let local_child = local_dir.join(&name);
+        let mut is_dir = stat.file_type().is_dir();
+        let mut size = stat.size.unwrap_or(0);
+        if stat.file_type().is_symlink() {
+            match sftp.stat(&pb) {
+                Ok(target) => {
+                    is_dir = target.file_type().is_dir();
+                    size = target.size.unwrap_or(0);
+                }
+                Err(_) => continue, // broken symlink — skip
+            }
+        }
+        if is_dir {
+            collect_remote_tree(sftp, &remote_child, &local_child, local_dirs, files)?;
+        } else {
+            files.push((remote_child, local_child, size));
+        }
+    }
+    Ok(())
 }
 
 pub struct SftpManager {
@@ -642,6 +1106,71 @@ mod tests {
         let result = manager.disconnect("nonexistent-id");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+
+    // --- conflict handler ---
+    use std::cell::Cell;
+
+    fn conflict_info() -> ConflictInfo {
+        ConflictInfo {
+            session_id: "s".into(),
+            file_name: "f.txt".into(),
+            dest_path: "/dest/f.txt".into(),
+            kind: "file".into(),
+            direction: "upload".into(),
+            existing_size: Some(1),
+            existing_modified: None,
+            incoming_size: Some(2),
+            incoming_modified: None,
+        }
+    }
+
+    #[test]
+    fn conflict_single_decisions_do_not_stick() {
+        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| {
+            ConflictDecision::Overwrite
+        });
+        assert!(h.resolve(&conflict_info()).unwrap());
+        let mut h =
+            ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| ConflictDecision::Skip);
+        assert!(!h.resolve(&conflict_info()).unwrap());
+    }
+
+    #[test]
+    fn conflict_apply_to_all_stops_prompting() {
+        let calls = Cell::new(0u32);
+        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| {
+            calls.set(calls.get() + 1);
+            ConflictDecision::OverwriteAll
+        });
+        assert!(h.resolve(&conflict_info()).unwrap());
+        assert!(h.resolve(&conflict_info()).unwrap());
+        assert_eq!(calls.get(), 1);
+
+        let calls = Cell::new(0u32);
+        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| {
+            calls.set(calls.get() + 1);
+            ConflictDecision::SkipAll
+        });
+        assert!(!h.resolve(&conflict_info()).unwrap());
+        assert!(!h.resolve(&conflict_info()).unwrap());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn conflict_preset_overwrite_all_never_prompts() {
+        let mut h = ConflictHandler::new(ConflictMode::OverwriteAll, |_: &ConflictInfo| {
+            panic!("must not prompt")
+        });
+        assert!(h.resolve(&conflict_info()).unwrap());
+    }
+
+    #[test]
+    fn conflict_cancel_returns_cancelled_err() {
+        let mut h = ConflictHandler::new(ConflictMode::Ask, |_: &ConflictInfo| {
+            ConflictDecision::Cancel
+        });
+        assert_eq!(h.resolve(&conflict_info()).unwrap_err(), "Cancelled");
     }
 }
 

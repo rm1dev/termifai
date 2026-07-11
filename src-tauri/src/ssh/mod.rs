@@ -79,7 +79,28 @@ pub fn connect(cfg: &SshConfig, on_stage: impl Fn(&str, &str)) -> Result<Session
         "connecting",
         &format!("Opening TCP connection to {addr}..."),
     );
-    let tcp = TcpStream::connect(&addr).map_err(|e| SshError::Tcp(e.to_string()))?;
+    let sock_addrs: Vec<std::net::SocketAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+            .map_err(|e| SshError::Tcp(e.to_string()))?
+            .collect();
+
+    // Match TcpStream::connect semantics: try every resolved address in
+    // order (IPv4/IPv6 dual-stack, round-robin DNS), but bound each dial.
+    let mut tcp: Option<TcpStream> = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for sock_addr in &sock_addrs {
+        match TcpStream::connect_timeout(sock_addr, Duration::from_secs(10)) {
+            Ok(stream) => {
+                tcp = Some(stream);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let tcp = tcp.ok_or_else(|| match last_err {
+        Some(e) => SshError::Tcp(e.to_string()),
+        None => SshError::Tcp(format!("Could not resolve {addr}")),
+    })?;
     tcp.set_read_timeout(Some(Duration::from_secs(15))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(15))).ok();
 

@@ -144,3 +144,16 @@ export interface TransferProgress {
   bytes_transferred: number;
   total_bytes: number;
 }
+
+export interface SftpConflictInfo {
+  session_id: string;
+  file_name: string;
+  dest_path: string;
+  kind: "file" | "dir";
+  direction: "upload" | "download";
+  existing_size: number | null;
+  existing_modified: string | null;
+  incoming_size: number | null;
+  incoming_modified: string | null;
+}
+

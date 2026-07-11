@@ -355,6 +355,31 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
       } else if (isShortcutMatch(event, shortcuts["lock-vault"])) {
         event.preventDefault();
         vaultLock().catch((err) => console.error("vault_lock failed:", err));
+      } else if (
+        // Skip while focus is inside the terminal: Ctrl+Q/Ctrl+S are XON/XOFF
+        // flow-control bytes shells and TUI apps rely on, so we only treat
+        // them as app shortcuts outside of xterm.
+        platform === "linux" &&
+        !isXtermInput &&
+        event.ctrlKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        !event.metaKey &&
+        event.code === "KeyQ"
+      ) {
+        event.preventDefault();
+        void quitApp();
+      } else if (
+        platform === "linux" &&
+        !isXtermInput &&
+        event.ctrlKey &&
+        event.altKey &&
+        !event.shiftKey &&
+        !event.metaKey &&
+        event.code === "KeyQ"
+      ) {
+        event.preventDefault();
+        void forceQuitApp();
       }
     };
 
@@ -674,10 +699,15 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => void quitApp()}>
           Quit
-          <span className="ml-auto text-xs text-muted-foreground">Alt+F4</span>
+          <span className="ml-auto text-xs text-muted-foreground">
+            {platform === "linux" ? "Ctrl+Q" : "Alt+F4"}
+          </span>
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={() => void forceQuitApp()}>
           Force Quit
+          {platform === "linux" && (
+            <span className="ml-auto text-xs text-muted-foreground">Ctrl+Alt+Q</span>
+          )}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
