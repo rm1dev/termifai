@@ -796,23 +796,25 @@ export function SettingsWindow() {
                   />
                 </div>
 
-                <div className="flex items-start justify-between gap-4 rounded-lg border border-border px-4 py-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm font-medium text-foreground">
-                      Open in Context Menu
+                {platform !== "linux" && (
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-border px-4 py-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium text-foreground">
+                        Open in Context Menu
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                        {platform === "macos"
+                          ? "Show 'Open in Termifai' in the Finder right-click menu. This toggles the Termifai Finder extension, also manageable in System Settings > General > Login Items & Extensions > File Providers."
+                          : "Add 'Open in Termifai' to your operating system's folder right-click context menu."
+                        }
+                      </div>
                     </div>
-                    <div className="mt-1 text-xs text-muted-foreground leading-relaxed">
-                      {platform === "macos"
-                        ? "Show 'Open in Termifai' in the Finder right-click menu. This toggles the Termifai Finder extension, also manageable in System Settings > General > Login Items & Extensions > File Providers."
-                        : "Add 'Open in Termifai' to your operating system's folder right-click context menu."
-                      }
-                    </div>
+                    <Switch
+                      checked={openInContextMenu}
+                      onCheckedChange={handleOpenInContextMenuChange}
+                    />
                   </div>
-                  <Switch
-                    checked={openInContextMenu}
-                    onCheckedChange={handleOpenInContextMenuChange}
-                  />
-                </div>
+                )}
               </CardContent>
             </Card>
           </TabsContent>
