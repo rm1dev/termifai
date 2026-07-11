@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  ArrowUpDown,
   Braces,
   ChevronRight,
   FileText,
@@ -45,6 +44,7 @@ import {
   listSnippets,
   removeSnippetGroup,
   removeSnippets,
+  reorderSnippets,
   saveSnippet,
   saveSnippetGroup,
 } from "@/lib/api/snippets";
@@ -69,18 +69,14 @@ export function SnippetsView() {
   const [groupModal, setGroupModal] = useState<{ open: boolean; parentId: string | null; group?: SnippetGroup | null }>({ open: false, parentId: null, group: null });
   const [removing, setRemoving] = useState<string[] | null>(null);
   const [viewMode, setViewMode] = useState<"grid" | "list">(
-    () => (localStorage.getItem("snippets-view-mode") as "grid" | "list") ?? "grid"
+    () => (localStorage.getItem("snippets-view-mode") as "grid" | "list") ?? "list"
   );
   const [viewOpen, setViewOpen] = useState(false);
-  const [sortDir, setSortDir] = useState<"desc" | "asc">(
-    () => (localStorage.getItem("snippets-sort-dir") as "desc" | "asc") ?? "desc"
-  );
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
   useEffect(() => { localStorage.setItem("snippets-view-mode", viewMode); }, [viewMode]);
-  useEffect(() => { localStorage.setItem("snippets-sort-dir", sortDir); }, [sortDir]);
 
   // Load from backend
   useEffect(() => {
@@ -158,21 +154,31 @@ export function SnippetsView() {
     }
   };
 
+  // Applies a new relative order for a subset of ids (e.g. one group's rows)
+  // back into the full snippet order, keeping every other snippet's slot.
+  const reorder = async (subsetNewOrder: string[]) => {
+    const subsetSet = new Set(subsetNewOrder);
+    let subsetIdx = 0;
+    const fullOrder = snippets.map((s) => (subsetSet.has(s.id) ? subsetNewOrder[subsetIdx++] : s.id));
+    const byId = new Map(snippets.map((s) => [s.id, s]));
+    setSnippets(fullOrder.map((id) => byId.get(id)!));
+    try {
+      await reorderSnippets(fullOrder);
+      notifySnippetsChanged();
+    } catch (err) {
+      console.error("Failed to reorder snippets:", err);
+    }
+  };
+
   const selectedIds = Array.from(selected);
 
   const getSnippetContent = (s: Snippet) => s.body || s.command || s.script || "";
 
-  const visibleSnippets = snippets
-    .filter((s) => {
-      if (!query.trim()) return true;
-      const q = query.toLowerCase();
-      return s.name.toLowerCase().includes(q) || getSnippetContent(s).toLowerCase().includes(q);
-    })
-    .sort((a, b) => {
-      const da = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-      const db = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-      return sortDir === "desc" ? db - da : da - db;
-    });
+  const visibleSnippets = snippets.filter((s) => {
+    if (!query.trim()) return true;
+    const q = query.toLowerCase();
+    return s.name.toLowerCase().includes(q) || getSnippetContent(s).toLowerCase().includes(q);
+  });
 
   const rootSnippets = visibleSnippets.filter((s) => !s.groupId);
   const rootGroups = groups.filter((g) => !g.parentId);
@@ -271,16 +277,6 @@ export function SnippetsView() {
               </div>
             )}
           </div>
-
-          {/* Sort by date */}
-          <button
-            onClick={() => setSortDir((d) => (d === "desc" ? "asc" : "desc"))}
-            className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-            title={sortDir === "desc" ? "Newest first" : "Oldest first"}
-          >
-            <ArrowUpDown className="h-3.5 w-3.5" />
-            {sortDir === "desc" ? "Newest" : "Oldest"}
-          </button>
         </div>
       </div>
 
@@ -332,6 +328,7 @@ export function SnippetsView() {
                   onDeleteGroup={(id) => void removeGroup(id)}
                   onEdit={(s) => setEditor({ open: true, snippet: s })}
                   onRemove={(id) => setRemoving([id])}
+                  onReorder={(ids) => void reorder(ids)}
                 />
               ))}
               <SnippetsList
@@ -342,6 +339,7 @@ export function SnippetsView() {
                 getSnippetContent={getSnippetContent}
                 onEdit={(s) => setEditor({ open: true, snippet: s })}
                 onRemove={(id) => setRemoving([id])}
+                onReorder={(ids) => void reorder(ids)}
               />
             </>
           )}
@@ -409,7 +407,7 @@ function descendantGroupIds(groups: SnippetGroup[], id: string): string[] {
 /* ---- Group rendering (recursive) ---- */
 function SnippetGroupNode({
   group, depth, groups, snippets, viewMode, selected, collapsed, onToggle, toggleSelect, getSnippetContent,
-  onAddSubgroup, onAddSnippet, onEditGroup, onDeleteGroup, onEdit, onRemove,
+  onAddSubgroup, onAddSnippet, onEditGroup, onDeleteGroup, onEdit, onRemove, onReorder,
 }: {
   group: SnippetGroup;
   depth: number;
@@ -427,6 +425,7 @@ function SnippetGroupNode({
   onDeleteGroup: (id: string) => void;
   onEdit: (s: Snippet) => void;
   onRemove: (id: string) => void;
+  onReorder: (ids: string[]) => void;
 }) {
   const isOpen = !collapsed[group.id];
   const children = groups.filter((g) => g.parentId === group.id);
@@ -499,6 +498,7 @@ function SnippetGroupNode({
               onDeleteGroup={onDeleteGroup}
               onEdit={onEdit}
               onRemove={onRemove}
+              onReorder={onReorder}
             />
           ))}
           {groupSnippets.length > 0 && (
@@ -510,6 +510,7 @@ function SnippetGroupNode({
               getSnippetContent={getSnippetContent}
               onEdit={onEdit}
               onRemove={onRemove}
+              onReorder={onReorder}
             />
           )}
         </div>
@@ -570,7 +571,7 @@ function SnippetGroupModal({
 
 /* ---- Snippet list (grid/list, reused for root + group nodes) ---- */
 function SnippetsList({
-  snippets, viewMode, selected, toggleSelect, getSnippetContent, onEdit, onRemove,
+  snippets, viewMode, selected, toggleSelect, getSnippetContent, onEdit, onRemove, onReorder,
 }: {
   snippets: Snippet[];
   viewMode: "grid" | "list";
@@ -579,7 +580,13 @@ function SnippetsList({
   getSnippetContent: (s: Snippet) => string;
   onEdit: (s: Snippet) => void;
   onRemove: (id: string) => void;
+  /** Enables vertical drag-to-reorder in list view. Omitted (e.g. during search) disables it. */
+  onReorder?: (ids: string[]) => void;
 }) {
+  const dragSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+  );
+
   if (snippets.length === 0) return null;
 
   if (viewMode === "grid") {
@@ -644,54 +651,156 @@ function SnippetsList({
     );
   }
 
-  return (
-    <div className="overflow-hidden rounded-lg border border-border bg-[var(--color-surface)]">
-      {snippets.map((s, i) => {
-        const isSel = selected.has(s.id);
-        const meta = SNIPPET_KIND_META[s.kind || "command"];
-        const KindIcon = meta.icon;
-        return (
-          <div
+  if (!onReorder) {
+    return (
+      <div className="overflow-hidden rounded-lg border border-border bg-[var(--color-surface)]">
+        {snippets.map((s, i) => (
+          <SnippetListRow
             key={s.id}
-            onClick={(e) => toggleSelect(s.id, e.metaKey || e.ctrlKey || e.shiftKey)}
-            className={[
-              "group flex cursor-pointer items-center gap-3 px-3 py-2.5 text-left transition",
-              i > 0 ? "border-t border-border" : "",
-              isSel
-                ? "bg-[var(--color-brand-orange)]/10"
-                : "hover:bg-[var(--color-surface-2)]",
-            ].join(" ")}
+            s={s}
+            bordered={i > 0}
+            isSel={selected.has(s.id)}
+            toggleSelect={toggleSelect}
+            getSnippetContent={getSnippetContent}
+            onEdit={onEdit}
+            onRemove={onRemove}
+          />
+        ))}
+      </div>
+    );
+  }
+
+  return (
+    <DndContext
+      sensors={dragSensors}
+      collisionDetection={closestCenter}
+      modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+      onDragEnd={(e: DragEndEvent) => {
+        const { active, over } = e;
+        if (!over || active.id === over.id) return;
+        const ids = snippets.map((s) => s.id);
+        const from = ids.indexOf(active.id as string);
+        const to = ids.indexOf(over.id as string);
+        if (from !== -1 && to !== -1) onReorder(arrayMove(ids, from, to));
+      }}
+    >
+      <SortableContext items={snippets.map((s) => s.id)} strategy={verticalListSortingStrategy}>
+        <div className="overflow-hidden rounded-lg border border-border bg-[var(--color-surface)]">
+          {snippets.map((s, i) => (
+            <SortableSnippetRow
+              key={s.id}
+              s={s}
+              bordered={i > 0}
+              isSel={selected.has(s.id)}
+              toggleSelect={toggleSelect}
+              getSnippetContent={getSnippetContent}
+              onEdit={onEdit}
+              onRemove={onRemove}
+            />
+          ))}
+        </div>
+      </SortableContext>
+    </DndContext>
+  );
+}
+
+function SnippetListRow({
+  s, bordered, isSel, toggleSelect, getSnippetContent, onEdit, onRemove, dragHandle,
+}: {
+  s: Snippet;
+  bordered: boolean;
+  isSel: boolean;
+  toggleSelect: (id: string, additive: boolean) => void;
+  getSnippetContent: (s: Snippet) => string;
+  onEdit: (s: Snippet) => void;
+  onRemove: (id: string) => void;
+  dragHandle?: React.ReactNode;
+}) {
+  const meta = SNIPPET_KIND_META[s.kind || "command"];
+  const KindIcon = meta.icon;
+  return (
+    <div
+      onClick={(e) => toggleSelect(s.id, e.metaKey || e.ctrlKey || e.shiftKey)}
+      className={[
+        "group flex cursor-pointer items-center gap-3 px-3 py-2.5 text-left transition",
+        bordered ? "border-t border-border" : "",
+        isSel ? "bg-[var(--color-brand-orange)]/10" : "hover:bg-[var(--color-surface-2)]",
+      ].join(" ")}
+    >
+      {dragHandle}
+      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-white" style={{ backgroundColor: meta.color }}>
+        <KindIcon className="h-4 w-4" />
+      </span>
+      <div className="w-48 shrink-0 truncate text-sm font-medium text-foreground">{s.name}</div>
+      <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+      <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
+      {s.createdAt && (
+        <div className="hidden shrink-0 text-xs text-muted-foreground md:block">
+          {new Date(s.createdAt).toLocaleDateString()}
+        </div>
+      )}
+      <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+        <button
+          title="Edit"
+          onClick={(e) => { e.stopPropagation(); onEdit(s); }}
+          className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+        >
+          <Settings className="h-3.5 w-3.5" />
+        </button>
+        <button
+          title="Remove"
+          onClick={(e) => { e.stopPropagation(); onRemove(s.id); }}
+          className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-[oklch(0.72_0.18_25)]"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SortableSnippetRow({
+  s, bordered, isSel, toggleSelect, getSnippetContent, onEdit, onRemove,
+}: {
+  s: Snippet;
+  bordered: boolean;
+  isSel: boolean;
+  toggleSelect: (id: string, additive: boolean) => void;
+  getSnippetContent: (s: Snippet) => string;
+  onEdit: (s: Snippet) => void;
+  onRemove: (id: string) => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: s.id });
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform ? { ...transform, x: 0, scaleX: 1, scaleY: 1 } : null),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : undefined,
+    position: "relative",
+    background: isDragging ? "var(--color-surface-2)" : undefined,
+  };
+  return (
+    <div ref={setNodeRef} style={style}>
+      <SnippetListRow
+        s={s}
+        bordered={bordered}
+        isSel={isSel}
+        toggleSelect={toggleSelect}
+        getSnippetContent={getSnippetContent}
+        onEdit={onEdit}
+        onRemove={onRemove}
+        dragHandle={
+          <button
+            type="button"
+            {...attributes}
+            {...listeners}
+            onClick={(e) => e.stopPropagation()}
+            className="flex h-6 w-5 shrink-0 cursor-grab items-center justify-center text-muted-foreground/50 opacity-0 transition-opacity hover:text-muted-foreground group-hover:opacity-100 active:cursor-grabbing"
           >
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-white" style={{ backgroundColor: meta.color }}>
-              <KindIcon className="h-4 w-4" />
-            </span>
-            <div className="w-48 shrink-0 truncate text-sm font-medium text-foreground">{s.name}</div>
-            <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
-            <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
-            {s.createdAt && (
-              <div className="hidden shrink-0 text-xs text-muted-foreground md:block">
-                {new Date(s.createdAt).toLocaleDateString()}
-              </div>
-            )}
-            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-              <button
-                title="Edit"
-                onClick={(e) => { e.stopPropagation(); onEdit(s); }}
-                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-              >
-                <Settings className="h-3.5 w-3.5" />
-              </button>
-              <button
-                title="Remove"
-                onClick={(e) => { e.stopPropagation(); onRemove(s.id); }}
-                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-[oklch(0.72_0.18_25)]"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
-        );
-      })}
+            <GripVertical className="h-3.5 w-3.5" />
+          </button>
+        }
+      />
     </div>
   );
 }
