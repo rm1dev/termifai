@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { sftpCall, sftpTransfer } from "@/lib/api/sftp";
 import { subscribe, subscribeOsDragDrop } from "@/lib/api/transport";
 import {
+  ChevronRight,
   Download,
   File,
   Folder,
@@ -16,7 +17,7 @@ import {
 import { toast } from "sonner";
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { AppTab, Host, LocalFileEntry, RemoteFileEntry, TransferProgress, SftpConflictInfo } from "@/components/app/types";
+import type { AppTab, Host, HostGroup, LocalFileEntry, RemoteFileEntry, TransferProgress, SftpConflictInfo } from "@/components/app/types";
 import { SftpContextMenu } from "@/components/app/SftpContextMenu";
 import { SftpRenameDialog } from "@/components/app/SftpRenameDialog";
 import { SftpPermissionsDialog } from "@/components/app/SftpPermissionsDialog";
@@ -279,6 +280,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
   const [sftpSessionId] = useState(() => `sftp-${tab.id}-${Date.now()}`);
   const [pickedHostId, setPickedHostId] = useState<string | undefined>(tab.sftpHostId);
   const [allHosts, setAllHosts] = useState<Host[]>([]);
+  const [allGroups, setAllGroups] = useState<HostGroup[]>([]);
+  const [collapsedGroups, setCollapsedGroups] = useState<Record<string, boolean>>({});
   const [hostQuery, setHostQuery] = useState("");
   const [isConnected, setIsConnected] = useState(false);
   // Start in "connecting" immediately if a host is pre-selected — avoids first-render flash
@@ -302,8 +305,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
   // Load hosts for picker (only when no host is pre-selected)
   useEffect(() => {
     if (!tab.sftpHostId) {
-      sftpCall<{ hosts: Host[] }>("list_hosts")
-        .then((v) => setAllHosts(v.hosts))
+      sftpCall<{ hosts: Host[]; groups: HostGroup[] }>("list_hosts")
+        .then((v) => {
+          setAllHosts(v.hosts);
+          setAllGroups(v.groups || []);
+        })
         .catch(() => {});
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -833,7 +839,10 @@ export function SftpView({ tab }: { tab: AppTab }) {
     setPickedHostId(undefined);
     setConnectError(null);
     setRemoteFiles([]);
-    sftpCall<{ hosts: Host[] }>("list_hosts").then((v) => setAllHosts(v.hosts)).catch(() => {});
+    sftpCall<{ hosts: Host[]; groups: HostGroup[] }>("list_hosts").then((v) => {
+      setAllHosts(v.hosts);
+      setAllGroups(v.groups || []);
+    }).catch(() => {});
   };
 
   const handleConnect = async (hostId?: string, hostObj?: Host) => {
@@ -974,6 +983,69 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
   // Pane highlights: (remote only) an OS file drag hovering the remote pane.
   const remoteDropTarget = remoteDragOver;
+
+  const renderHostItem = (h: Host) => (
+    <button
+      key={h.id}
+      className="flex w-full items-center gap-3 border-b border-border px-4 py-2.5 text-left hover:bg-[var(--color-surface)]"
+      onClick={() => void handleConnect(h.id, h)}
+    >
+      <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[var(--color-surface-2)]">
+        <Server className="h-3.5 w-3.5 text-muted-foreground" />
+      </div>
+      <div className="min-w-0">
+        <div className="truncate text-sm font-medium text-foreground">{h.name || h.hostname}</div>
+        <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}:{h.port}</div>
+      </div>
+    </button>
+  );
+
+  const renderSftpGroupNode = (groupId: string | null, depth: number): React.ReactNode => {
+    const subGroups = allGroups.filter(g => g.parentId === groupId);
+    const groupHosts = allHosts.filter(h => groupId ? h.groupId === groupId : !h.groupId);
+
+    const hasContent = subGroups.length > 0 || groupHosts.length > 0;
+    if (!hasContent) return null;
+
+    if (groupId) {
+      const group = allGroups.find(g => g.id === groupId);
+      if (!group) return null;
+      const isOpen = !collapsedGroups[groupId];
+      const totalItems = subGroups.length + groupHosts.length;
+      return (
+        <div key={groupId} className="flex flex-col">
+          <button
+            type="button"
+            onClick={() => setCollapsedGroups(prev => ({ ...prev, [groupId]: !prev[groupId] }))}
+            className="flex w-full items-center gap-2 px-4 py-2 text-left hover:bg-[var(--color-surface-2)]"
+            style={{ paddingLeft: `${depth * 12 + 16}px` }}
+          >
+            <ChevronRight className={`h-3 w-3 shrink-0 text-muted-foreground transition-transform ${isOpen ? "rotate-90" : ""}`} />
+            <Folder className="h-3.5 w-3.5 shrink-0 text-[oklch(0.7_0.13_230)]" />
+            <span className="text-xs font-semibold text-foreground truncate">{group.name}</span>
+            <span className="text-[10px] text-muted-foreground">({totalItems})</span>
+          </button>
+          {isOpen && (
+            <div className="flex flex-col">
+              {subGroups.map(sg => renderSftpGroupNode(sg.id, depth + 1))}
+              {groupHosts.map(h => (
+                <div key={h.id} style={{ paddingLeft: `${(depth + 1) * 12}px` }}>
+                  {renderHostItem(h)}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div key="root-group">
+        {subGroups.map(sg => renderSftpGroupNode(sg.id, depth))}
+        {groupHosts.map(h => renderHostItem(h))}
+      </div>
+    );
+  };
 
   return (
     <div
@@ -1278,26 +1350,16 @@ export function SftpView({ tab }: { tab: AppTab }) {
               {allHosts.length === 0 && (
                 <div className="px-4 py-8 text-center text-xs text-muted-foreground">No saved hosts</div>
               )}
-              {allHosts
-                .filter((h) => {
-                  const q = hostQuery.toLowerCase();
-                  return !q || h.name.toLowerCase().includes(q) || h.hostname.toLowerCase().includes(q) || h.user.toLowerCase().includes(q);
-                })
-                .map((h) => (
-                  <button
-                    key={h.id}
-                    className="flex w-full items-center gap-3 border-b border-border px-4 py-2.5 text-left hover:bg-[var(--color-surface)]"
-                    onClick={() => void handleConnect(h.id, h)}
-                  >
-                    <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-[var(--color-surface-2)]">
-                      <Server className="h-3.5 w-3.5 text-muted-foreground" />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium text-foreground">{h.name || h.hostname}</div>
-                      <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}:{h.port}</div>
-                    </div>
-                  </button>
-                ))}
+              {hostQuery ? (
+                allHosts
+                  .filter((h) => {
+                    const q = hostQuery.toLowerCase();
+                    return h.name.toLowerCase().includes(q) || h.hostname.toLowerCase().includes(q) || h.user.toLowerCase().includes(q);
+                  })
+                  .map((h) => renderHostItem(h))
+              ) : (
+                renderSftpGroupNode(null, 0)
+              )}
             </div>
           </div>
         )}
