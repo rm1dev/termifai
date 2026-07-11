@@ -1912,7 +1912,15 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
             .to_string_lossy()
             .into_owned();
 
-        let home = std::env::var("HOME").map(std::path::PathBuf::from).ok();
+        let mut home = std::env::var("HOME").map(std::path::PathBuf::from).ok();
+        if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+            if !sudo_user.is_empty() {
+                let user_home = std::path::PathBuf::from(format!("/home/{}", sudo_user));
+                if user_home.exists() {
+                    home = Some(user_home);
+                }
+            }
+        }
 
         if let Some(ref h) = home {
             // 1. KDE Dolphin ServiceMenu (KDE 5 & 6)
