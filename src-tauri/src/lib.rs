@@ -517,8 +517,14 @@ fn upload_script_via_sftp(
 
     let remote_path = format!("/tmp/termifai_run_{}.sh", snippet_exec::short_id());
 
+    use ssh2::{OpenFlags, OpenType};
     let mut remote_file = sftp
-        .create(std::path::Path::new(&remote_path))
+        .open_mode(
+            std::path::Path::new(&remote_path),
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+            0o600,
+            OpenType::File,
+        )
         .map_err(|e| format!("Failed to create remote temp file: {}", e))?;
 
     use std::io::Write;
@@ -556,6 +562,11 @@ fn run_script_locally(
         std::env::temp_dir().join(format!("termifai_run_{}.sh", snippet_exec::short_id()));
     std::fs::write(&local_temp_path, script)
         .map_err(|e| format!("Failed to write local temp script: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&local_temp_path, std::fs::Permissions::from_mode(0o600));
+    }
 
     let payload = snippet_exec::local_exec_payload(&local_temp_path.to_string_lossy());
     let manager = state.pty_manager.lock().unwrap();
