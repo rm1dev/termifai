@@ -14,6 +14,9 @@ import {
 } from "@/lib/api/terminal";
 import { subscribe, type UnlistenFn } from "@/lib/api/transport";
 import { listSnippets } from "@/lib/api/snippets";
+import { listHosts } from "@/lib/api/hosts";
+import { onSnippetsChanged } from "@/lib/snippets-events";
+import { matchesOsTarget } from "@/features/snippets/osTargets";
 import {
   ensureTerminalFontLoaded,
   getTerminalFontStack,
@@ -35,7 +38,7 @@ import {
   shortcutsStorageKey,
   type ShortcutMap,
 } from "@/lib/shortcuts";
-import type { Snippet } from "@/components/app/types";
+import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
 import { Search } from "lucide-react";
 
 interface Props {
@@ -171,9 +174,25 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [showConnectionLogs, setShowConnectionLogs] = useState(false);
   const [snippetPalette, setSnippetPalette] = useState(false);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
+  const [snippetGroups, setSnippetGroups] = useState<SnippetGroup[]>([]);
   const [snippetQuery, setSnippetQuery] = useState("");
   const [snippetIndex, setSnippetIndex] = useState(0);
   const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
+  // Resolved once per mount: local terminal tabs have no hostId, so `isLocal`
+  // is true; SSH tabs look up the host's OS to gate OS-restricted snippets.
+  const osContextRef = useRef<{ isLocal: boolean; hostOs?: OsKind }>({ isLocal: !hostId });
+  // keyword -> snippet, for the text-only auto-expand feature. Only snippets
+  // with no variables are eligible (mid-line variable prompts would be jarring).
+  const keywordSnippetsRef = useRef<Map<string, Snippet>>(new Map());
+  // Raw text typed since the last Enter, tracked from keystrokes directly
+  // rather than read from the terminal's rendered buffer — the buffer only
+  // reflects a keystroke once the PTY echoes it back asynchronously, which
+  // isn't done yet at the moment the next keystroke (e.g. the space that
+  // triggers a keyword match) arrives. Used both for keyword auto-expand
+  // and to gate command/script snippets to "cursor at start of line" (a
+  // shell prompt already occupies columns before the cursor, so absolute
+  // terminal column can't be used for that either).
+  const currentLineRef = useRef("");
   const shortcutsRefLocal = useRef<ShortcutMap>(loadShortcuts());
   const termRef = useRef<Terminal | null>(null);
   const sessionRef = useRef<string | null>(sessionId ?? null);
@@ -185,6 +204,56 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const mountCountRef = useRef(0);
   const notifiedSessionRef = useRef<string | null>(sessionId ?? null);
   const appearanceRequestRef = useRef(0);
+
+  const loadSnippets = useCallback(() => {
+    return listSnippets().then((data) => {
+      setSnippets(data.snippets);
+      setSnippetGroups(data.groups);
+      const map = new Map<string, Snippet>();
+      for (const s of data.snippets) {
+        if (
+          s.kind === "text" &&
+          s.keyword &&
+          (!s.variables || s.variables.length === 0) &&
+          matchesOsTarget(s.osTargets, osContextRef.current)
+        ) {
+          map.set(s.keyword, s);
+        }
+      }
+      keywordSnippetsRef.current = map;
+    });
+  }, []);
+
+  // Resolve this tab's OS context once, then (re)build the keyword map with it.
+  useEffect(() => {
+    let cancelled = false;
+    if (!hostId) {
+      osContextRef.current = { isLocal: true };
+      void loadSnippets();
+      return;
+    }
+    listHosts()
+      .then(({ hosts }) => {
+        if (cancelled) return;
+        const host = hosts.find((h) => h.id === hostId);
+        osContextRef.current = { isLocal: false, hostOs: host?.os };
+        void loadSnippets();
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId]);
+
+  // Refresh the palette + keyword map whenever a snippet is created, edited,
+  // removed, or moved — otherwise changes made in the Snippets panel would
+  // have no effect on terminals that were already open.
+  useEffect(() => {
+    const { unlisten } = onSnippetsChanged(() => void loadSnippets());
+    return unlisten;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
 
   // Constant per window (the quick-terminal window always passes true).
@@ -226,8 +295,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       if (shortcuts["open-snippets"] && isShortcutMatch(event, shortcuts["open-snippets"])) {
         if (event.type === "keydown") {
           event.preventDefault();
-          listSnippets().then((data) => {
-            setSnippets(data);
+          loadSnippets().then(() => {
             setSnippetQuery("");
             setSnippetIndex(0);
             setSnippetPalette(true);
@@ -255,6 +323,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
               writeToSession(sid, text).catch(() => {});
             }).catch(() => {});
           }
+        }
+        return false;
+      }
+
+      if (shortcuts["clear-terminal"] && isShortcutMatch(event, shortcuts["clear-terminal"])) {
+        if (event.type === "keydown") {
+          term.clear();
         }
         return false;
       }
@@ -336,10 +411,42 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     // Send keystrokes to backend PTY
     const dataDisp = term.onData((data) => {
       const sid = sessionRef.current;
-      if (sid) {
-        writeToSession(sid, data).catch((err) =>
-          console.error("write_to_session failed:", err)
-        );
+      if (!sid) return;
+
+      const send = (payload: string) =>
+        writeToSession(sid, payload).catch((err) => console.error("write_to_session failed:", err));
+
+      if (data === "\r") {
+        currentLineRef.current = "";
+        send(data);
+        return;
+      }
+      if (data === "\x7f") {
+        currentLineRef.current = currentLineRef.current.slice(0, -1);
+        send(data);
+        return;
+      }
+      if (data.length === 0 || data.startsWith("\x1b")) {
+        send(data);
+        return;
+      }
+
+      currentLineRef.current += data;
+      send(data);
+
+      // Immediate keyword match: as soon as the word just typed (tracked
+      // locally from raw keystrokes, not read from the terminal's rendered
+      // buffer — the buffer only reflects a keystroke once the PTY echoes it
+      // back asynchronously) exactly equals a known keyword, expand it right
+      // away without waiting for a boundary character. Only eligible on
+      // kind === "text" snippets with no variables.
+      const match = /(\S+)$/.exec(currentLineRef.current);
+      const word = match?.[1];
+      const snippet = word ? keywordSnippetsRef.current.get(word) : undefined;
+      if (snippet) {
+        currentLineRef.current = currentLineRef.current.slice(0, -word!.length);
+        const erase = "\x7f".repeat(word!.length);
+        send(erase + (snippet.body ?? ""));
       }
     });
 
@@ -504,17 +611,46 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   // ── Snippet Palette Logic ──────────────────────────────────────────────────
 
-  const filteredSnippets = snippets.filter((s) => {
-    // Filter by search query
-    if (!snippetQuery.trim()) return true;
-    const q = snippetQuery.toLowerCase();
-    const content = s.body || s.command || s.script || "";
-    return s.name.toLowerCase().includes(q) || content.toLowerCase().includes(q);
-  });
+  // command/script snippets are only offered when the cursor is at column 0 —
+  // if the user has typed anything on the current line, they're hidden.
+  const cursorAtLineStart = () => currentLineRef.current.length === 0;
+
+  // Full "Parent › Child" path for a snippet's group, or null when ungrouped —
+  // used to cluster the palette by group instead of a flat list.
+  const groupPathFor = (groupId: string | null | undefined): string | null => {
+    if (!groupId) return null;
+    const parts: string[] = [];
+    let cur = snippetGroups.find((g) => g.id === groupId);
+    while (cur) {
+      parts.unshift(cur.name);
+      cur = cur.parentId ? snippetGroups.find((g) => g.id === cur!.parentId) : undefined;
+    }
+    return parts.length > 0 ? parts.join(" › ") : null;
+  };
+
+  const filteredSnippets = snippets
+    .filter((s) => {
+      if (!matchesOsTarget(s.osTargets, osContextRef.current)) return false;
+      if ((s.kind === "command" || s.kind === "script") && !cursorAtLineStart()) return false;
+      // Filter by search query
+      if (!snippetQuery.trim()) return true;
+      const q = snippetQuery.toLowerCase();
+      const content = s.body || s.command || s.script || "";
+      return s.name.toLowerCase().includes(q) || content.toLowerCase().includes(q);
+    })
+    .sort((a, b) => {
+      const pa = groupPathFor(a.groupId);
+      const pb = groupPathFor(b.groupId);
+      if (pa === pb) return 0;
+      if (pa === null) return 1; // ungrouped snippets sort after grouped ones
+      if (pb === null) return -1;
+      return pa.localeCompare(pb);
+    });
 
   const executeSnippet = useCallback((snippet: Snippet, varValues?: Record<string, string>) => {
     const sid = sessionRef.current;
     if (!sid) return;
+    if ((snippet.kind === "command" || snippet.kind === "script") && !cursorAtLineStart()) return;
 
     const resolveVars = (text: string) => {
       if (!snippet.variables?.length) return text;
@@ -709,23 +845,32 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
                 filteredSnippets.map((s, i) => {
                   const kindColors: Record<string, string> = { text: "oklch(0.55_0.15_160)", command: "oklch(0.45_0.15_230)", script: "oklch(0.55_0.15_300)" };
                   const kindLabels: Record<string, string> = { text: "Text", command: "Cmd", script: "Script" };
+                  const groupPath = groupPathFor(s.groupId);
+                  const prevGroupPath = i > 0 ? groupPathFor(filteredSnippets[i - 1].groupId) : undefined;
+                  const showGroupHeader = groupPath !== prevGroupPath;
                   return (
-                    <div
-                      key={s.id}
-                      onClick={() => selectSnippet(s)}
-                      className={[
-                        "flex cursor-pointer items-center gap-3 px-3 py-2 transition",
-                        i === snippetIndex ? "bg-[var(--color-surface-2)]" : "hover:bg-[var(--color-surface-2)]/60",
-                      ].join(" ")}
-                    >
-                      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
-                        {kindLabels[s.kind]?.[0] || "C"}
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
-                        <div className="truncate text-xs text-muted-foreground font-mono">{s.body || s.command || s.script || ""}</div>
+                    <div key={s.id}>
+                      {showGroupHeader && (
+                        <div className="px-3 pb-1 pt-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70 first:pt-1.5">
+                          {groupPath ?? "Ungrouped"}
+                        </div>
+                      )}
+                      <div
+                        onClick={() => selectSnippet(s)}
+                        className={[
+                          "flex cursor-pointer items-center gap-3 px-3 py-2 transition",
+                          i === snippetIndex ? "bg-[var(--color-surface-2)]" : "hover:bg-[var(--color-surface-2)]/60",
+                        ].join(" ")}
+                      >
+                        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
+                          {kindLabels[s.kind]?.[0] || "C"}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
+                          <div className="truncate text-xs text-muted-foreground font-mono">{s.body || s.command || s.script || ""}</div>
+                        </div>
+                        <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">{kindLabels[s.kind] || "Command"}</span>
                       </div>
-                      <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">{kindLabels[s.kind] || "Command"}</span>
                     </div>
                   );
                 })

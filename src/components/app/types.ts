@@ -57,6 +57,22 @@ export interface AppTab {
 
 export type SnippetKind = "text" | "command" | "script";
 
+export type SnippetOsTarget =
+  | "all"
+  | "local"
+  | "linux"
+  | "windows"
+  | "ubuntu"
+  | "debian"
+  | "centos"
+  | "alpine";
+
+export interface SnippetGroup {
+  id: string;
+  name: string;
+  parentId: string | null;
+}
+
 export type SnippetVariableType = "text" | "enum";
 
 export interface SnippetVariable {
@@ -79,6 +95,11 @@ export interface Snippet {
   /** For "script" kind — a full bash script */
   script?: string;
   variables?: SnippetVariable[];
+  groupId?: string | null;
+  /** For "text" kind only — typing this word in the terminal auto-expands it to `body`. */
+  keyword?: string;
+  /** Restricts which hosts this snippet is offered on. Empty/absent = all OS. */
+  osTargets?: SnippetOsTarget[];
   createdAt?: string; // ISO date string
 }
 

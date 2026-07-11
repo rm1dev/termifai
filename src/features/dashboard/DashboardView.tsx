@@ -10,6 +10,7 @@ import {
   Container,
   Cpu,
   Download,
+  Folder,
   HardDrive,
   List,
   Network,
@@ -38,7 +39,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import type { Host } from "@/components/app/types";
+import type { Host, HostGroup } from "@/components/app/types";
 import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
 
 function CircularGauge({ value, label }: { value: number; label: string }) {
@@ -229,14 +230,18 @@ const DASHBOARD_SERVERS: ServerStat[] = [
 export function DashboardView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hosts, setHosts] = useState<Host[]>([]);
+  const [groups, setGroups] = useState<HostGroup[]>([]);
   // Cache the last full detail result (including processes) per host.
   // Stored in a ref so re-entering a host shows data instantly without re-fetching.
   const detailCacheRef = useRef<Record<string, HostPollResult>>({});
 
   // Load hosts that have showStatusInDashboard enabled
   useEffect(() => {
-    call<{ hosts: Host[] }>("list_hosts")
-      .then((v) => setHosts(v.hosts.filter((h) => h.showStatusInDashboard !== false)))
+    call<{ hosts: Host[]; groups: HostGroup[] }>("list_hosts")
+      .then((v) => {
+        setHosts(v.hosts.filter((h) => h.showStatusInDashboard !== false));
+        setGroups(v.groups || []);
+      })
       .catch(console.error);
   }, []);
 
@@ -256,6 +261,133 @@ export function DashboardView() {
       );
     }
   }
+
+  const renderHostCard = (host: Host) => {
+    const poll = stats[host.id];
+    const isLoading = loading.has(host.id);
+    const sys = poll?.system;
+
+    return (
+      <button
+        key={host.id}
+        type="button"
+        onClick={() => setSelectedId(host.id)}
+        className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
+      >
+        {/* Header */}
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-semibold text-foreground">{host.name}</span>
+          <div className="flex items-center gap-1.5">
+            {isLoading ? (
+              <span className="h-2 w-2 rounded-full bg-muted-foreground/40 animate-pulse" />
+            ) : (
+              <span className={`h-2 w-2 rounded-full ${poll?.ok ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
+            )}
+            <span className="text-xs text-muted-foreground">
+              {isLoading ? "Connecting…" : poll?.ok ? "Online" : poll?.error ? "Error" : "—"}
+            </span>
+          </div>
+        </div>
+
+        {/* Specs from real system data */}
+        <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+          {sys && (
+            <>
+              <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys.cores} Cores</span>
+              <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes(sys.memTotalKb * 1024)}</span>
+              <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes(sys.diskTotalKb * 1024)}</span>
+              <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {fmtUptime(sys.uptimeSecs)}</span>
+            </>
+          )}
+          {isLoading && !sys && (
+            <span className="h-3 w-48 rounded animate-shimmer inline-block" />
+          )}
+        </div>
+
+        {/* Gauges */}
+        {sys ? (
+          <div className="mt-4 flex items-start gap-4">
+            <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
+            <RingGauge
+              value={sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
+              label="RAM"
+              gradientId={`g-dash-ram-${host.id}`}
+              size={52}
+            />
+            <RingGauge
+              value={sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
+              label="Disk"
+              gradientId={`g-dash-disk-${host.id}`}
+              size={52}
+            />
+            <IoStat
+              label="Network"
+              rows={[
+                { icon: ArrowDownToLine, value: fmtBytes(sys.netRxRate), unit: "/s" },
+                { icon: ArrowUpFromLine, value: fmtBytes(sys.netTxRate), unit: "/s" },
+              ]}
+            />
+          </div>
+        ) : (
+          <div className="mt-4 flex items-start gap-4">
+            {/* Gauge placeholders */}
+            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
+            {/* Network placeholder */}
+            <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
+              <div className="h-2.5 w-14 rounded animate-shimmer" />
+              <div className="flex flex-col gap-1">
+                <div className="h-2.5 w-16 rounded animate-shimmer" />
+                <div className="h-2.5 w-16 rounded animate-shimmer" />
+              </div>
+            </div>
+          </div>
+        )}
+      </button>
+    );
+  };
+
+  const hasHostsInGroup = (gId: string): boolean => {
+    if (hosts.some(h => h.groupId === gId)) return true;
+    const subs = groups.filter(g => g.parentId === gId);
+    return subs.some(sub => hasHostsInGroup(sub.id));
+  };
+
+  const renderGroupDashboard = (groupId: string | null, depth: number): React.ReactNode => {
+    const subGroups = groups.filter(g => g.parentId === groupId);
+    const groupHosts = hosts.filter(h => groupId ? h.groupId === groupId : !h.groupId);
+
+    const hasSubgroupContent = subGroups.some(sg => hasHostsInGroup(sg.id));
+    const hasDirectHosts = groupHosts.length > 0;
+
+    if (!hasSubgroupContent && !hasDirectHosts) return null;
+
+    return (
+      <div key={groupId || "root"} className={groupId ? "mb-6" : ""}>
+        {groupId && (
+          <div 
+            className="flex items-center gap-1.5 mb-2.5 mt-4 text-[10px] font-bold tracking-wider text-muted-foreground/80 uppercase"
+            style={{ marginLeft: `${Math.max(0, depth - 1) * 8}px` }}
+          >
+            <Folder className="h-3.5 w-3.5 text-[oklch(0.7_0.13_230)] shrink-0" />
+            <span>{groups.find(g => g.id === groupId)?.name}</span>
+          </div>
+        )}
+
+        {hasDirectHosts && (
+          <div 
+            className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(340px,1fr))]"
+            style={{ marginLeft: `${depth * 8}px` }}
+          >
+            {groupHosts.map(host => renderHostCard(host))}
+          </div>
+        )}
+
+        {subGroups.map(sg => renderGroupDashboard(sg.id, depth + 1))}
+      </div>
+    );
+  };
 
   const total = hosts.length;
   const online = hosts.filter((h) => stats[h.id]?.ok).length;
@@ -297,93 +429,7 @@ export function DashboardView() {
       )}
 
       {/* Server cards */}
-      <div className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(340px,1fr))]">
-        {hosts.map((host) => {
-          const poll = stats[host.id];
-          const isLoading = loading.has(host.id);
-          const sys = poll?.system;
-
-          return (
-            <button
-              key={host.id}
-              type="button"
-              onClick={() => setSelectedId(host.id)}
-              className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
-            >
-              {/* Header */}
-              <div className="flex items-center justify-between">
-                <span className="text-sm font-semibold text-foreground">{host.name}</span>
-                <div className="flex items-center gap-1.5">
-                  {isLoading ? (
-                    <span className="h-2 w-2 rounded-full bg-muted-foreground/40 animate-pulse" />
-                  ) : (
-                    <span className={`h-2 w-2 rounded-full ${poll?.ok ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
-                  )}
-                  <span className="text-xs text-muted-foreground">
-                    {isLoading ? "Connecting…" : poll?.ok ? "Online" : poll?.error ? "Error" : "—"}
-                  </span>
-                </div>
-              </div>
-
-              {/* Specs from real system data */}
-              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-                {sys && (
-                  <>
-                    <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys.cores} Cores</span>
-                    <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes(sys.memTotalKb * 1024)}</span>
-                    <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes(sys.diskTotalKb * 1024)}</span>
-                    <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {fmtUptime(sys.uptimeSecs)}</span>
-                  </>
-                )}
-                {isLoading && !sys && (
-                  <span className="h-3 w-48 rounded animate-shimmer inline-block" />
-                )}
-              </div>
-
-              {/* Gauges */}
-              {sys ? (
-                <div className="mt-4 flex items-start gap-4">
-                  <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
-                  <RingGauge
-                    value={sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
-                    label="RAM"
-                    gradientId={`g-dash-ram-${host.id}`}
-                    size={52}
-                  />
-                  <RingGauge
-                    value={sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
-                    label="Disk"
-                    gradientId={`g-dash-disk-${host.id}`}
-                    size={52}
-                  />
-                  <IoStat
-                    label="Network"
-                    rows={[
-                      { icon: ArrowDownToLine, value: fmtBytes(sys.netRxRate), unit: "/s" },
-                      { icon: ArrowUpFromLine, value: fmtBytes(sys.netTxRate), unit: "/s" },
-                    ]}
-                  />
-                </div>
-              ) : (
-                <div className="mt-4 flex items-start gap-4">
-                  {/* Gauge placeholders */}
-                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-                  <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-                  {/* Network placeholder */}
-                  <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-                    <div className="h-2.5 w-14 rounded animate-shimmer" />
-                    <div className="flex flex-col gap-1">
-                      <div className="h-2.5 w-16 rounded animate-shimmer" />
-                      <div className="h-2.5 w-16 rounded animate-shimmer" />
-                    </div>
-                  </div>
-                </div>
-              )}
-            </button>
-          );
-        })}
-      </div>
+      {renderGroupDashboard(null, 0)}
     </div>
   );
 }

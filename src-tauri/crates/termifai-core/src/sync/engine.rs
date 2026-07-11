@@ -1,6 +1,6 @@
 use crate::model::forwards::PortForwardRule;
 use crate::model::hosts::{Host, HostGroup};
-use crate::model::snippets::Snippet;
+use crate::model::snippets::{Snippet, SnippetGroup};
 use crate::model::ssh_keys::SshKey;
 use crate::model::tombstones::{EntityKind, Tombstone};
 use crate::sync::backend::{SyncBackend, SyncError};
@@ -18,6 +18,7 @@ pub struct LocalSnapshot {
     pub hosts: Vec<Host>,
     pub groups: Vec<HostGroup>,
     pub snippets: Vec<Snippet>,
+    pub snippet_groups: Vec<SnippetGroup>,
     pub port_forwards: Vec<PortForwardRule>,
     /// `None` when this device has SSH-key sync turned off.
     pub ssh_keys: Option<Vec<SshKey>>,
@@ -33,6 +34,7 @@ pub struct SyncOutcome {
     pub hosts: Vec<Host>,
     pub groups: Vec<HostGroup>,
     pub snippets: Vec<Snippet>,
+    pub snippet_groups: Vec<SnippetGroup>,
     pub port_forwards: Vec<PortForwardRule>,
     pub ssh_keys: Option<Vec<SshKey>>,
     pub settings: SettingsPayload,
@@ -77,6 +79,14 @@ pub fn merge_snapshot(local: &LocalSnapshot, remote: Option<SyncPayload>) -> Syn
         &local.device_id,
         &remote_device_id,
     );
+    let snippet_groups = merge_entities(
+        local.snippet_groups.clone(),
+        remote.snippet_groups,
+        &tombstones,
+        EntityKind::SnippetGroup,
+        &local.device_id,
+        &remote_device_id,
+    );
     let port_forwards = merge_entities(
         local.port_forwards.clone(),
         remote.port_forwards,
@@ -104,6 +114,7 @@ pub fn merge_snapshot(local: &LocalSnapshot, remote: Option<SyncPayload>) -> Syn
         hosts,
         groups,
         snippets,
+        snippet_groups,
         port_forwards,
         ssh_keys,
         settings,
@@ -159,6 +170,7 @@ pub fn run_sync(
             hosts: outcome.hosts.clone(),
             groups: outcome.groups.clone(),
             snippets: outcome.snippets.clone(),
+            snippet_groups: outcome.snippet_groups.clone(),
             port_forwards: outcome.port_forwards.clone(),
             ssh_keys: outcome.ssh_keys.clone(),
             settings: outcome.settings.clone(),

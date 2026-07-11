@@ -369,7 +369,12 @@ fn ensure_daemon_running(app: &AppHandle) -> Result<(), String> {
             return Err(msg);
         }
     }
-    let _ = app.autolaunch().enable();
+    // Only touch autolaunch if the user hasn't explicitly opted out in
+    // Settings — otherwise every hotkey (re)spawn would silently override
+    // a "Run at Startup" toggled off.
+    if crate::load_general_settings(app).run_at_startup {
+        let _ = app.autolaunch().enable();
+    }
     Ok(())
 }
 
