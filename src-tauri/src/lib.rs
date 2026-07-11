@@ -1973,8 +1973,16 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
                 let _ = std::fs::create_dir_all(&python_dir);
                 let content = format!(
                     "import os\n\
+                     import gi\n\
+                     try:\n\
+                         gi.require_version('Nautilus', '4.0')\n\
+                     except Exception:\n\
+                         try:\n\
+                             gi.require_version('Nautilus', '3.0')\n\
+                         except Exception:\n\
+                             pass\n\n\
                      from gi.repository import Nautilus, GObject\n\n\
-                     class TermifaiExtension(GObject.GObject, Nautilus.MenuProvider):\n\
+                     class TermifaiExtension(GObject.Object, Nautilus.MenuProvider):\n\
                          def __init__(self):\n\
                              pass\n\n\
                          def get_file_items(self, *args):\n\
@@ -2087,6 +2095,13 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
             } else {
                 let _ = std::fs::remove_file(caja_script);
             }
+
+            // Reload file managers so that context menu changes apply instantly on Linux
+            let _ = std::process::Command::new("nautilus").arg("-q").status();
+            let _ = std::process::Command::new("nemo").arg("-q").status();
+            let _ = std::process::Command::new("caja").arg("-q").status();
+            let _ = std::process::Command::new("kbuildsycoca6").status();
+            let _ = std::process::Command::new("kbuildsycoca5").status();
         }
     }
 
