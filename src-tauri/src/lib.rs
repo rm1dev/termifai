@@ -2500,6 +2500,7 @@ pub fn run() {
             .resizable(false)
             .decorations(false)
             .transparent(true)
+            .shadow(false)
             .minimizable(false)
             .maximizable(false)
             .visible(false)
