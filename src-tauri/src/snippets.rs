@@ -227,6 +227,27 @@ pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> 
     Ok(())
 }
 
+/// Reorders `vault.snippets` to match `ids` (front-to-back). Any snippet not
+/// referenced in `ids` keeps its original relative position, appended after
+/// the reordered ones — defensive against a stale/partial id list.
+pub fn reorder_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            let mut reordered: Vec<Snippet> = Vec::with_capacity(vault.snippets.len());
+            for id in &ids {
+                if let Some(pos) = vault.snippets.iter().position(|s| &s.id == id) {
+                    reordered.push(vault.snippets.remove(pos));
+                }
+            }
+            reordered.append(&mut vault.snippets);
+            vault.snippets = reordered;
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn save_snippet_group(
     app: &AppHandle,
     request: SaveSnippetGroupRequest,
