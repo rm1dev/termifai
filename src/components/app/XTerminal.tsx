@@ -327,6 +327,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         return false;
       }
 
+      if (shortcuts["clear-terminal"] && isShortcutMatch(event, shortcuts["clear-terminal"])) {
+        if (event.type === "keydown") {
+          term.clear();
+        }
+        return false;
+      }
+
       return true;
     });
 
