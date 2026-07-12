@@ -148,11 +148,25 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
     const portArg = host.port && host.port !== 22 ? ` -p ${host.port}` : "";
     const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
     const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
-    const remoteBootstrap = `printf '${readyMarker}\\n'; ${cdPart}exec ` + "${SHELL:-/bin/sh}" + " -i";
+    // Stable per-tab tmux session name (fixed at tab creation, reused verbatim
+    // on every reconnect attempt): if tmux is on the remote host, attach to —
+    // or create — this named session instead of spawning a plain login shell,
+    // so a dropped connection resumes the exact same shell (cwd, env, running
+    // jobs, scrollback) rather than a fresh one. Falls back to a plain shell
+    // when tmux isn't installed.
+    const tmuxSession = id.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const plainShell = "${SHELL:-/bin/sh} -i";
+    const tmuxAttach = `tmux new-session -A -s ${tmuxSession}`;
+    const remoteBootstrap =
+      `printf '${readyMarker}\\n'; ${cdPart}` +
+      `if command -v tmux >/dev/null 2>&1; then exec ${tmuxAttach}; else exec ${plainShell}; fi`;
     // accept-new: trust a host's key on first contact and record it in the user's
     // known_hosts, but hard-fail if a previously recorded key changes (unlike
     // StrictHostKeyChecking=no, which trusted every connection unconditionally).
-    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+    // ServerAlive*: let ssh itself detect a dead connection (3 missed keepalives,
+    // ~15s) instead of us guessing from unanswered keystrokes — that would
+    // misfire on ordinary latency spikes or brief network blips.
+    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
