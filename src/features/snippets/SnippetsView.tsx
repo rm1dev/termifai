@@ -6,8 +6,6 @@ import {
   Folder,
   FolderPlus,
   GripVertical,
-  LayoutGrid,
-  List,
   Plus,
   Search,
   Settings,
@@ -38,7 +36,7 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Field, ModalActions, ModalShell } from "@/components/shared/modal-primitives";
+import { Field, ModalActions, ModalShell, SplitButton } from "@/components/shared/modal-primitives";
 import type { Snippet, SnippetGroup, SnippetKind, SnippetOsTarget, SnippetVariable } from "@/components/app/types";
 import {
   listSnippets,
@@ -68,15 +66,10 @@ export function SnippetsView() {
   const [editor, setEditor] = useState<{ open: boolean; snippet?: Snippet | null; groupId?: string | null }>({ open: false });
   const [groupModal, setGroupModal] = useState<{ open: boolean; parentId: string | null; group?: SnippetGroup | null }>({ open: false, parentId: null, group: null });
   const [removing, setRemoving] = useState<string[] | null>(null);
-  const [viewMode, setViewMode] = useState<"grid" | "list">(
-    () => (localStorage.getItem("snippets-view-mode") as "grid" | "list") ?? "list"
-  );
-  const [viewOpen, setViewOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
   useEffect(() => { if (searchOpen) searchRef.current?.focus(); }, [searchOpen]);
-  useEffect(() => { localStorage.setItem("snippets-view-mode", viewMode); }, [viewMode]);
 
   // Load from backend
   useEffect(() => {
@@ -191,18 +184,14 @@ export function SnippetsView() {
       {/* Toolbar */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => setEditor({ open: true, snippet: null, groupId: null })}
-            className="flex h-7 items-center gap-1 rounded-md bg-[var(--color-surface-2)] px-2.5 text-xs font-medium text-foreground hover:bg-white/5"
-          >
-            <Plus className="h-3.5 w-3.5" /> New snippet
-          </button>
-          <button
-            onClick={() => setGroupModal({ open: true, parentId: null, group: null })}
-            className="flex h-7 items-center gap-1 rounded-md px-2.5 text-xs font-medium text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-          >
-            <FolderPlus className="h-3.5 w-3.5" /> New group
-          </button>
+          <SplitButton
+            primary={<><Plus className="h-3.5 w-3.5" /> New snippet</>}
+            onPrimary={() => setEditor({ open: true, snippet: null, groupId: null })}
+            menu={[
+              { label: "New snippet", icon: <Plus className="h-3.5 w-3.5" />, onClick: () => setEditor({ open: true, snippet: null, groupId: null }) },
+              { label: "New group", icon: <FolderPlus className="h-3.5 w-3.5" />, onClick: () => setGroupModal({ open: true, parentId: null, group: null }) },
+            ]}
+          />
           {selectedIds.length > 0 && (
             <button
               onClick={() => setRemoving(selectedIds)}
@@ -245,38 +234,6 @@ export function SnippetsView() {
               <Search className="h-4 w-4" />
             </button>
           </div>
-
-          {/* View mode dropdown */}
-          <div className="relative">
-            <button
-              onClick={() => setViewOpen((v) => !v)}
-              className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-              title={viewMode === "grid" ? "Grid view" : "List view"}
-            >
-              {viewMode === "grid" ? <LayoutGrid className="h-4 w-4" /> : <List className="h-4 w-4" />}
-            </button>
-            {viewOpen && (
-              <div
-                className="absolute right-0 top-full z-30 mt-1 w-40 overflow-hidden rounded-lg border border-border bg-popover shadow-2xl"
-                onMouseLeave={() => setViewOpen(false)}
-              >
-                <button
-                  onClick={() => { setViewMode("grid"); setViewOpen(false); }}
-                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[var(--color-surface-2)] ${viewMode === "grid" ? "text-foreground" : "text-muted-foreground"}`}
-                >
-                  <LayoutGrid className="h-4 w-4" />
-                  Grid view
-                </button>
-                <button
-                  onClick={() => { setViewMode("list"); setViewOpen(false); }}
-                  className={`flex w-full items-center gap-2 px-3 py-2 text-sm hover:bg-[var(--color-surface-2)] ${viewMode === "list" ? "text-foreground" : "text-muted-foreground"}`}
-                >
-                  <List className="h-4 w-4" />
-                  List view
-                </button>
-              </div>
-            )}
-          </div>
         </div>
       </div>
 
@@ -300,7 +257,6 @@ export function SnippetsView() {
           ) : isSearching ? (
             <SnippetsList
               snippets={visibleSnippets}
-              viewMode={viewMode}
               selected={selected}
               toggleSelect={toggleSelect}
               getSnippetContent={getSnippetContent}
@@ -316,7 +272,6 @@ export function SnippetsView() {
                   depth={0}
                   groups={groups}
                   snippets={visibleSnippets}
-                  viewMode={viewMode}
                   selected={selected}
                   collapsed={collapsed}
                   onToggle={toggleCollapse}
@@ -333,7 +288,6 @@ export function SnippetsView() {
               ))}
               <SnippetsList
                 snippets={rootSnippets}
-                viewMode={viewMode}
                 selected={selected}
                 toggleSelect={toggleSelect}
                 getSnippetContent={getSnippetContent}
@@ -406,14 +360,13 @@ function descendantGroupIds(groups: SnippetGroup[], id: string): string[] {
 
 /* ---- Group rendering (recursive) ---- */
 function SnippetGroupNode({
-  group, depth, groups, snippets, viewMode, selected, collapsed, onToggle, toggleSelect, getSnippetContent,
+  group, depth, groups, snippets, selected, collapsed, onToggle, toggleSelect, getSnippetContent,
   onAddSubgroup, onAddSnippet, onEditGroup, onDeleteGroup, onEdit, onRemove, onReorder,
 }: {
   group: SnippetGroup;
   depth: number;
   groups: SnippetGroup[];
   snippets: Snippet[];
-  viewMode: "grid" | "list";
   selected: Set<string>;
   collapsed: Record<string, boolean>;
   onToggle: (id: string) => void;
@@ -486,7 +439,6 @@ function SnippetGroupNode({
               depth={depth + 1}
               groups={groups}
               snippets={snippets}
-              viewMode={viewMode}
               selected={selected}
               collapsed={collapsed}
               onToggle={onToggle}
@@ -504,7 +456,6 @@ function SnippetGroupNode({
           {groupSnippets.length > 0 && (
             <SnippetsList
               snippets={groupSnippets}
-              viewMode={viewMode}
               selected={selected}
               toggleSelect={toggleSelect}
               getSnippetContent={getSnippetContent}
@@ -569,12 +520,10 @@ function SnippetGroupModal({
   );
 }
 
-/* ---- Snippet list (grid/list, reused for root + group nodes) ---- */
 function SnippetsList({
-  snippets, viewMode, selected, toggleSelect, getSnippetContent, onEdit, onRemove, onReorder,
+  snippets, selected, toggleSelect, getSnippetContent, onEdit, onRemove, onReorder,
 }: {
   snippets: Snippet[];
-  viewMode: "grid" | "list";
   selected: Set<string>;
   toggleSelect: (id: string, additive: boolean) => void;
   getSnippetContent: (s: Snippet) => string;
@@ -588,68 +537,6 @@ function SnippetsList({
   );
 
   if (snippets.length === 0) return null;
-
-  if (viewMode === "grid") {
-    return (
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {snippets.map((s) => {
-          const isSel = selected.has(s.id);
-          const meta = SNIPPET_KIND_META[s.kind || "command"];
-          const KindIcon = meta.icon;
-          return (
-            <div
-              key={s.id}
-              onClick={(e) => toggleSelect(s.id, e.metaKey || e.ctrlKey || e.shiftKey)}
-              className={[
-                "group relative flex cursor-pointer items-center gap-3 rounded-lg border p-3 text-left transition",
-                isSel
-                  ? "border-[var(--color-brand-orange)]/60 bg-[var(--color-brand-orange)]/10"
-                  : "border-border bg-[var(--color-surface)] hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]",
-              ].join(" ")}
-            >
-              <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-white" style={{ backgroundColor: meta.color }}>
-                <KindIcon className="h-5 w-5" />
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
-                <div className="truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
-                {((s.variables && s.variables.length > 0) || s.keyword) && (
-                  <div className="mt-1 flex items-center gap-1">
-                    {s.variables && s.variables.length > 0 && (
-                      <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                        {s.variables.length} var{s.variables.length > 1 ? "s" : ""}
-                      </span>
-                    )}
-                    {s.keyword && (
-                      <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
-                        :{s.keyword}
-                      </span>
-                    )}
-                  </div>
-                )}
-              </div>
-              <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-                <button
-                  title="Edit"
-                  onClick={(e) => { e.stopPropagation(); onEdit(s); }}
-                  className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-                >
-                  <Settings className="h-3.5 w-3.5" />
-                </button>
-                <button
-                  title="Remove"
-                  onClick={(e) => { e.stopPropagation(); onRemove(s.id); }}
-                  className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-[oklch(0.72_0.18_25)]"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    );
-  }
 
   if (!onReorder) {
     return (

@@ -95,6 +95,7 @@ import {
 } from "@/lib/api/terminal";
 
 export function SettingsWindow() {
+  const isMac = platform === "macos";
   const [terminalAppearance, setTerminalAppearance] = useState(loadTerminalAppearance);
   const [selectedThemeId, setSelectedThemeId] = useState(loadAppTheme().id);
   const [mainWindowOpacity, setMainWindowOpacity] = useState(() => {
@@ -135,7 +136,6 @@ export function SettingsWindow() {
   const [sftpHostId, setSftpHostId] = useState("");
   const [sftpRemotePath, setSftpRemotePath] = useState("~/.termifai/sync");
   const [syncableHosts, setSyncableHosts] = useState<Host[]>([]);
-  const [syncSshKeysToggle, setSyncSshKeysToggle] = useState(false);
   const [syncLoading, setSyncLoading] = useState(false);
   const [providerConnecting, setProviderConnecting] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
@@ -191,7 +191,6 @@ export function SettingsWindow() {
     syncGetConfig()
       .then((status) => {
         setSyncStatusState(status);
-        setSyncSshKeysToggle(status.syncSshKeys);
         if (status.backend?.kind === "localDir") setLocalDirPath(status.backend.path);
         if (status.backend?.kind === "sftp") {
           setSftpHostId(status.backend.hostId);
@@ -306,12 +305,12 @@ export function SettingsWindow() {
     try {
       if (syncBackendKind === "localDir") {
         if (!localDirPath.trim()) return;
-        await syncSetConfig({ kind: "localDir", path: localDirPath.trim() }, syncSshKeysToggle);
+        await syncSetConfig({ kind: "localDir", path: localDirPath.trim() }, false);
       } else if (syncBackendKind === "sftp") {
         if (!sftpHostId || !sftpRemotePath.trim()) return;
         await syncSetConfig(
           { kind: "sftp", hostId: sftpHostId, remotePath: sftpRemotePath.trim() },
-          syncSshKeysToggle,
+          false,
         );
         // Mark the chosen host so it shows the sync-server badge in Hosts.
         const host = syncableHosts.find((h) => h.id === sftpHostId);
@@ -321,7 +320,7 @@ export function SettingsWindow() {
       } else {
         setProviderConnecting(true);
         await syncConnectProvider(syncBackendKind === "googleDrive" ? "google" : "dropbox");
-        await syncSetConfig({ kind: syncBackendKind }, syncSshKeysToggle);
+        await syncSetConfig({ kind: syncBackendKind }, false);
       }
       refreshSyncStatus();
       toast.success("Sync backend connected");
@@ -392,12 +391,14 @@ export function SettingsWindow() {
   };
 
   useEffect(() => {
-    const previousBackground = document.body.style.backgroundColor;
-    document.body.style.backgroundColor = "transparent";
-    return () => {
-      document.body.style.backgroundColor = previousBackground;
-    };
-  }, []);
+    if (isMac) {
+      const previousBackground = document.body.style.backgroundColor;
+      document.body.style.backgroundColor = "transparent";
+      return () => {
+        document.body.style.backgroundColor = previousBackground;
+      };
+    }
+  }, [isMac]);
   useEffect(() => {
     const onStorageChanged = (event: StorageEvent) => {
       if (event.key === shortcutsStorageKey) {
@@ -642,7 +643,7 @@ export function SettingsWindow() {
     }
   };
 
-  const isMac = platform === "macos";
+
 
   const renderHotkeyRow = (
     action: HotkeyAction,
@@ -701,7 +702,7 @@ export function SettingsWindow() {
   };
 
   return (
-    <div className={`flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground ${isMac ? "rounded-lg" : ""}`}>
+    <div className={`flex h-full w-full flex-col overflow-hidden bg-background text-foreground ${isMac ? "rounded-lg" : ""}`}>
       <header className="relative flex h-8 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none">
         {/* Drag region covers the full header but excludes button areas */}
         <div className="absolute inset-0" data-tauri-drag-region />
@@ -798,23 +799,25 @@ export function SettingsWindow() {
                   />
                 </div>
 
-                <div className="flex items-start justify-between gap-4 rounded-lg border border-border px-4 py-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm font-medium text-foreground">
-                      Open in Context Menu
+                {platform !== "linux" && (
+                  <div className="flex items-start justify-between gap-4 rounded-lg border border-border px-4 py-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-medium text-foreground">
+                        Open in Context Menu
+                      </div>
+                      <div className="mt-1 text-xs text-muted-foreground leading-relaxed">
+                        {platform === "macos"
+                          ? "Show 'Open in Termifai' in the Finder right-click menu. This toggles the Termifai Finder extension, also manageable in System Settings > General > Login Items & Extensions > File Providers."
+                          : "Add 'Open in Termifai' to your operating system's folder right-click context menu."
+                        }
+                      </div>
                     </div>
-                    <div className="mt-1 text-xs text-muted-foreground leading-relaxed">
-                      {platform === "macos"
-                        ? "Show 'Open in Termifai' in the Finder right-click menu. This toggles the Termifai Finder extension, also manageable in System Settings > General > Login Items & Extensions > File Providers."
-                        : "Add 'Open in Termifai' to your operating system's folder right-click context menu."
-                      }
-                    </div>
+                    <Switch
+                      checked={openInContextMenu}
+                      onCheckedChange={handleOpenInContextMenuChange}
+                    />
                   </div>
-                  <Switch
-                    checked={openInContextMenu}
-                    onCheckedChange={handleOpenInContextMenuChange}
-                  />
-                </div>
+                )}
               </CardContent>
             </Card>
           </TabsContent>
@@ -1380,15 +1383,7 @@ export function SettingsWindow() {
                       </>
                     )}
 
-                    <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <input
-                        type="checkbox"
-                        checked={syncSshKeysToggle}
-                        onChange={(e) => setSyncSshKeysToggle(e.target.checked)}
-                        className="h-3.5 w-3.5 rounded accent-[var(--color-brand-cyan)]"
-                      />
-                      Also sync SSH private keys (stored encrypted, off by default)
-                    </label>
+
                     <Button
                       size="sm"
                       onClick={() => void handleConnectSync()}

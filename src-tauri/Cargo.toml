@@ -3,7 +3,7 @@ members = ["crates/termifai-core", "crates/termifaid"]
 
 [package]
 name = "termifai"
-version = "0.1.0"
+version = "0.9.1"
 description = "A modern terminal emulator"
 authors = ["you"]
 license = "MIT"
@@ -46,6 +46,10 @@ tauri = { version = "2", features = ["macos-private-api"] }
 # keyring v3 ships only a non-persistent mock store unless a platform backend
 # is enabled; apple-native gives us the real macOS Keychain.
 keyring = { version = "3", features = ["apple-native"] }
+# NSProcessInfo activity (App Nap exemption) during hidden --background
+# startup; already in the tree as a tauri dependency, so this pins no new
+# version.
+objc2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
