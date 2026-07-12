@@ -83,6 +83,17 @@ const initialConnectionStatus: ConnectionStatusPayload = {
   message: "Opening TCP connection to SSH server...",
 };
 
+// Reconnect after an unexpected host disconnect: 3 attempts with increasing
+// backoff, then give up and wait for the user to reconnect manually.
+const RECONNECT_DELAYS_SEC = [2, 4, 8];
+const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_SEC.length;
+
+interface ReconnectState {
+  phase: "waiting" | "connecting" | "failed";
+  attempt: number;
+  countdown: number;
+}
+
 function EnumDropdown({
   options,
   value,
@@ -172,6 +183,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
   const [connectionLogs, setConnectionLogs] = useState<string[]>([]);
   const [showConnectionLogs, setShowConnectionLogs] = useState(false);
+  const [reconnectState, setReconnectState] = useState<ReconnectState | null>(null);
   const [snippetPalette, setSnippetPalette] = useState(false);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
   const [snippetGroups, setSnippetGroups] = useState<SnippetGroup[]>([]);
@@ -204,6 +216,97 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const mountCountRef = useRef(0);
   const notifiedSessionRef = useRef<string | null>(sessionId ?? null);
   const appearanceRequestRef = useRef(0);
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const clearReconnectTimers = () => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    if (reconnectIntervalRef.current) {
+      clearInterval(reconnectIntervalRef.current);
+      reconnectIntervalRef.current = null;
+    }
+  };
+
+  // Called whenever the PTY session ends unexpectedly. For SSH tabs (hostId
+  // present) this kicks off the auto-reconnect flow; local shells just get
+  // the old "press any key" message since there's no host to reconnect to.
+  const handleDisconnect = () => {
+    if (!hostId) {
+      termRef.current?.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
+      return;
+    }
+    termRef.current?.write("\r\n\x1b[38;2;255;99;99m[Connection to host lost.]\x1b[0m\r\n");
+    reconnectAttemptRef.current = 0;
+    scheduleReconnectAttempt();
+  };
+
+  const scheduleReconnectAttempt = () => {
+    const attempt = reconnectAttemptRef.current + 1;
+    reconnectAttemptRef.current = attempt;
+    if (attempt > MAX_RECONNECT_ATTEMPTS) {
+      clearReconnectTimers();
+      setReconnectState({ phase: "failed", attempt: MAX_RECONNECT_ATTEMPTS, countdown: 0 });
+      return;
+    }
+
+    const delay = RECONNECT_DELAYS_SEC[attempt - 1];
+    let remaining = delay;
+    setReconnectState({ phase: "waiting", attempt, countdown: remaining });
+
+    clearReconnectTimers();
+    reconnectIntervalRef.current = setInterval(() => {
+      remaining -= 1;
+      setReconnectState((s) => (s && s.phase === "waiting" ? { ...s, countdown: Math.max(remaining, 0) } : s));
+    }, 1000);
+    reconnectTimeoutRef.current = setTimeout(() => {
+      void performReconnect(attempt);
+    }, delay * 1000);
+  };
+
+  const performReconnect = async (attempt: number) => {
+    clearReconnectTimers();
+    setReconnectState({ phase: "connecting", attempt, countdown: 0 });
+    try {
+      const info = await createSession({
+        cwd: cwd ?? "",
+        initialCommand: initialCommand ?? null,
+        hostId: hostId ?? null,
+        readyMarker: readyMarker ?? null,
+      });
+      sessionRef.current = info.id;
+
+      unlistenOutputRef.current?.();
+      unlistenExitRef.current?.();
+      unlistenOutputRef.current = await onSessionOutput(info.id, (chunk) => {
+        termRef.current?.write(chunk);
+      });
+      unlistenExitRef.current = await onSessionExited(info.id, () => {
+        handleDisconnect();
+      });
+
+      const term = termRef.current;
+      if (term?.cols && term?.rows) {
+        await resizeSession(info.id, term.cols, term.rows);
+      }
+
+      reconnectAttemptRef.current = 0;
+      setReconnectState(null);
+      term?.write("\r\n\x1b[38;2;120;220;140m[Reconnected.]\x1b[0m\r\n");
+    } catch {
+      scheduleReconnectAttempt();
+    }
+  };
+
+  // Manual reconnect from the "failed" screen, or a manual retry at any point.
+  const manualReconnect = () => {
+    clearReconnectTimers();
+    reconnectAttemptRef.current = 0;
+    void performReconnect(1).catch(() => {});
+  };
 
   const loadSnippets = useCallback(() => {
     return listSnippets().then((data) => {
@@ -508,7 +611,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         // Listen for shell exit
         unlistenExitRef.current = await onSessionExited(sid, () => {
           if (!readyMarker) setIsConnecting(false);
-          term.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
+          handleDisconnect();
         });
 
         // Do an initial fit + resize notification to backend
@@ -540,6 +643,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         return;
       }
       destroyed = true;
+      clearReconnectTimers();
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
       window.removeEventListener(appThemeChangedEvent, onAppThemeChanged);
@@ -812,6 +916,49 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
           </div>
         </div>
       )}
+      {!isConnecting && reconnectState && (reconnectState.phase === "waiting" || reconnectState.phase === "connecting") && (
+        <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-3 border-b border-border bg-[var(--color-surface)]/95 px-4 py-2 text-xs backdrop-blur">
+          <div className="flex items-center gap-2">
+            <div className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-muted-foreground border-t-red-400" />
+            <span className="font-medium text-foreground">
+              {reconnectState.phase === "connecting"
+                ? `Reconnecting… (attempt ${reconnectState.attempt} of ${MAX_RECONNECT_ATTEMPTS})`
+                : `Connection lost — retrying (${reconnectState.attempt}/${MAX_RECONNECT_ATTEMPTS}) in ${reconnectState.countdown}s`}
+            </span>
+          </div>
+          {reconnectState.phase === "waiting" && (
+            <button
+              type="button"
+              onClick={() => { clearReconnectTimers(); void performReconnect(reconnectState.attempt); }}
+              className="shrink-0 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-semibold text-foreground hover:bg-[var(--color-surface)]"
+            >
+              Retry now
+            </button>
+          )}
+        </div>
+      )}
+
+      {!isConnecting && reconnectState?.phase === "failed" && (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-background/95 px-4 text-center backdrop-blur">
+          <div className="w-full max-w-sm">
+            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-red-500/15 text-red-400">
+              <span className="text-2xl">⚠</span>
+            </div>
+            <h3 className="text-base font-bold text-foreground">Connection lost</h3>
+            <p className="mt-1.5 text-sm text-muted-foreground">
+              Couldn&apos;t reconnect after {MAX_RECONNECT_ATTEMPTS} attempts. Your terminal history is preserved.
+            </p>
+            <button
+              type="button"
+              onClick={manualReconnect}
+              className="mt-5 h-9 w-full rounded-md bg-[var(--color-brand-orange,oklch(0.75_0.15_55))] text-sm font-semibold text-white hover:opacity-90"
+            >
+              Connect
+            </button>
+          </div>
+        </div>
+      )}
+
       <div
         ref={ref}
         className="xterm-wrapper h-full w-full pl-1 pt-1"
