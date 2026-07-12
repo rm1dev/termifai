@@ -14,6 +14,17 @@ To build and run Termifai locally, you need the following dependencies installed
 - **Node.js/npm**: Required implicitly for some ecosystem tools.
 - **Tauri v2 dependencies**: Refer to the [Tauri v2 installation guide](https://v2.tauri.app/start/prerequisites/) for your operating system (specifically OS libraries like `webkit2gtk` on Linux).
 
+### One-Time Setup: OAuth Secrets Stub
+
+The sync module includes `oauth_secrets.rs` at compile time, and that file is gitignored — a fresh clone will not compile until you create it from the template:
+
+```bash
+cp src-tauri/crates/termifai-core/src/sync/oauth_secrets.example.rs \
+   src-tauri/crates/termifai-core/src/sync/oauth_secrets.rs
+```
+
+The placeholder values are fine for development. Fill in real OAuth client IDs (instructions inside the file) only if you need to test Google Drive / Dropbox sync; local-folder sync works with the placeholders.
+
 ### Running Locally
 
 To start the React frontend dev server and native Tauri desktop shell with hot-reload enabled:
