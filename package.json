@@ -11,7 +11,7 @@
     "build:tauri": "bash scripts/build-termifaid.sh && tauri build",
     "build:linux:docker": "bash scripts/build-linux.sh",
     "build:windows": "bash scripts/build-termifaid.sh x86_64-pc-windows-gnu && tauri build --target x86_64-pc-windows-gnu --bundles nsis",
-    "build:windows:docker": "bash scripts/build-windows.sh"
+    "build:windows:arm": "bash scripts/build-termifaid.sh aarch64-pc-windows-msvc && tauri build --target aarch64-pc-windows-msvc --bundles nsis"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",
