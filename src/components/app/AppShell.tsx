@@ -108,7 +108,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
   };
   const openFolderTab = (folderPath: string) => {
     const id = `t-terminal-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const title = folderPath.split("/").filter(Boolean).pop() || folderPath;
+    const title = folderPath.split(/[/\\]/).filter(Boolean).pop() || folderPath;
     setTabs((t) => [...t, { id, kind: "terminal", title, closable: true, cwd: folderPath }]);
     setActiveTab(id);
   };
@@ -827,10 +827,10 @@ const BaseTabChip = forwardRef<HTMLDivElement, BaseTabChipProps>(function BaseTa
         }
       }}
       className={[
-        "group relative flex h-9 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs font-medium outline-none",
+        "group relative flex h-9 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs font-medium outline-none border-t-2 transition-all",
         active
-          ? "bg-[var(--color-tab-active)] text-foreground"
-          : "bg-[var(--color-tab-inactive)] text-muted-foreground hover:text-foreground",
+          ? "bg-[var(--color-tab-active)] text-foreground border-primary"
+          : "bg-[var(--color-tab-inactive)] text-muted-foreground hover:text-foreground border-transparent",
       ].join(" ")}
     >
       {icon}
@@ -966,7 +966,7 @@ function Sidebar({
         })}
       </nav>
       <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground text-center truncate">
-        {isCurrentlyCollapsed ? "v0.1" : "v0.1 · Termifai"}
+        {isCurrentlyCollapsed ? "v0.9.1" : "v0.9.1 · Termifai"}
       </div>
     </aside>
   );

@@ -239,6 +239,7 @@
   }
   html, body, #root {
     height: 100%;
+    width: 100%;
   }
   html {
     overscroll-behavior: none;
@@ -379,7 +380,7 @@
   --sidebar: color-mix(in oklab, var(--qt-solid-sidebar) calc(var(--qt-alpha, 1) * 100%), transparent);
   --card: color-mix(in oklab, var(--qt-solid-card) calc(var(--qt-alpha, 1) * 100%), transparent);
   --tab-active: color-mix(in oklab, var(--qt-solid-tab-active) calc(var(--qt-alpha, 1) * 100%), transparent);
-  --tab-inactive: color-mix(in oklab, var(--qt-solid-tab-inactive) calc(var(--qt-alpha, 1) * 100%), transparent);
+  --tab-inactive: color-mix(in oklab, var(--qt-solid-tab-inactive) calc(var(--qt-alpha, 1) * 50%), transparent);
 
   --color-background: var(--background);
   --color-surface: var(--surface);
