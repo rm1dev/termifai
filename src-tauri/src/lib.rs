@@ -192,6 +192,13 @@ fn windows_supports_smooth_effects() -> bool {
     }
 }
 
+/// WebView2 launch args for release builds on Windows: Tauri's defaults
+/// (which `additional_browser_args` replaces, so they must be repeated)
+/// plus `--disable-dev-tools`, so F12/Ctrl+Shift+I can't open DevTools.
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+const WEBVIEW2_RELEASE_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-dev-tools";
+
 /// Builds the "main" webview window. Used both at startup and to recreate
 /// the window if a second launch is forwarded after the user fully closed
 /// it (possible when the "run in background" setting is off).
@@ -220,6 +227,11 @@ fn build_main_window(
     #[cfg(not(target_os = "macos"))]
     {
         main_builder = main_builder.decorations(false);
+    }
+
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        main_builder = main_builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
     }
 
     main_builder.build()
@@ -251,6 +263,11 @@ fn new_window(app: tauri::AppHandle) -> Result<(), String> {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             builder = builder.decorations(false);
+        }
+
+        #[cfg(all(target_os = "windows", not(debug_assertions)))]
+        {
+            builder = builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
         }
 
         let _ = builder.build();
@@ -2531,7 +2548,8 @@ pub fn run() {
             // Create the settings window hidden at startup — creating it dynamically after
             // the event loop starts deadlocks on Windows because WebView2 initialization
             // requires the event loop to be free.
-            WebviewWindowBuilder::new(
+            #[allow(unused_mut)]
+            let mut settings_builder = WebviewWindowBuilder::new(
                 app,
                 "settings",
                 WebviewUrl::App("index.html?window=settings".into()),
@@ -2545,8 +2563,12 @@ pub fn run() {
             .shadow(false)
             .minimizable(false)
             .maximizable(false)
-            .visible(false)
-            .build()?;
+            .visible(false);
+            #[cfg(all(target_os = "windows", not(debug_assertions)))]
+            {
+                settings_builder = settings_builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
+            }
+            settings_builder.build()?;
 
             // Quick Terminal panel — same create-hidden-at-startup pattern as the
             // settings window (dynamic creation deadlocks WebView2 on Windows).
@@ -2573,6 +2595,10 @@ pub fn run() {
             // what the user sees sliding in is the panel div inside the webview.
             .transparent(true)
             .shadow(false);
+            #[cfg(all(target_os = "windows", not(debug_assertions)))]
+            {
+                qt_builder = qt_builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
+            }
             // Native backdrop blur for the glass look: the first effect the
             // platform supports is applied (HudWindow → macOS vibrancy,
             // Acrylic/Blur → Windows; no-op on Linux). Only visible where the

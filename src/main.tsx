@@ -42,6 +42,13 @@ window.addEventListener("wheel", (e) => {
 window.addEventListener("gesturestart", (e) => e.preventDefault());
 window.addEventListener("gesturechange", (e) => e.preventDefault());
 
+// Suppress the native webview context menu (Reload/Inspect) in release builds.
+// Custom in-app context menus still work: they handle the event on their own
+// targets before this window-level listener runs.
+if (import.meta.env.PROD) {
+  window.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+
 const params = new URLSearchParams(window.location.search);
 const windowKind = params.get("window");
 

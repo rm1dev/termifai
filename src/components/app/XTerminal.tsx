@@ -32,12 +32,16 @@ import {
   type AppTheme,
 } from "@/lib/app-theme";
 import {
+  formatShortcut,
   isShortcutMatch,
   loadShortcuts,
   shortcutsChangedEvent,
   shortcutsStorageKey,
+  type ShortcutBinding,
   type ShortcutMap,
 } from "@/lib/shortcuts";
+import { platform } from "@/lib/platform";
+import * as ContextMenu from "@radix-ui/react-context-menu";
 import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
 import { Search } from "lucide-react";
 
@@ -92,6 +96,14 @@ interface ReconnectState {
   phase: "waiting" | "connecting" | "failed";
   attempt: number;
   countdown: number;
+}
+
+const menuItemCls =
+  "flex cursor-pointer select-none items-center gap-2 rounded px-2.5 py-1.5 text-xs text-foreground outline-none data-[highlighted]:bg-[var(--color-surface-2)] data-[disabled]:pointer-events-none data-[disabled]:opacity-40";
+
+function MenuShortcut({ binding }: { binding?: ShortcutBinding }) {
+  if (!binding) return null;
+  return <span className="text-[10px] text-muted-foreground">{formatShortcut(binding)}</span>;
 }
 
 function EnumDropdown({
@@ -190,6 +202,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [snippetQuery, setSnippetQuery] = useState("");
   const [snippetIndex, setSnippetIndex] = useState(0);
   const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
+  // Drives the enabled state of "Copy" in the terminal context menu.
+  const [hasSelection, setHasSelection] = useState(false);
   // Resolved once per mount: local terminal tabs have no hostId, so `isLocal`
   // is true; SSH tabs look up the host's OS to gate OS-restricted snippets.
   const osContextRef = useRef<{ isLocal: boolean; hostOs?: OsKind }>({ isLocal: !hostId });
@@ -307,6 +321,46 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     reconnectAttemptRef.current = 0;
     void performReconnect(1).catch(() => {});
   };
+
+  // ── Terminal clipboard actions (context menu + Windows right-click) ───────
+  const copySelection = useCallback(() => {
+    const term = termRef.current;
+    const selection = term?.getSelection();
+    if (term && selection) {
+      navigator.clipboard.writeText(selection).catch(() => {});
+      term.clearSelection();
+    }
+  }, []);
+
+  const pasteClipboard = useCallback(() => {
+    const sid = sessionRef.current;
+    if (!sid) return;
+    navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (text) writeToSession(sid, text).catch(() => {});
+      })
+      .catch(() => {});
+  }, []);
+
+  const refocusTerminal = useCallback(() => {
+    setTimeout(() => termRef.current?.focus(), 50);
+  }, []);
+
+  // Windows terminal convention (VS Code / Windows Terminal default): right
+  // click never shows a menu — it copies the selection if there is one,
+  // otherwise pastes. macOS/Linux get a context menu instead (see render).
+  const handleWindowsRightClick = useCallback(
+    (event: React.MouseEvent) => {
+      event.preventDefault();
+      if (termRef.current?.hasSelection()) {
+        copySelection();
+      } else {
+        pasteClipboard();
+      }
+    },
+    [copySelection, pasteClipboard]
+  );
 
   const loadSnippets = useCallback(() => {
     return listSnippets().then((data) => {
@@ -561,6 +615,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       }
     });
 
+    const selectionDisp = term.onSelectionChange(() => {
+      setHasSelection(term.hasSelection());
+    });
+
     // Notify backend on resize
     const resizeDisp = term.onResize(({ cols, rows }) => {
       const sid = sessionRef.current;
@@ -646,6 +704,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         destroyed = true;
         ro.disconnect();
         dataDisp.dispose();
+        selectionDisp.dispose();
         resizeDisp.dispose();
         isInitializedRef.current = false;
         return;
@@ -661,6 +720,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       unlistenAppearance?.();
       ro.disconnect();
       dataDisp.dispose();
+      selectionDisp.dispose();
       resizeDisp.dispose();
       unlistenOutputRef.current?.();
       unlistenExitRef.current?.();
@@ -981,11 +1041,50 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         </div>
       )}
 
-      <div
-        ref={ref}
-        className="xterm-wrapper h-full w-full pl-1 pt-1"
-        style={{ visibility: isConnecting ? "hidden" : "visible" }}
-      />
+      {platform === "windows" ? (
+        <div
+          ref={ref}
+          className="xterm-wrapper h-full w-full pl-1 pt-1"
+          style={{ visibility: isConnecting ? "hidden" : "visible" }}
+          onContextMenu={handleWindowsRightClick}
+        />
+      ) : (
+        <ContextMenu.Root>
+          <ContextMenu.Trigger asChild>
+            <div
+              ref={ref}
+              className="xterm-wrapper h-full w-full pl-1 pt-1"
+              style={{ visibility: isConnecting ? "hidden" : "visible" }}
+            />
+          </ContextMenu.Trigger>
+          <ContextMenu.Portal>
+            <ContextMenu.Content
+              className="z-50 min-w-[180px] overflow-hidden rounded-lg border border-border bg-popover p-1 shadow-xl"
+              onCloseAutoFocus={(e) => {
+                e.preventDefault();
+                refocusTerminal();
+              }}
+            >
+              <ContextMenu.Item className={menuItemCls} disabled={!hasSelection} onSelect={copySelection}>
+                <span className="flex-1">Copy</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["terminal-copy"]} />
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItemCls} onSelect={pasteClipboard}>
+                <span className="flex-1">Paste</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["terminal-paste"]} />
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItemCls} onSelect={() => termRef.current?.selectAll()}>
+                <span className="flex-1">Select All</span>
+              </ContextMenu.Item>
+              <ContextMenu.Separator className="my-1 h-px bg-border" />
+              <ContextMenu.Item className={menuItemCls} onSelect={() => termRef.current?.clear()}>
+                <span className="flex-1">Clear</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["clear-terminal"]} />
+              </ContextMenu.Item>
+            </ContextMenu.Content>
+          </ContextMenu.Portal>
+        </ContextMenu.Root>
+      )}
 
       {/* Snippet Palette */}
       {snippetPalette && (
