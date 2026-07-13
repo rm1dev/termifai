@@ -440,7 +440,15 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       return true;
     });
 
+    // Tabs are never unmounted, just toggled with display:none (see
+    // AppShell). A hidden container reports clientWidth/Height 0, and
+    // fitting against that shrinks the terminal to bogus cols/rows — which
+    // then gets pushed to the backend PTY via onResize below, corrupting
+    // how already-written lines reflow once the tab is shown again. Skip
+    // fitting whenever the container has no real layout box yet.
     const safeFit = () => {
+      const el = ref.current;
+      if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
       try {
         fit.fit();
       } catch {
@@ -694,24 +702,38 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     }
   }, [onSessionCreated]);
 
+  // A single requestAnimationFrame after a tab's container flips from
+  // display:none to visible isn't reliably enough time for layout to land
+  // on slower machines (seen on Intel Macs) — fitting too early measures a
+  // stale/zero-size box and corrupts how the terminal reflows. Poll across
+  // frames until the container actually has a size, capped so we don't spin
+  // forever if it's legitimately hidden.
+  const fitWhenLaidOut = useCallback((onDone?: () => void) => {
+    let attempts = 0;
+    const tick = () => {
+      const el = ref.current;
+      if (el && el.clientWidth > 0 && el.clientHeight > 0) {
+        fitAddonRef.current?.fit();
+        onDone?.();
+        return;
+      }
+      if (++attempts < 20) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }, []);
+
   // Re-fit and focus when this tab becomes active
   useEffect(() => {
     if (!isActive || isConnecting) return;
-    requestAnimationFrame(() => {
-      fitAddonRef.current?.fit();
-      requestAnimationFrame(() => termRef.current?.focus());
-    });
-  }, [isActive, isConnecting]);
+    fitWhenLaidOut(() => requestAnimationFrame(() => termRef.current?.focus()));
+  }, [isActive, isConnecting, fitWhenLaidOut]);
 
   // Focus terminal when connection overlay is dismissed
   useEffect(() => {
     if (!isConnecting && termRef.current) {
-      requestAnimationFrame(() => {
-        fitAddonRef.current?.fit();
-        requestAnimationFrame(() => termRef.current?.focus());
-      });
+      fitWhenLaidOut(() => requestAnimationFrame(() => termRef.current?.focus()));
     }
-  }, [isConnecting]);
+  }, [isConnecting, fitWhenLaidOut]);
 
   // ── Snippet Palette Logic ──────────────────────────────────────────────────
 
