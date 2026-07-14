@@ -41,10 +41,10 @@ const TabsContent = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <TabsPrimitive.Content
     ref={ref}
-    className={cn(
-      "mt-2 ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
-      className,
-    )}
+    // The panel itself must not draw a focus ring: Radix makes it focusable
+    // (tabIndex=0), so clicking anywhere in the content area focuses it and
+    // the next keypress would outline the whole panel.
+    className={cn("mt-2 outline-none", className)}
     {...props}
   />
 ));
