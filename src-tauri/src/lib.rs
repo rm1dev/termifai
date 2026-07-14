@@ -85,10 +85,13 @@ struct AppState {
 fn create_session(
     app: tauri::AppHandle,
     state: State<AppState>,
+    session_id: String,
     cwd: String,
     initial_command: Option<String>,
     host_id: Option<String>,
     ready_marker: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
 ) -> Result<TabInfo, String> {
     let password = if let Some(ref h_id) = host_id {
         let vault = hosts::list_hosts(&app)?;
@@ -105,11 +108,14 @@ fn create_session(
     let manager = state.pty_manager.lock().unwrap();
     manager.create_session(
         &app,
+        &session_id,
         &cwd,
         initial_command.as_deref(),
         password.as_deref(),
         ready_marker.as_deref(),
         host_id.as_deref(),
+        cols.unwrap_or(80),
+        rows.unwrap_or(24),
     )
 }
 
