@@ -22,6 +22,16 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
   clampTerminalFontSize,
   clampTerminalLineHeight,
   getTerminalAppearanceUpdatedAt,
@@ -562,7 +572,35 @@ export function SettingsWindow() {
     saveShortcuts(nextShortcuts);
   };
 
+  // Global hotkeys are served by the background service, which dies together
+  // with the app when neither "Run in Background" nor "Run at Startup" is on.
+  // Warn when a hotkey is being enabled in that state and offer to flip the
+  // two General-tab switches right away. Advisory only — declining still
+  // enables the hotkey. Rendered with the app's own AlertDialog; the resolver
+  // held in state keeps the caller's async flow suspended until a choice is
+  // made.
+  const [backgroundPromptResolve, setBackgroundPromptResolve] = useState<
+    ((enableNow: boolean) => void) | null
+  >(null);
+
+  const offerBackgroundOptionsForHotkeys = () => {
+    if (runInBackground && autostartEnabled) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      setBackgroundPromptResolve(() => (enableNow: boolean) => {
+        setBackgroundPromptResolve(null);
+        if (enableNow) {
+          if (!runInBackground) handleRunInBackgroundChange(true);
+          if (!autostartEnabled) handleAutostartChange(true);
+        }
+        resolve();
+      });
+    });
+  };
+
   const applyHotkey = async (action: HotkeyAction, next: GlobalHotkeySettings) => {
+    if (next.enabled && !hotkeys[action].enabled) {
+      await offerBackgroundOptionsForHotkeys();
+    }
     setHotkeyErrors((errors) => ({ ...errors, [action]: undefined }));
     setHotkeyBusy(true);
     try {
@@ -603,6 +641,9 @@ export function SettingsWindow() {
         { title: "Quick Terminal on Wayland", kind: "warning" },
       );
       if (!confirmed) return;
+    }
+    if (enabled) {
+      await offerBackgroundOptionsForHotkeys();
     }
     setHotkeyErrors((errors) => ({ ...errors, "quick-terminal": undefined }));
     setHotkeyBusy(true);
@@ -1474,6 +1515,32 @@ export function SettingsWindow() {
           </TabsContent>
         </Tabs>
       </main>
+
+      <AlertDialog
+        open={backgroundPromptResolve !== null}
+        onOpenChange={(open) => {
+          if (!open) backgroundPromptResolve?.(false);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Keep hotkeys working in the background?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Global hotkeys stop working once the app is closed unless it keeps running in
+              the background. It&apos;s best to enable “Run at Startup” and “Run in
+              Background” in the General tab. Enable them now?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => backgroundPromptResolve?.(false)}>
+              Not now
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={() => backgroundPromptResolve?.(true)}>
+              Enable now
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
