@@ -85,10 +85,13 @@ struct AppState {
 fn create_session(
     app: tauri::AppHandle,
     state: State<AppState>,
+    session_id: String,
     cwd: String,
     initial_command: Option<String>,
     host_id: Option<String>,
     ready_marker: Option<String>,
+    cols: Option<u16>,
+    rows: Option<u16>,
 ) -> Result<TabInfo, String> {
     let password = if let Some(ref h_id) = host_id {
         let vault = hosts::list_hosts(&app)?;
@@ -105,11 +108,14 @@ fn create_session(
     let manager = state.pty_manager.lock().unwrap();
     manager.create_session(
         &app,
+        &session_id,
         &cwd,
         initial_command.as_deref(),
         password.as_deref(),
         ready_marker.as_deref(),
         host_id.as_deref(),
+        cols.unwrap_or(80),
+        rows.unwrap_or(24),
     )
 }
 
@@ -139,6 +145,65 @@ fn close_session(state: State<AppState>, session_id: String) -> Result<(), Strin
     let manager = state.pty_manager.lock().unwrap();
     manager.close_session(&session_id)
 }
+
+/// Reports whether native DWM window effects (Acrylic/Blur/HudWindow) should
+/// be applied on this Windows install. Windows 10's compositor recomputes
+/// the blur-behind region on every frame while a transparent, undecorated
+/// window is being dragged/resized — this is visibly janky there but cheap
+/// on Windows 11's compositor. Rather than risk that stutter (and the
+/// two-tone seam between the native blur layer and the app's own CSS
+/// transparency it can produce while content resizes), skip the effects
+/// entirely below the Windows 11 build number (22000) and fall back to the
+/// app's CSS-only transparency.
+#[cfg(target_os = "windows")]
+fn windows_supports_smooth_effects() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
+    };
+
+    unsafe {
+        let subkey: Vec<u16> = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\0"
+            .encode_utf16()
+            .collect();
+        let mut hkey = std::ptr::null_mut();
+        if RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut hkey) != 0 {
+            return true;
+        }
+
+        let value_name: Vec<u16> = "CurrentBuildNumber\0".encode_utf16().collect();
+        let mut buf = [0u16; 32];
+        let mut buf_len = (buf.len() * 2) as u32;
+        let mut value_type = 0u32;
+        let ok = RegQueryValueExW(
+            hkey,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut value_type,
+            buf.as_mut_ptr() as *mut u8,
+            &mut buf_len,
+        ) == 0
+            && value_type == REG_SZ;
+        RegCloseKey(hkey);
+
+        if !ok {
+            return true;
+        }
+
+        let len = (buf_len as usize / 2).saturating_sub(1).min(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+            .trim()
+            .parse::<u32>()
+            .map(|build| build >= 22000)
+            .unwrap_or(true)
+    }
+}
+
+/// WebView2 launch args for release builds on Windows: Tauri's defaults
+/// (which `additional_browser_args` replaces, so they must be repeated)
+/// plus `--disable-dev-tools`, so F12/Ctrl+Shift+I can't open DevTools.
+#[cfg(all(target_os = "windows", not(debug_assertions)))]
+const WEBVIEW2_RELEASE_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-dev-tools";
 
 /// Builds the "main" webview window. Used both at startup and to recreate
 /// the window if a second launch is forwarded after the user fully closed
@@ -170,6 +235,11 @@ fn build_main_window(
         main_builder = main_builder.decorations(false);
     }
 
+    #[cfg(all(target_os = "windows", not(debug_assertions)))]
+    {
+        main_builder = main_builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
+    }
+
     main_builder.build()
 }
 
@@ -199,6 +269,11 @@ fn new_window(app: tauri::AppHandle) -> Result<(), String> {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             builder = builder.decorations(false);
+        }
+
+        #[cfg(all(target_os = "windows", not(debug_assertions)))]
+        {
+            builder = builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
         }
 
         let _ = builder.build();
@@ -2479,7 +2554,8 @@ pub fn run() {
             // Create the settings window hidden at startup — creating it dynamically after
             // the event loop starts deadlocks on Windows because WebView2 initialization
             // requires the event loop to be free.
-            WebviewWindowBuilder::new(
+            #[allow(unused_mut)]
+            let mut settings_builder = WebviewWindowBuilder::new(
                 app,
                 "settings",
                 WebviewUrl::App("index.html?window=settings".into()),
@@ -2493,14 +2569,23 @@ pub fn run() {
             .shadow(false)
             .minimizable(false)
             .maximizable(false)
-            .visible(false)
-            .build()?;
+            .visible(false);
+            #[cfg(all(target_os = "windows", not(debug_assertions)))]
+            {
+                settings_builder = settings_builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
+            }
+            settings_builder.build()?;
 
             // Quick Terminal panel — same create-hidden-at-startup pattern as the
             // settings window (dynamic creation deadlocks WebView2 on Windows).
             // Not draggable (no drag region in its HTML) and not natively
             // resizable: sizing happens only via the in-panel drag handle.
-            WebviewWindowBuilder::new(
+            #[cfg(target_os = "windows")]
+            let apply_native_effects = windows_supports_smooth_effects();
+            #[cfg(not(target_os = "windows"))]
+            let apply_native_effects = true;
+
+            let mut qt_builder = WebviewWindowBuilder::new(
                 app,
                 quick_terminal::WINDOW_LABEL,
                 WebviewUrl::App("index.html?window=quick-terminal".into()),
@@ -2515,36 +2600,47 @@ pub fn run() {
             // Transparent + shadowless so the native window itself is invisible:
             // what the user sees sliding in is the panel div inside the webview.
             .transparent(true)
-            .shadow(false)
+            .shadow(false);
+            #[cfg(all(target_os = "windows", not(debug_assertions)))]
+            {
+                qt_builder = qt_builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
+            }
             // Native backdrop blur for the glass look: the first effect the
             // platform supports is applied (HudWindow → macOS vibrancy,
             // Acrylic/Blur → Windows; no-op on Linux). Only visible where the
             // frontend makes its backgrounds translucent (panel transparency
-            // setting below 100%).
-            .effects(
-                tauri::window::EffectsBuilder::new()
-                    .effect(tauri::window::Effect::HudWindow)
-                    .effect(tauri::window::Effect::Acrylic)
-                    .effect(tauri::window::Effect::Blur)
-                    // Pin the effect to its active look — by default macOS
-                    // vibrancy follows window focus and dims when the panel
-                    // loses key status, which reads as the panel "darkening".
-                    .state(tauri::window::EffectState::Active)
-                    .build(),
-            )
-            .visible(false)
-            .build()?;
-
-            let app_handle = app.handle().clone();
-            if let Some(main_win) = app.get_webview_window("main") {
-                let _ = main_win.set_effects(
+            // setting below 100%). Skipped on Windows 10 and below — DWM
+            // there recomputes the blur-behind region every frame while the
+            // window is dragged/resized, which is janky, and can desync from
+            // the app's own CSS transparency as content resizes, producing a
+            // visible seam. The app's CSS-only transparency is used instead.
+            if apply_native_effects {
+                qt_builder = qt_builder.effects(
                     tauri::window::EffectsBuilder::new()
                         .effect(tauri::window::Effect::HudWindow)
                         .effect(tauri::window::Effect::Acrylic)
                         .effect(tauri::window::Effect::Blur)
+                        // Pin the effect to its active look — by default macOS
+                        // vibrancy follows window focus and dims when the panel
+                        // loses key status, which reads as the panel "darkening".
                         .state(tauri::window::EffectState::Active)
                         .build(),
                 );
+            }
+            qt_builder.visible(false).build()?;
+
+            let app_handle = app.handle().clone();
+            if let Some(main_win) = app.get_webview_window("main") {
+                if apply_native_effects {
+                    let _ = main_win.set_effects(
+                        tauri::window::EffectsBuilder::new()
+                            .effect(tauri::window::Effect::HudWindow)
+                            .effect(tauri::window::Effect::Acrylic)
+                            .effect(tauri::window::Effect::Blur)
+                            .state(tauri::window::EffectState::Active)
+                            .build(),
+                    );
+                }
 
                 main_win.on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { .. } = event {
