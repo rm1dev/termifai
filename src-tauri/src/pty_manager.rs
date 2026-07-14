@@ -43,17 +43,20 @@ impl PtyManager {
     pub fn create_session(
         &self,
         app: &AppHandle,
+        session_id: &str,
         cwd: &str,
         initial_command: Option<&str>,
         initial_password: Option<&str>,
         ready_marker: Option<&str>,
         host_id: Option<&str>,
+        cols: u16,
+        rows: u16,
     ) -> Result<TabInfo, String> {
         let pty_system = native_pty_system();
 
         let size = PtySize {
-            rows: 24,
-            cols: 80,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         };
@@ -81,7 +84,7 @@ impl PtyManager {
             .spawn_command(cmd)
             .map_err(|e| format!("Failed to spawn shell: {}", e))?;
 
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = session_id.to_string();
         let seq = COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
         let label = format!("Terminal {}", seq);
 
@@ -163,6 +166,7 @@ impl PtyManager {
             let mut password_sent = false;
             let mut ready = ready_marker.is_none();
             let mut pending_output = String::new();
+            let mut leftover: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
@@ -179,14 +183,31 @@ impl PtyManager {
                         break;
                     }
                     Ok(n) => {
-                        let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                        leftover.extend_from_slice(&buf[..n]);
+                        let data = match std::str::from_utf8(&leftover) {
+                            Ok(s) => {
+                                let s = s.to_string();
+                                leftover.clear();
+                                s
+                            }
+                            Err(e) => {
+                                let valid_up_to = e.valid_up_to();
+                                let s =
+                                    String::from_utf8_lossy(&leftover[..valid_up_to]).to_string();
+                                let rest = leftover[valid_up_to..].to_vec();
+                                // A genuine truncated UTF-8 sequence is at most 3 trailing
+                                // bytes; anything longer is malformed input, not a split
+                                // multi-byte char, so don't hold onto it indefinitely.
+                                leftover = if rest.len() <= 3 { rest } else { Vec::new() };
+                                s
+                            }
+                        };
                         if !ready {
                             connection_tracker.handle_output(&data, ready_marker.as_deref());
                         }
                         if !password_sent && !ready {
                             if let Some(password) = password_for_prompt.as_deref() {
-                                recent_output
-                                    .push_str(&String::from_utf8_lossy(&buf[..n]).to_lowercase());
+                                recent_output.push_str(&data.to_lowercase());
                                 if recent_output.len() > 2048 {
                                     let keep_from = recent_output.len().saturating_sub(2048);
                                     recent_output = recent_output[keep_from..].to_string();

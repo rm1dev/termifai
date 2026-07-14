@@ -101,8 +101,16 @@ pub fn connect(cfg: &SshConfig, on_stage: impl Fn(&str, &str)) -> Result<Session
         Some(e) => SshError::Tcp(e.to_string()),
         None => SshError::Tcp(format!("Could not resolve {addr}")),
     })?;
-    tcp.set_read_timeout(Some(Duration::from_secs(15))).ok();
-    tcp.set_write_timeout(Some(Duration::from_secs(15))).ok();
+    // This timeout bounds a single blocking read()/write() on the socket, not
+    // the whole operation — but it's set on the session's TCP stream for its
+    // entire lifetime, which SFTP reuses for uploads/downloads/directory
+    // listings that can run far longer than a handshake. 15s was tight enough
+    // to fail large transfers or slow links ("Timed out waiting on socket")
+    // even though the connection was alive; 120s still catches a genuinely
+    // dead socket while giving slow I/O room to complete. True liveness is
+    // covered separately by the 15s keepalive below.
+    tcp.set_read_timeout(Some(Duration::from_secs(120))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(120))).ok();
 
     let mut session = Session::new().map_err(|e| SshError::Handshake(e.to_string()))?;
     session.set_tcp_stream(tcp);
