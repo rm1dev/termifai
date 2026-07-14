@@ -390,3 +390,12 @@
   --color-tab-active: var(--tab-active);
   --color-tab-inactive: var(--tab-inactive);
 }
+
+/* Focus rings only while Tab-navigating (main.tsx toggles the class): the
+   browser's :focus-visible heuristic also fires when a mouse-focused element
+   receives any keypress (e.g. Space), outlining whatever was last clicked. */
+html:not(.user-is-tabbing) :focus-visible {
+  outline: none !important;
+  --tw-ring-color: transparent !important;
+  --tw-ring-offset-width: 0px !important;
+}

@@ -1,4 +1,4 @@
-import { X, Palette, Keyboard, Minus, Plus, Check, Shield, RefreshCw, PanelTop, Settings } from "lucide-react";
+import { Palette, Keyboard, Minus, Plus, Check, Shield, RefreshCw, PanelTop, Settings } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
@@ -21,6 +21,16 @@ import {
 } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import {
   clampTerminalFontSize,
   clampTerminalLineHeight,
@@ -54,6 +64,10 @@ import {
   saveAppTheme,
   type AppThemeId,
 } from "@/lib/app-theme";
+import {
+  loadSemanticHighlighting,
+  saveSemanticHighlighting,
+} from "@/lib/terminal-highlighter";
 import {
   eventToShortcutBinding,
   formatShortcut,
@@ -98,6 +112,7 @@ export function SettingsWindow() {
   const isMac = platform === "macos";
   const [terminalAppearance, setTerminalAppearance] = useState(loadTerminalAppearance);
   const [selectedThemeId, setSelectedThemeId] = useState(loadAppTheme().id);
+  const [semanticHighlighting, setSemanticHighlighting] = useState(loadSemanticHighlighting);
   const [mainWindowOpacity, setMainWindowOpacity] = useState(() => {
     try {
       const stored = localStorage.getItem("termifai:main-window-opacity");
@@ -512,11 +527,6 @@ export function SettingsWindow() {
     return () => window.removeEventListener(shortcutsChangedEvent, onShortcutChanged);
   }, []);
 
-  const closeWindow = () => {
-    getCurrentWindow().hide().catch((err) =>
-      console.error("hide settings window failed:", err)
-    );
-  };
   const updateFontFamily = (fontFamily: TerminalFont) => {
     const nextAppearance = { ...terminalAppearance, fontFamily };
     setTerminalAppearance(nextAppearance);
@@ -557,7 +567,35 @@ export function SettingsWindow() {
     saveShortcuts(nextShortcuts);
   };
 
+  // Global hotkeys are served by the background service, which dies together
+  // with the app when neither "Run in Background" nor "Run at Startup" is on.
+  // Warn when a hotkey is being enabled in that state and offer to flip the
+  // two General-tab switches right away. Advisory only — declining still
+  // enables the hotkey. Rendered with the app's own AlertDialog; the resolver
+  // held in state keeps the caller's async flow suspended until a choice is
+  // made.
+  const [backgroundPromptResolve, setBackgroundPromptResolve] = useState<
+    ((enableNow: boolean) => void) | null
+  >(null);
+
+  const offerBackgroundOptionsForHotkeys = () => {
+    if (runInBackground && autostartEnabled) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      setBackgroundPromptResolve(() => (enableNow: boolean) => {
+        setBackgroundPromptResolve(null);
+        if (enableNow) {
+          if (!runInBackground) handleRunInBackgroundChange(true);
+          if (!autostartEnabled) handleAutostartChange(true);
+        }
+        resolve();
+      });
+    });
+  };
+
   const applyHotkey = async (action: HotkeyAction, next: GlobalHotkeySettings) => {
+    if (next.enabled && !hotkeys[action].enabled) {
+      await offerBackgroundOptionsForHotkeys();
+    }
     setHotkeyErrors((errors) => ({ ...errors, [action]: undefined }));
     setHotkeyBusy(true);
     try {
@@ -598,6 +636,9 @@ export function SettingsWindow() {
         { title: "Quick Terminal on Wayland", kind: "warning" },
       );
       if (!confirmed) return;
+    }
+    if (enabled) {
+      await offerBackgroundOptionsForHotkeys();
     }
     setHotkeyErrors((errors) => ({ ...errors, "quick-terminal": undefined }));
     setHotkeyBusy(true);
@@ -702,32 +743,7 @@ export function SettingsWindow() {
   };
 
   return (
-    <div className={`flex h-full w-full flex-col overflow-hidden bg-background text-foreground ${isMac ? "rounded-lg" : ""}`}>
-      <header className="relative flex h-8 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none">
-        {/* Drag region covers the full header but excludes button areas */}
-        <div className="absolute inset-0" data-tauri-drag-region />
-
-        {isMac ? (
-          <button
-            onClick={closeWindow}
-            className="relative z-10 ml-2 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#ff5f57] text-[#7a1f1b] hover:text-[#7a1f1b]/90"
-            aria-label="Close Settings"
-          >
-            <X className="h-2.5 w-2.5 opacity-0 hover:opacity-100" />
-          </button>
-        ) : (
-          <button
-            onClick={closeWindow}
-            className="relative z-10 ml-auto flex h-full w-10 items-center justify-center text-muted-foreground hover:bg-red-500 hover:text-white transition-colors"
-            aria-label="Close Settings"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        )}
-
-        <h1 className="absolute inset-0 flex items-center justify-center text-[13px] font-medium leading-none text-foreground pointer-events-none">Settings</h1>
-      </header>
-
+    <div className="flex h-full w-full flex-col overflow-hidden bg-background text-foreground">
       <main className="min-h-0 flex-1 overflow-auto p-5">
         <Tabs defaultValue="general" className="mx-auto max-w-3xl">
           <TabsList className="grid w-full grid-cols-6">
@@ -957,6 +973,26 @@ export function SettingsWindow() {
                   </button>
                   );
                 })}
+              </div>
+            </div>
+
+            {/* Semantic Highlighting */}
+            <div className="rounded-xl bg-[var(--color-card)] p-5">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-base font-medium text-foreground">Smart highlighting</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    Color URLs, IPs, file paths, emails, IDs, timestamps and log keywords
+                    (error/warning/success) in terminal output, using the active theme&apos;s palette.
+                  </div>
+                </div>
+                <Switch
+                  checked={semanticHighlighting}
+                  onCheckedChange={(checked) => {
+                    setSemanticHighlighting(checked);
+                    saveSemanticHighlighting(checked);
+                  }}
+                />
               </div>
             </div>
 
@@ -1449,6 +1485,32 @@ export function SettingsWindow() {
           </TabsContent>
         </Tabs>
       </main>
+
+      <AlertDialog
+        open={backgroundPromptResolve !== null}
+        onOpenChange={(open) => {
+          if (!open) backgroundPromptResolve?.(false);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Keep hotkeys working in the background?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Global hotkeys stop working once the app is closed unless it keeps running in
+              the background. It&apos;s best to enable “Run at Startup” and “Run in
+              Background” in the General tab. Enable them now?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => backgroundPromptResolve?.(false)}>
+              Not now
+            </AlertDialogCancel>
+            <AlertDialogAction onClick={() => backgroundPromptResolve?.(true)}>
+              Enable now
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

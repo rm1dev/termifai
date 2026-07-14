@@ -25,6 +25,195 @@ const SLIDE_STEPS: u32 = 12;
 /// Bumped to cancel any in-flight slide (new toggle, resize, disable).
 static SLIDE_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// Logical panel state for toggling. Distinct from `is_visible`: on macOS the
+/// native window intentionally stays ordered-in (off-screen) for a moment
+/// after a hide while focus is handed back to the previous app, so window
+/// visibility alone would misroute a quick re-toggle.
+static PANEL_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// On macOS, hiding the key quick-terminal window makes AppKit promote the
+/// next window of this app (usually main) to key and active — so a panel
+/// summoned over another app would dump focus onto the main window when
+/// dismissed. `NSApp deactivate` is not a reliable fix under the cooperative
+/// activation model (macOS 14+), so instead the app that was frontmost when
+/// the panel was summoned is remembered by pid and explicitly re-activated
+/// on hide (the same scheme Quake-style terminals use).
+#[cfg(target_os = "macos")]
+mod previous_app {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use tauri::AppHandle;
+
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send, sel};
+
+    /// pid of the app the panel chain originates from — the app that was
+    /// frontmost when the panel was summoned. 0 = this app itself → nothing
+    /// to restore on hide.
+    static PID: AtomicI32 = AtomicI32::new(0);
+
+    /// True from the moment a hide starts handing focus back until that
+    /// hand-over lands (this app observed inactive). While set, a re-show
+    /// that samples *this* app as frontmost is mid-hand-over, not a genuine
+    /// "summoned from our own window" — the original pid must be kept.
+    static IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Must run on the main thread. Both callers below queue it via
+    /// `run_on_main_thread`, which preserves ordering relative to the
+    /// queued `show`/`set_focus`/`hide` window calls.
+    fn remember_frontmost_inner() {
+        let own_pid = std::process::id() as i32;
+        let pid = unsafe {
+            let workspace: Retained<AnyObject> = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let frontmost: Option<Retained<AnyObject>> =
+                msg_send![&*workspace, frontmostApplication];
+            match frontmost {
+                Some(app) => msg_send![&*app, processIdentifier],
+                None => 0,
+            }
+        };
+        if pid != own_pid {
+            PID.store(pid, Ordering::SeqCst);
+        } else if !IN_FLIGHT.load(Ordering::SeqCst) {
+            // This app is genuinely frontmost (not merely mid-hand-over,
+            // where the previous hide's hand-over hasn't landed yet and the
+            // chain's original pid must be kept for the next hide).
+            PID.store(0, Ordering::SeqCst);
+        }
+    }
+
+    pub fn remember_frontmost(app: &AppHandle) {
+        let _ = app.run_on_main_thread(remember_frontmost_inner);
+    }
+
+    /// The chain's origin pid. None = the panel was summoned from this app
+    /// itself, so there is nothing to hand focus back to on hide. Not
+    /// consumed: a re-show mid-hand-over must still see it (see IN_FLIGHT).
+    pub fn origin() -> Option<i32> {
+        match PID.load(Ordering::SeqCst) {
+            0 => None,
+            pid => Some(pid),
+        }
+    }
+
+    /// Forget everything (feature disabled / panel force-hidden).
+    pub fn reset() {
+        PID.store(0, Ordering::SeqCst);
+        IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+
+    /// One watchdog tick, on the main thread: reports whether this app is
+    /// active, and if it is and `hand_over` is set, hands activation to the
+    /// previous app.
+    fn tick(pid: i32, hand_over: bool) -> bool {
+        unsafe {
+            let nsapp: Retained<AnyObject> = msg_send![class!(NSApplication), sharedApplication];
+            let own_active: bool = msg_send![&*nsapp, isActive];
+            if !own_active || !hand_over {
+                return own_active;
+            }
+            let previous: Option<Retained<AnyObject>> = msg_send![
+                class!(NSRunningApplication),
+                runningApplicationWithProcessIdentifier: pid
+            ];
+            let Some(previous) = previous else {
+                return own_active; // previous app gone; nothing to hand to
+            };
+            // Cooperative activation (macOS 14+): consent to hand over
+            // activation, otherwise the system may refuse the request below.
+            let can_yield: bool =
+                msg_send![&*nsapp, respondsToSelector: sel!(yieldActivationToApplication:)];
+            if can_yield {
+                let _: () = msg_send![&*nsapp, yieldActivationToApplication: &*previous];
+            }
+            // NSApplicationActivateIgnoringOtherApps; deprecated-but-working
+            // pre-14 path, ignored on 14+ where the yield above governs.
+            let _: bool = msg_send![&*previous, activateWithOptions: 1usize << 1];
+            own_active
+        }
+    }
+
+    /// Post-hide focus watchdog.
+    ///
+    /// Two async hazards follow a hide, both caused by activation being
+    /// asynchronous under cooperative activation (macOS 14+):
+    ///  * this app is still active (the panel had focus) — activation must
+    ///    be handed back to the previous app, possibly with retries while
+    ///    this app's own pending activation settles;
+    ///  * this app is NOT active yet, but the activation requested by
+    ///    `set_focus` at show time can land seconds later — with the panel
+    ///    gone, AppKit would key the main window, visibly stealing focus.
+    ///
+    /// So for a grace period the panel window stays ordered-in (parked
+    /// off-screen / fully transparent, i.e. invisible): any late activation
+    /// keys the panel instead of the main window, and every tick that finds
+    /// this app active hands activation back to `pid`. Afterwards the window
+    /// is hidden for real — unless a re-show bumped SLIDE_GENERATION past
+    /// `generation`, which cancels the watchdog.
+    pub fn watch_and_restore(
+        app: &AppHandle,
+        window: tauri::WebviewWindow,
+        pid: i32,
+        generation: u64,
+    ) {
+        IN_FLIGHT.store(true, Ordering::SeqCst);
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            // Phase machinery to tell a late self-activation apart from a
+            // deliberate user return to this app:
+            //  * `seen_inactive` — once false→ we're in the initial hand-over
+            //    (retry while our pending activation settles);
+            //  * `late_quota` — when this app was NOT active at hide time,
+            //    the show-time activation request is still pending and may
+            //    land once, later; exactly one such re-activation is undone.
+            //    Any activation beyond that is the user coming back on
+            //    purpose, which must be left alone.
+            let mut seen_inactive = false;
+            let mut late_quota = 0u32;
+            for t in 0..60 {
+                if super::SLIDE_GENERATION.load(Ordering::SeqCst) != generation {
+                    // Cancelled by a re-show. IN_FLIGHT is deliberately left
+                    // as-is: if the hand-over never landed, the re-show has
+                    // kept the origin pid and its own hide continues the
+                    // chain.
+                    return;
+                }
+                let hand_over = !seen_inactive || late_quota > 0;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let queued = app.run_on_main_thread(move || {
+                    let _ = tx.send(tick(pid, hand_over));
+                });
+                let Ok(active) = rx.await else { break };
+                let _ = queued;
+                if t == 0 && !active {
+                    late_quota = 1;
+                }
+                if !active {
+                    seen_inactive = true;
+                    IN_FLIGHT.store(false, Ordering::SeqCst);
+                } else if seen_inactive {
+                    if late_quota > 0 {
+                        // The pending show-time activation just landed and
+                        // was handed straight back (this tick's hand_over).
+                        late_quota -= 1;
+                        IN_FLIGHT.store(true, Ordering::SeqCst);
+                    } else {
+                        // User deliberately re-activated this app.
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            IN_FLIGHT.store(false, Ordering::SeqCst);
+            let _ = app.run_on_main_thread(move || {
+                if super::SLIDE_GENERATION.load(Ordering::SeqCst) == generation {
+                    let _ = window.hide();
+                }
+            });
+        });
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Edge {
@@ -292,7 +481,9 @@ fn slide_endpoints(
 
 /// Ease-out slide of the native window between two logical positions,
 /// optionally hiding it at the end. Cancelled if SLIDE_GENERATION moves on.
-fn slide(window: tauri::WebviewWindow, from: (f64, f64), to: (f64, f64), hide_after: bool) {
+/// Returns the slide's generation so callers can chain follow-up work that
+/// must abort if a newer slide supersedes this one.
+fn slide(window: tauri::WebviewWindow, from: (f64, f64), to: (f64, f64), hide_after: bool) -> u64 {
     let generation = SLIDE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     tauri::async_runtime::spawn(async move {
         let step_delay = std::time::Duration::from_millis(SLIDE_DURATION_MS / SLIDE_STEPS as u64);
@@ -312,17 +503,26 @@ fn slide(window: tauri::WebviewWindow, from: (f64, f64), to: (f64, f64), hide_af
             let _ = window.hide();
         }
     });
+    generation
 }
 
 fn show_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTerminalSettings) {
     let Some(monitor) = target_monitor(app) else {
         return;
     };
+    PANEL_SHOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+    // Must be sampled before set_focus below makes this app frontmost.
+    #[cfg(target_os = "macos")]
+    previous_app::remember_frontmost(app);
     let animate = !has_monitor_beyond(app, &monitor, settings.edge);
     let (on, off, (w, h)) = slide_endpoints(settings.edge, &settings.sizes, &monitor);
     let start = if animate { off } else { on };
     let _ = window.set_size(tauri::LogicalSize::new(w, h));
     let _ = window.set_position(tauri::LogicalPosition::new(start.0, start.1));
+    // A previous hide may have parked the window fully transparent (see the
+    // monitor-adjoining branch of hide_panel).
+    #[cfg(target_os = "macos")]
+    set_native_alpha(app, &window, 1.0);
     let _ = window.show();
     let _ = window.set_focus();
     let _ = app.emit(
@@ -347,12 +547,26 @@ fn show_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTer
 /// window's real position by its own size clears the screen edge on any
 /// monitor.
 fn hide_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTerminalSettings) {
+    PANEL_SHOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(target_os = "macos")]
+    let restore_pid = previous_app::origin();
     // If another monitor adjoins the slide edge, don't animate — the panel
     // would visibly travel across the neighbouring display before hiding.
     let on_monitor = window.current_monitor().ok().flatten();
     if let Some(monitor) = &on_monitor {
         if has_monitor_beyond(app, monitor, settings.edge) {
-            SLIDE_GENERATION.fetch_add(1, Ordering::SeqCst);
+            let generation = SLIDE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+            #[cfg(target_os = "macos")]
+            if let Some(pid) = restore_pid {
+                // Can't slide off-screen here (a monitor adjoins the edge)
+                // and can't orderOut yet (focus watchdog) — make the window
+                // fully transparent instead until the watchdog hides it.
+                // show_panel restores the alpha.
+                set_native_alpha(app, &window, 0.0);
+                previous_app::watch_and_restore(app, window, pid, generation);
+                return;
+            }
+            let _ = generation;
             let _ = window.hide();
             return;
         }
@@ -367,13 +581,40 @@ fn hide_panel(app: &AppHandle, window: tauri::WebviewWindow, settings: &QuickTer
     };
     let on = (position.x as f64 / scale, position.y as f64 / scale);
     let (w, h) = (size.width as f64 / scale, size.height as f64 / scale);
-    let off = match settings.edge {
+    let off = offset_past_edge(on, (w, h), settings.edge);
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = restore_pid {
+        // Slide out without hiding; the watchdog orders the window out after
+        // the focus grace period.
+        let generation = slide(window.clone(), on, off, false);
+        previous_app::watch_and_restore(app, window, pid, generation);
+        return;
+    }
+    slide(window, on, off, true);
+}
+
+/// Position one panel-size past the screen edge in the hide direction.
+fn offset_past_edge(on: (f64, f64), (w, h): (f64, f64), edge: Edge) -> (f64, f64) {
+    match edge {
         Edge::Top => (on.0, on.1 - h),
         Edge::Bottom => (on.0, on.1 + h),
         Edge::Left => (on.0 - w, on.1),
         Edge::Right => (on.0 + w, on.1),
-    };
-    slide(window, on, off, true);
+    }
+}
+
+/// Native NSWindow alpha, applied on the main thread.
+#[cfg(target_os = "macos")]
+fn set_native_alpha(app: &AppHandle, window: &tauri::WebviewWindow, alpha: f64) {
+    let window = window.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Ok(ns_window) = window.ns_window() {
+            unsafe {
+                let ns_window = ns_window as *mut objc2::runtime::AnyObject;
+                let _: () = objc2::msg_send![ns_window, setAlphaValue: alpha];
+            }
+        }
+    });
 }
 
 /// Toggle entry point, called by the global hotkey and by commands.
@@ -387,7 +628,11 @@ pub fn toggle(app: &AppHandle) {
         return;
     };
 
-    if window.is_visible().unwrap_or(false) {
+    // PANEL_SHOWN (not just is_visible): during the post-hide grace period
+    // the window is still ordered-in off-screen while focus is handed back,
+    // yet logically hidden — a toggle then must re-show, not hide again.
+    if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst) && window.is_visible().unwrap_or(false)
+    {
         hide_panel(app, window, &settings);
     } else {
         // A panel whose webview died while loading hidden would slide in as
@@ -430,7 +675,9 @@ pub fn quick_terminal_frontend_ready(app: AppHandle) {
 pub fn hide_quick_terminal(app: AppHandle) {
     let settings = load_settings(&app);
     if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
-        if window.is_visible().unwrap_or(false) {
+        if PANEL_SHOWN.load(std::sync::atomic::Ordering::SeqCst)
+            && window.is_visible().unwrap_or(false)
+        {
             hide_panel(&app, window, &settings);
         }
     }
@@ -519,6 +766,9 @@ pub fn set_quick_terminal_enabled(app: AppHandle, enabled: bool) {
     save_settings(&app, &settings);
     if !enabled {
         // Cancel any slide and hide immediately — the feature was turned off.
+        PANEL_SHOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(target_os = "macos")]
+        previous_app::reset();
         SLIDE_GENERATION.fetch_add(1, Ordering::SeqCst);
         if let Some(window) = app.get_webview_window(WINDOW_LABEL) {
             let _ = window.hide();
