@@ -2050,6 +2050,10 @@ fn force_quit_app(app: tauri::AppHandle) {
     // Without this flag the ExitRequested handler treats the exit as a
     // window close and hides the app instead of quitting it.
     SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    // supervise:false must hit disk BEFORE the daemon dies: a daemon tick
+    // racing the pkill would otherwise see a dead app and resurrect it with
+    // a --background instance (which would in turn respawn the daemon).
+    global_hotkey::clean_quit(&app);
     global_hotkey::kill_daemon();
     app.exit(0);
 }
@@ -2315,6 +2319,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![
             take_pending_open_folders,
             create_session,
@@ -2418,6 +2423,14 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let label = window.label();
                 log::info!("window '{label}': close requested");
+                // The settings window is built once at startup and reopened
+                // by showing it — the native close button must hide it, not
+                // destroy it.
+                if label == "settings" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                    return;
+                }
                 if label == "main"
                     || label.starts_with("window-")
                     || label == quick_terminal::WINDOW_LABEL
@@ -2429,6 +2442,9 @@ pub fn run() {
                         api.prevent_close();
                     } else {
                         log::info!("run_in_background is false: quitting app");
+                        // supervise:false before killing the daemon — see
+                        // force_quit_app.
+                        global_hotkey::clean_quit(app);
                         global_hotkey::kill_daemon();
                         app.exit(0);
                     }
@@ -2564,9 +2580,6 @@ pub fn run() {
             .inner_size(800.0, 600.0)
             .min_inner_size(800.0, 600.0)
             .resizable(false)
-            .decorations(false)
-            .transparent(true)
-            .shadow(false)
             .minimizable(false)
             .maximizable(false)
             .visible(false);
@@ -2574,7 +2587,26 @@ pub fn run() {
             {
                 settings_builder = settings_builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
             }
-            settings_builder.build()?;
+            #[allow(unused_variables)]
+            let settings_win = settings_builder.build()?;
+            // minimizable/maximizable(false) only greys out the traffic-light
+            // buttons on macOS; remove them from the title bar entirely.
+            #[cfg(target_os = "macos")]
+            if let Ok(ns_window) = settings_win.ns_window() {
+                use objc2::rc::Retained;
+                use objc2::runtime::AnyObject;
+                unsafe {
+                    let ns_window = ns_window as *mut AnyObject;
+                    // NSWindowButton: 1 = Miniaturize, 2 = Zoom.
+                    for kind in [1u64, 2u64] {
+                        let button: Option<Retained<AnyObject>> =
+                            objc2::msg_send![ns_window, standardWindowButton: kind];
+                        if let Some(button) = button {
+                            let _: () = objc2::msg_send![&*button, setHidden: true];
+                        }
+                    }
+                }
+            }
 
             // Quick Terminal panel — same create-hidden-at-startup pattern as the
             // settings window (dynamic creation deadlocks WebView2 on Windows).
@@ -2734,6 +2766,9 @@ pub fn run() {
                     }
                     "custom-force-quit" => {
                         SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // supervise:false before killing the daemon — see
+                        // force_quit_app.
+                        global_hotkey::clean_quit(&handle);
                         global_hotkey::kill_daemon();
                         handle.exit(0);
                     }
@@ -2795,6 +2830,9 @@ pub fn run() {
                     }
                     "tray-force-quit" => {
                         SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // supervise:false before killing the daemon — see
+                        // force_quit_app.
+                        global_hotkey::clean_quit(app);
                         global_hotkey::kill_daemon();
                         app.exit(0);
                     }
@@ -2844,6 +2882,9 @@ pub fn run() {
                     SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst)
                 );
                 if !run_in_background {
+                    // Backstop for any exit path (e.g. Cmd+Q): stop the
+                    // daemon from resurrecting the app — see force_quit_app.
+                    global_hotkey::clean_quit(app_handle);
                     global_hotkey::kill_daemon();
                 } else if !SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
                     api.prevent_exit();

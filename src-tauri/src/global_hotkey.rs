@@ -75,8 +75,14 @@ fn toggle_main_window(app: &AppHandle) {
     match app.get_webview_window("main") {
         Some(window) => {
             let visible = window.is_visible().unwrap_or(false);
-            if visible {
+            let focused = window.is_focused().unwrap_or(false);
+            if visible && focused {
                 let _ = window.hide();
+            } else if visible {
+                // Open but in the background (or minimized): bring it to the
+                // front instead of hiding it.
+                let _ = window.unminimize();
+                let _ = window.set_focus();
             } else {
                 crate::revive_webview_if_stuck(&window);
                 set_dock_visible(app, true);

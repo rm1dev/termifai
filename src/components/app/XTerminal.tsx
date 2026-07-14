@@ -14,6 +14,7 @@ import {
   writeToSession,
 } from "@/lib/api/terminal";
 import { subscribe, type UnlistenFn } from "@/lib/api/transport";
+import { open as openExternalUrl } from "@tauri-apps/plugin-shell";
 import { listSnippets } from "@/lib/api/snippets";
 import { listHosts } from "@/lib/api/hosts";
 import { onSnippetsChanged } from "@/lib/snippets-events";
@@ -41,7 +42,13 @@ import {
   type ShortcutBinding,
   type ShortcutMap,
 } from "@/lib/shortcuts";
-import { platform } from "@/lib/platform";
+import { isMac, platform } from "@/lib/platform";
+import {
+  attachSemanticHighlighter,
+  loadSemanticHighlighting,
+  semanticHighlightingChangedEvent,
+  semanticHighlightingStorageKey,
+} from "@/lib/terminal-highlighter";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
 import { Search } from "lucide-react";
@@ -98,6 +105,11 @@ interface ReconnectState {
   attempt: number;
   countdown: number;
 }
+
+// Once the user has successfully opened a link with the modifier once, they
+// know the gesture — the hover hint has done its job and would only be
+// noise from then on. Persisted so it stays dismissed across restarts.
+const linkHintDismissedKey = "termifai:link-hint-dismissed";
 
 const menuItemCls =
   "flex cursor-pointer select-none items-center gap-2 rounded px-2.5 py-1.5 text-xs text-foreground outline-none data-[highlighted]:bg-[var(--color-surface-2)] data-[disabled]:pointer-events-none data-[disabled]:opacity-40";
@@ -205,6 +217,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
   // Drives the enabled state of "Copy" in the terminal context menu.
   const [hasSelection, setHasSelection] = useState(false);
+  // Hover hint for detected URLs: position (relative to the terminal
+  // wrapper) plus the link text, shown as a small tooltip until the mouse
+  // leaves the link.
+  const [linkHint, setLinkHint] = useState<{ x: number; y: number; uri: string } | null>(null);
   // Resolved once per mount: local terminal tabs have no hostId, so `isLocal`
   // is true; SSH tabs look up the host's OS to gate OS-restricted snippets.
   const osContextRef = useRef<{ isLocal: boolean; hostOs?: OsKind }>({ isLocal: !hostId });
@@ -463,21 +479,59 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       theme: xtermTheme(appTheme),
       allowTransparency: true,
       scrollback: 50000,
+      // registerDecoration (semantic highlighting) and parser.registerOscHandler
+      // (ClipboardAddon's OSC52 support) are gated behind this flag and throw
+      // without it.
+      allowProposedApi: true,
     });
 
     const fit = new FitAddon();
     fitAddonRef.current = fit;
     term.loadAddon(fit);
-    term.loadAddon(new WebLinksAddon());
-    // OSC52 clipboard support: with tmux mouse mode on (see AppShell's
-    // remote bootstrap), drag-selection is handled by tmux on the host and
-    // lands in a tmux buffer — tmux then forwards it as an OSC52 escape,
-    // which this addon writes into the system clipboard so drag-to-copy
-    // keeps working exactly like it does without the tmux layer.
+    // Links open only with the platform modifier held (⌘ on macOS,
+    // Ctrl elsewhere — the standard terminal-emulator convention), so a
+    // plain click inside a URL still just moves selection. Opening goes
+    // through the Tauri shell plugin: the webview's own window.open (the
+    // addon's default handler) doesn't reach the system browser.
+    term.loadAddon(
+      new WebLinksAddon(
+        (event, uri) => {
+          if (!(isMac ? event.metaKey : event.ctrlKey)) return;
+          setLinkHint(null);
+          try {
+            localStorage.setItem(linkHintDismissedKey, "1");
+          } catch {
+            /* storage unavailable — hint just stays on */
+          }
+          openExternalUrl(uri).catch((err) => console.error("open url failed:", err));
+        },
+        {
+          hover: (event, uri) => {
+            if (localStorage.getItem(linkHintDismissedKey)) return;
+            const rect = ref.current?.getBoundingClientRect();
+            if (!rect) return;
+            setLinkHint({
+              x: Math.max(0, Math.min(event.clientX - rect.left, rect.width - 340)),
+              y: event.clientY - rect.top,
+              uri,
+            });
+          },
+          leave: () => setLinkHint(null),
+        }
+      )
+    );
+    // OSC52 clipboard support: remote programs (tmux, nvim, …) can push
+    // copied text to the system clipboard through this escape sequence.
     term.loadAddon(new ClipboardAddon());
     term.open(ref.current);
     termRef.current = term;
     requestAnimationFrame(() => term.focus());
+
+    // Semantic highlighting (URLs, IPs, paths, emails, ids, timestamps, log
+    // keywords), colored from the active theme's own xterm palette so each
+    // theme gets its own coherent set of highlight colors.
+    let currentTheme = appTheme;
+    const highlighter = attachSemanticHighlighter(term, () => currentTheme.xterm);
 
     // Intercept terminal shortcuts before xterm processes them
     term.attachCustomKeyEventHandler((event) => {
@@ -612,21 +666,30 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     const onAppearanceChanged = (event: Event) => {
       applyAppearance((event as CustomEvent<TerminalAppearance>).detail);
     };
+    const applyTheme = (theme: AppTheme) => {
+      term.options.theme = xtermTheme(theme);
+      currentTheme = theme;
+      // Existing decorations were painted with the old palette.
+      highlighter.refresh();
+    };
     const onStorageChanged = (event: StorageEvent) => {
       if (event.key === terminalAppearanceStorageKey) {
         applyAppearance(loadTerminalAppearance());
       } else if (event.key === appThemeStorageKey) {
-        term.options.theme = xtermTheme(loadAppTheme());
+        applyTheme(loadAppTheme());
+      } else if (event.key === semanticHighlightingStorageKey) {
+        highlighter.setEnabled(loadSemanticHighlighting());
       }
-    };
-    const applyTheme = (theme: AppTheme) => {
-      term.options.theme = xtermTheme(theme);
     };
     const onAppThemeChanged = (event: Event) => {
       applyTheme((event as CustomEvent<AppTheme>).detail);
     };
+    const onHighlightingChanged = (event: Event) => {
+      highlighter.setEnabled((event as CustomEvent<boolean>).detail);
+    };
     window.addEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
     window.addEventListener(appThemeChangedEvent, onAppThemeChanged);
+    window.addEventListener(semanticHighlightingChangedEvent, onHighlightingChanged);
     window.addEventListener("storage", onStorageChanged);
     const onShortcutStorageChanged = (event: StorageEvent) => {
       if (event.key === shortcutsStorageKey) {
@@ -654,6 +717,15 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       .then((unlisten) => {
         if (destroyed) { unlisten(); return; }
         unlistenAppTheme = unlisten;
+      })
+      .catch(() => {});
+    let unlistenHighlighting: UnlistenFn | null = null;
+    void subscribe<boolean>(semanticHighlightingChangedEvent, (event) => {
+      highlighter.setEnabled(event.payload);
+    })
+      .then((unlisten) => {
+        if (destroyed) { unlisten(); return; }
+        unlistenHighlighting = unlisten;
       })
       .catch(() => {});
 
@@ -713,6 +785,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     const selectionDisp = term.onSelectionChange(() => {
       setHasSelection(term.hasSelection());
     });
+
+    // Scrolling shifts link ranges under the pointer without a mouseleave,
+    // so the hover hint would otherwise linger over unrelated content.
+    const scrollDisp = term.onScroll(() => setLinkHint(null));
 
     // Notify backend on resize
     const resizeDisp = term.onResize(({ cols, rows }) => {
@@ -896,6 +972,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         ro.disconnect();
         dataDisp.dispose();
         selectionDisp.dispose();
+        scrollDisp.dispose();
+        highlighter.dispose();
         resizeDisp.dispose();
         isInitializedRef.current = false;
         return;
@@ -905,13 +983,17 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
       window.removeEventListener(appThemeChangedEvent, onAppThemeChanged);
+      window.removeEventListener(semanticHighlightingChangedEvent, onHighlightingChanged);
       window.removeEventListener("storage", onStorageChanged);
       window.removeEventListener("storage", onShortcutStorageChanged);
       unlistenAppTheme?.();
       unlistenAppearance?.();
+      unlistenHighlighting?.();
       ro.disconnect();
       dataDisp.dispose();
       selectionDisp.dispose();
+      scrollDisp.dispose();
+      highlighter.dispose();
       resizeDisp.dispose();
       unlistenOutputRef.current?.();
       unlistenExitRef.current?.();
@@ -1118,6 +1200,17 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   return (
     <div className="relative h-full w-full bg-background">
+      {linkHint && (
+        <div
+          className="pointer-events-none absolute z-30 flex max-w-[340px] items-center gap-2 rounded-md border border-border bg-popover px-2 py-1 text-xs shadow-lg"
+          style={{ left: linkHint.x, top: linkHint.y + 18 }}
+        >
+          <span className="truncate font-mono text-foreground">{linkHint.uri}</span>
+          <span className="shrink-0 text-muted-foreground">
+            {isMac ? "⌘ + click to open" : "Ctrl + click to open"}
+          </span>
+        </div>
+      )}
       {isConnecting && (
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-background px-4 text-center">
           <div className="w-full max-w-2xl">
