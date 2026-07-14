@@ -15,6 +15,7 @@
     "core:window:allow-start-dragging",
     "core:window:allow-set-fullscreen",
     "dialog:allow-open",
-    "dialog:allow-ask"
+    "dialog:allow-ask",
+    "shell:allow-open"
   ]
 }
