@@ -43,6 +43,12 @@ import {
   type ShortcutMap,
 } from "@/lib/shortcuts";
 import { isMac, platform } from "@/lib/platform";
+import {
+  attachSemanticHighlighter,
+  loadSemanticHighlighting,
+  semanticHighlightingChangedEvent,
+  semanticHighlightingStorageKey,
+} from "@/lib/terminal-highlighter";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
 import { Search } from "lucide-react";
@@ -473,6 +479,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       theme: xtermTheme(appTheme),
       allowTransparency: true,
       scrollback: 50000,
+      // registerDecoration (semantic highlighting) and parser.registerOscHandler
+      // (ClipboardAddon's OSC52 support) are gated behind this flag and throw
+      // without it.
+      allowProposedApi: true,
     });
 
     const fit = new FitAddon();
@@ -510,15 +520,18 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         }
       )
     );
-    // OSC52 clipboard support: with tmux mouse mode on (see AppShell's
-    // remote bootstrap), drag-selection is handled by tmux on the host and
-    // lands in a tmux buffer — tmux then forwards it as an OSC52 escape,
-    // which this addon writes into the system clipboard so drag-to-copy
-    // keeps working exactly like it does without the tmux layer.
+    // OSC52 clipboard support: remote programs (tmux, nvim, …) can push
+    // copied text to the system clipboard through this escape sequence.
     term.loadAddon(new ClipboardAddon());
     term.open(ref.current);
     termRef.current = term;
     requestAnimationFrame(() => term.focus());
+
+    // Semantic highlighting (URLs, IPs, paths, emails, ids, timestamps, log
+    // keywords), colored from the active theme's own xterm palette so each
+    // theme gets its own coherent set of highlight colors.
+    let currentTheme = appTheme;
+    const highlighter = attachSemanticHighlighter(term, () => currentTheme.xterm);
 
     // Intercept terminal shortcuts before xterm processes them
     term.attachCustomKeyEventHandler((event) => {
@@ -653,21 +666,30 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     const onAppearanceChanged = (event: Event) => {
       applyAppearance((event as CustomEvent<TerminalAppearance>).detail);
     };
+    const applyTheme = (theme: AppTheme) => {
+      term.options.theme = xtermTheme(theme);
+      currentTheme = theme;
+      // Existing decorations were painted with the old palette.
+      highlighter.refresh();
+    };
     const onStorageChanged = (event: StorageEvent) => {
       if (event.key === terminalAppearanceStorageKey) {
         applyAppearance(loadTerminalAppearance());
       } else if (event.key === appThemeStorageKey) {
-        term.options.theme = xtermTheme(loadAppTheme());
+        applyTheme(loadAppTheme());
+      } else if (event.key === semanticHighlightingStorageKey) {
+        highlighter.setEnabled(loadSemanticHighlighting());
       }
-    };
-    const applyTheme = (theme: AppTheme) => {
-      term.options.theme = xtermTheme(theme);
     };
     const onAppThemeChanged = (event: Event) => {
       applyTheme((event as CustomEvent<AppTheme>).detail);
     };
+    const onHighlightingChanged = (event: Event) => {
+      highlighter.setEnabled((event as CustomEvent<boolean>).detail);
+    };
     window.addEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
     window.addEventListener(appThemeChangedEvent, onAppThemeChanged);
+    window.addEventListener(semanticHighlightingChangedEvent, onHighlightingChanged);
     window.addEventListener("storage", onStorageChanged);
     const onShortcutStorageChanged = (event: StorageEvent) => {
       if (event.key === shortcutsStorageKey) {
@@ -695,6 +717,15 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       .then((unlisten) => {
         if (destroyed) { unlisten(); return; }
         unlistenAppTheme = unlisten;
+      })
+      .catch(() => {});
+    let unlistenHighlighting: UnlistenFn | null = null;
+    void subscribe<boolean>(semanticHighlightingChangedEvent, (event) => {
+      highlighter.setEnabled(event.payload);
+    })
+      .then((unlisten) => {
+        if (destroyed) { unlisten(); return; }
+        unlistenHighlighting = unlisten;
       })
       .catch(() => {});
 
@@ -942,6 +973,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         dataDisp.dispose();
         selectionDisp.dispose();
         scrollDisp.dispose();
+        highlighter.dispose();
         resizeDisp.dispose();
         isInitializedRef.current = false;
         return;
@@ -951,14 +983,17 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
       window.removeEventListener(appThemeChangedEvent, onAppThemeChanged);
+      window.removeEventListener(semanticHighlightingChangedEvent, onHighlightingChanged);
       window.removeEventListener("storage", onStorageChanged);
       window.removeEventListener("storage", onShortcutStorageChanged);
       unlistenAppTheme?.();
       unlistenAppearance?.();
+      unlistenHighlighting?.();
       ro.disconnect();
       dataDisp.dispose();
       selectionDisp.dispose();
       scrollDisp.dispose();
+      highlighter.dispose();
       resizeDisp.dispose();
       unlistenOutputRef.current?.();
       unlistenExitRef.current?.();
