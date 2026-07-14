@@ -1,4 +1,4 @@
-import { X, Palette, Keyboard, Minus, Plus, Check, Shield, RefreshCw, PanelTop, Settings } from "lucide-react";
+import { Palette, Keyboard, Minus, Plus, Check, Shield, RefreshCw, PanelTop, Settings } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { ask as askDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { useEffect, useState } from "react";
@@ -527,11 +527,6 @@ export function SettingsWindow() {
     return () => window.removeEventListener(shortcutsChangedEvent, onShortcutChanged);
   }, []);
 
-  const closeWindow = () => {
-    getCurrentWindow().hide().catch((err) =>
-      console.error("hide settings window failed:", err)
-    );
-  };
   const updateFontFamily = (fontFamily: TerminalFont) => {
     const nextAppearance = { ...terminalAppearance, fontFamily };
     setTerminalAppearance(nextAppearance);
@@ -748,32 +743,7 @@ export function SettingsWindow() {
   };
 
   return (
-    <div className={`flex h-full w-full flex-col overflow-hidden bg-background text-foreground ${isMac ? "rounded-lg" : ""}`}>
-      <header className="relative flex h-8 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none">
-        {/* Drag region covers the full header but excludes button areas */}
-        <div className="absolute inset-0" data-tauri-drag-region />
-
-        {isMac ? (
-          <button
-            onClick={closeWindow}
-            className="relative z-10 ml-2 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[#ff5f57] text-[#7a1f1b] hover:text-[#7a1f1b]/90"
-            aria-label="Close Settings"
-          >
-            <X className="h-2.5 w-2.5 opacity-0 hover:opacity-100" />
-          </button>
-        ) : (
-          <button
-            onClick={closeWindow}
-            className="relative z-10 ml-auto flex h-full w-10 items-center justify-center text-muted-foreground hover:bg-red-500 hover:text-white transition-colors"
-            aria-label="Close Settings"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        )}
-
-        <h1 className="absolute inset-0 flex items-center justify-center text-[13px] font-medium leading-none text-foreground pointer-events-none">Settings</h1>
-      </header>
-
+    <div className="flex h-full w-full flex-col overflow-hidden bg-background text-foreground">
       <main className="min-h-0 flex-1 overflow-auto p-5">
         <Tabs defaultValue="general" className="mx-auto max-w-3xl">
           <TabsList className="grid w-full grid-cols-6">

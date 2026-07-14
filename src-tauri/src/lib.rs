@@ -2423,6 +2423,14 @@ pub fn run() {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let label = window.label();
                 log::info!("window '{label}': close requested");
+                // The settings window is built once at startup and reopened
+                // by showing it — the native close button must hide it, not
+                // destroy it.
+                if label == "settings" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                    return;
+                }
                 if label == "main"
                     || label.starts_with("window-")
                     || label == quick_terminal::WINDOW_LABEL
@@ -2572,9 +2580,6 @@ pub fn run() {
             .inner_size(800.0, 600.0)
             .min_inner_size(800.0, 600.0)
             .resizable(false)
-            .decorations(false)
-            .transparent(true)
-            .shadow(false)
             .minimizable(false)
             .maximizable(false)
             .visible(false);
@@ -2582,7 +2587,26 @@ pub fn run() {
             {
                 settings_builder = settings_builder.additional_browser_args(WEBVIEW2_RELEASE_ARGS);
             }
-            settings_builder.build()?;
+            #[allow(unused_variables)]
+            let settings_win = settings_builder.build()?;
+            // minimizable/maximizable(false) only greys out the traffic-light
+            // buttons on macOS; remove them from the title bar entirely.
+            #[cfg(target_os = "macos")]
+            if let Ok(ns_window) = settings_win.ns_window() {
+                use objc2::rc::Retained;
+                use objc2::runtime::AnyObject;
+                unsafe {
+                    let ns_window = ns_window as *mut AnyObject;
+                    // NSWindowButton: 1 = Miniaturize, 2 = Zoom.
+                    for kind in [1u64, 2u64] {
+                        let button: Option<Retained<AnyObject>> =
+                            objc2::msg_send![ns_window, standardWindowButton: kind];
+                        if let Some(button) = button {
+                            let _: () = objc2::msg_send![&*button, setHidden: true];
+                        }
+                    }
+                }
+            }
 
             // Quick Terminal panel — same create-hidden-at-startup pattern as the
             // settings window (dynamic creation deadlocks WebView2 on Windows).
