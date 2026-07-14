@@ -1,5 +1,6 @@
 import { useEffect, useRef, useLayoutEffect, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
@@ -32,12 +33,16 @@ import {
   type AppTheme,
 } from "@/lib/app-theme";
 import {
+  formatShortcut,
   isShortcutMatch,
   loadShortcuts,
   shortcutsChangedEvent,
   shortcutsStorageKey,
+  type ShortcutBinding,
   type ShortcutMap,
 } from "@/lib/shortcuts";
+import { platform } from "@/lib/platform";
+import * as ContextMenu from "@radix-ui/react-context-menu";
 import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
 import { Search } from "lucide-react";
 
@@ -82,6 +87,25 @@ const initialConnectionStatus: ConnectionStatusPayload = {
   status: "active",
   message: "Opening TCP connection to SSH server...",
 };
+
+// Reconnect after an unexpected host disconnect: 3 attempts with increasing
+// backoff, then give up and wait for the user to reconnect manually.
+const RECONNECT_DELAYS_SEC = [2, 4, 8];
+const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_SEC.length;
+
+interface ReconnectState {
+  phase: "waiting" | "connecting" | "failed";
+  attempt: number;
+  countdown: number;
+}
+
+const menuItemCls =
+  "flex cursor-pointer select-none items-center gap-2 rounded px-2.5 py-1.5 text-xs text-foreground outline-none data-[highlighted]:bg-[var(--color-surface-2)] data-[disabled]:pointer-events-none data-[disabled]:opacity-40";
+
+function MenuShortcut({ binding }: { binding?: ShortcutBinding }) {
+  if (!binding) return null;
+  return <span className="text-[10px] text-muted-foreground">{formatShortcut(binding)}</span>;
+}
 
 function EnumDropdown({
   options,
@@ -172,12 +196,15 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
   const [connectionLogs, setConnectionLogs] = useState<string[]>([]);
   const [showConnectionLogs, setShowConnectionLogs] = useState(false);
+  const [reconnectState, setReconnectState] = useState<ReconnectState | null>(null);
   const [snippetPalette, setSnippetPalette] = useState(false);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
   const [snippetGroups, setSnippetGroups] = useState<SnippetGroup[]>([]);
   const [snippetQuery, setSnippetQuery] = useState("");
   const [snippetIndex, setSnippetIndex] = useState(0);
   const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
+  // Drives the enabled state of "Copy" in the terminal context menu.
+  const [hasSelection, setHasSelection] = useState(false);
   // Resolved once per mount: local terminal tabs have no hostId, so `isLocal`
   // is true; SSH tabs look up the host's OS to gate OS-restricted snippets.
   const osContextRef = useRef<{ isLocal: boolean; hostOs?: OsKind }>({ isLocal: !hostId });
@@ -204,6 +231,164 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const mountCountRef = useRef(0);
   const notifiedSessionRef = useRef<string | null>(sessionId ?? null);
   const appearanceRequestRef = useRef(0);
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const clearReconnectTimers = () => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    if (reconnectIntervalRef.current) {
+      clearInterval(reconnectIntervalRef.current);
+      reconnectIntervalRef.current = null;
+    }
+  };
+
+  // Called whenever the PTY session ends unexpectedly. For SSH tabs (hostId
+  // present) this kicks off the auto-reconnect flow; local shells just get
+  // the old "press any key" message since there's no host to reconnect to.
+  const handleDisconnect = () => {
+    if (!hostId) {
+      termRef.current?.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
+      return;
+    }
+    termRef.current?.write("\r\n\x1b[38;2;255;99;99m[Connection to host lost.]\x1b[0m\r\n");
+    reconnectAttemptRef.current = 0;
+    scheduleReconnectAttempt();
+  };
+
+  const scheduleReconnectAttempt = () => {
+    const attempt = reconnectAttemptRef.current + 1;
+    reconnectAttemptRef.current = attempt;
+    if (attempt > MAX_RECONNECT_ATTEMPTS) {
+      clearReconnectTimers();
+      setReconnectState({ phase: "failed", attempt: MAX_RECONNECT_ATTEMPTS, countdown: 0 });
+      return;
+    }
+
+    const delay = RECONNECT_DELAYS_SEC[attempt - 1];
+    let remaining = delay;
+    setReconnectState({ phase: "waiting", attempt, countdown: remaining });
+
+    clearReconnectTimers();
+    reconnectIntervalRef.current = setInterval(() => {
+      remaining -= 1;
+      setReconnectState((s) => (s && s.phase === "waiting" ? { ...s, countdown: Math.max(remaining, 0) } : s));
+    }, 1000);
+    reconnectTimeoutRef.current = setTimeout(() => {
+      void performReconnect(attempt);
+    }, delay * 1000);
+  };
+
+  const performReconnect = async (attempt: number) => {
+    clearReconnectTimers();
+    // termRef is nulled on unmount — a reconnect completing after that would
+    // create an ownerless ssh session that (via tmux attach -D on the same
+    // named session) kicks the client of whichever terminal replaced us.
+    if (!termRef.current) return;
+    setReconnectState({ phase: "connecting", attempt, countdown: 0 });
+    const staleSid = sessionRef.current;
+    try {
+      const term = termRef.current;
+      const newSid = crypto.randomUUID();
+
+      // Register listeners against the new id before creating the session,
+      // same ordering as the initial connect — otherwise output emitted
+      // right after reconnect can be dropped before anything is listening.
+      unlistenOutputRef.current?.();
+      unlistenExitRef.current?.();
+      unlistenOutputRef.current = await onSessionOutput(newSid, (chunk) => {
+        termRef.current?.write(chunk);
+      });
+      unlistenExitRef.current = await onSessionExited(newSid, () => {
+        handleDisconnect();
+      });
+
+      const info = await createSession({
+        sessionId: newSid,
+        cwd: cwd ?? "",
+        initialCommand: initialCommand ?? null,
+        hostId: hostId ?? null,
+        readyMarker: readyMarker ?? null,
+        cols: term?.cols || undefined,
+        rows: term?.rows || undefined,
+      });
+      if (!termRef.current) {
+        closeSession(info.id).catch(() => {});
+        return;
+      }
+      sessionRef.current = info.id;
+
+      if (term?.cols && term?.rows) {
+        await resizeSession(info.id, term.cols, term.rows);
+      }
+
+      // Keep the tab's persisted session id (AppShell state) in sync with the
+      // live session — otherwise it stays pinned to the pre-reconnect id and
+      // any later resync of sessionRef.current from that stale prop makes
+      // every keystroke write into a dead/nonexistent session.
+      notifiedSessionRef.current = info.id;
+      onSessionCreated?.(info.id);
+      if (staleSid && staleSid !== info.id) {
+        closeSession(staleSid).catch(() => {});
+      }
+
+      reconnectAttemptRef.current = 0;
+      setReconnectState(null);
+      term?.write("\r\n\x1b[38;2;120;220;140m[Reconnected.]\x1b[0m\r\n");
+    } catch {
+      scheduleReconnectAttempt();
+    }
+  };
+
+  // Manual reconnect from the "failed" screen, or a manual retry at any point.
+  const manualReconnect = () => {
+    clearReconnectTimers();
+    reconnectAttemptRef.current = 0;
+    void performReconnect(1).catch(() => {});
+  };
+
+  // ── Terminal clipboard actions (context menu + Windows right-click) ───────
+  const copySelection = useCallback(() => {
+    const term = termRef.current;
+    const selection = term?.getSelection();
+    if (term && selection) {
+      navigator.clipboard.writeText(selection).catch(() => {});
+      term.clearSelection();
+    }
+  }, []);
+
+  const pasteClipboard = useCallback(() => {
+    const sid = sessionRef.current;
+    if (!sid) return;
+    navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (text) writeToSession(sid, text).catch(() => {});
+      })
+      .catch(() => {});
+  }, []);
+
+  const refocusTerminal = useCallback(() => {
+    setTimeout(() => termRef.current?.focus(), 50);
+  }, []);
+
+  // Windows terminal convention (VS Code / Windows Terminal default): right
+  // click never shows a menu — it copies the selection if there is one,
+  // otherwise pastes. macOS/Linux get a context menu instead (see render).
+  const handleWindowsRightClick = useCallback(
+    (event: React.MouseEvent) => {
+      event.preventDefault();
+      if (termRef.current?.hasSelection()) {
+        copySelection();
+      } else {
+        pasteClipboard();
+      }
+    },
+    [copySelection, pasteClipboard]
+  );
 
   const loadSnippets = useCallback(() => {
     return listSnippets().then((data) => {
@@ -284,6 +469,12 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     fitAddonRef.current = fit;
     term.loadAddon(fit);
     term.loadAddon(new WebLinksAddon());
+    // OSC52 clipboard support: with tmux mouse mode on (see AppShell's
+    // remote bootstrap), drag-selection is handled by tmux on the host and
+    // lands in a tmux buffer — tmux then forwards it as an OSC52 escape,
+    // which this addon writes into the system clipboard so drag-to-copy
+    // keeps working exactly like it does without the tmux layer.
+    term.loadAddon(new ClipboardAddon());
     term.open(ref.current);
     termRef.current = term;
     requestAnimationFrame(() => term.focus());
@@ -337,7 +528,15 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       return true;
     });
 
+    // Tabs are never unmounted, just toggled with display:none (see
+    // AppShell). A hidden container reports clientWidth/Height 0, and
+    // fitting against that shrinks the terminal to bogus cols/rows — which
+    // then gets pushed to the backend PTY via onResize below, corrupting
+    // how already-written lines reflow once the tab is shown again. Skip
+    // fitting whenever the container has no real layout box yet.
     const safeFit = () => {
+      const el = ref.current;
+      if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
       try {
         fit.fit();
       } catch {
@@ -345,6 +544,56 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       }
     };
     requestAnimationFrame(safeFit);
+
+    // Poll across frames until the container's layout box has been the same
+    // size for a few consecutive frames, then fit. Used before creating a
+    // fresh SSH session: `ssh -tt` execs straight into `tmux new-session -A`,
+    // which births the remote window at whatever size the local PTY has *at
+    // that moment* — tmux/byobu's window-size handling frequently doesn't
+    // retroactively grow a window past its birth size even after a later
+    // resize is forwarded over SSH. So the PTY needs the real, *settled*
+    // size up front, not a guess corrected later. A single non-zero reading
+    // isn't enough: right after a new tab is inserted the flex layout can
+    // still be reflowing (and the terminal font may still be loading, which
+    // changes cell measurements), so the first non-zero frame is often a
+    // transient, too-small intermediate size rather than the final one.
+    const waitForLayoutAndFit = (): Promise<void> =>
+      new Promise((resolve) => {
+        let attempts = 0;
+        let lastW = -1;
+        let lastH = -1;
+        let stableFrames = 0;
+        const tick = () => {
+          const el = ref.current;
+          const w = el?.clientWidth ?? 0;
+          const h = el?.clientHeight ?? 0;
+          if (w > 0 && h > 0) {
+            stableFrames = w === lastW && h === lastH ? stableFrames + 1 : 0;
+            lastW = w;
+            lastH = h;
+            if (stableFrames >= 4) {
+              try {
+                fit.fit();
+              } catch {
+                /* element not visible yet */
+              }
+              resolve();
+              return;
+            }
+          }
+          if (++attempts < 60) {
+            requestAnimationFrame(tick);
+          } else {
+            try {
+              fit.fit();
+            } catch {
+              /* element not visible yet */
+            }
+            resolve();
+          }
+        };
+        requestAnimationFrame(tick);
+      });
 
     const ro = new ResizeObserver(safeFit);
     ro.observe(ref.current);
@@ -414,7 +663,18 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       if (!sid) return;
 
       const send = (payload: string) =>
-        writeToSession(sid, payload).catch((err) => console.error("write_to_session failed:", err));
+        writeToSession(sid, payload).catch((err) => {
+          console.error("write_to_session failed:", err);
+          // A "Session not found" write means the backend PTY behind sid is
+          // gone (e.g. it was superseded by a reconnect this component
+          // missed, or the process exited) — every future keystroke would
+          // silently no-op otherwise. Trigger the same recovery path as an
+          // unexpected disconnect instead of leaving the user stuck typing
+          // into a dead session.
+          if (sid === sessionRef.current && String(err).toLowerCase().includes("not found")) {
+            handleDisconnect();
+          }
+        });
 
       if (data === "\r") {
         currentLineRef.current = "";
@@ -448,6 +708,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         const erase = "\x7f".repeat(word!.length);
         send(erase + (snippet.body ?? ""));
       }
+    });
+
+    const selectionDisp = term.onSelectionChange(() => {
+      setHasSelection(term.hasSelection());
     });
 
     // Notify backend on resize
@@ -485,31 +749,127 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
           );
         }
 
-        let sid = sessionRef.current;
-        if (!sid) {
+        // Registers listeners for a brand-new session id *before* calling
+        // createSession (Tauri drops events emitted with no listener
+        // attached — any output the backend emits before this registration
+        // lands would otherwise be silently lost), waits for the container's
+        // real, settled layout so the PTY is opened at the right size (SSH
+        // hosts exec straight into `tmux new-session -A`, which births the
+        // remote window at whatever size the PTY has *right now* — tmux/byobu
+        // won't reliably grow a window past its birth size even once a
+        // later resize is forwarded), then creates the session.
+        // Returns null when this setup pass was orphaned mid-flight (its
+        // mount got cleaned up — Strict Mode double-invoke or a fast
+        // unmount). Aborting matters beyond hygiene: a leaked ssh session
+        // attaches the same named tmux session as the live one, and since
+        // the attach uses `-D` (detach other clients), the orphan and the
+        // real session would kick each other's client off in a loop — seen
+        // by the user as several spurious auto-reconnects right after
+        // connecting.
+        const createFresh = async (): Promise<string | null> => {
+          if (destroyed) return null;
+          const newSid = crypto.randomUUID();
+          sessionRef.current = newSid;
+
+          unlistenOutputRef.current?.();
+          unlistenExitRef.current?.();
+          unlistenOutputRef.current = null;
+          unlistenExitRef.current = null;
+
+          const unlistenOutput = await onSessionOutput(newSid, (chunk) => {
+            if (!readyMarker) setIsConnecting(false);
+            term.write(chunk);
+          });
+          const unlistenExit = await onSessionExited(newSid, () => {
+            if (!readyMarker) setIsConnecting(false);
+            handleDisconnect();
+          });
+
+          // Tears down only what THIS pass created. The shared refs must
+          // never be blanket-disposed here: with two setup passes in flight
+          // (Strict Mode double-invoke), the refs may already hold the
+          // *newer* pass's live listeners, and disposing those would leave
+          // the surviving terminal deaf to all PTY output.
+          const abort = (createdId?: string): null => {
+            unlistenOutput();
+            unlistenExit();
+            if (unlistenOutputRef.current === unlistenOutput) unlistenOutputRef.current = null;
+            if (unlistenExitRef.current === unlistenExit) unlistenExitRef.current = null;
+            if (sessionRef.current === newSid) sessionRef.current = null;
+            if (createdId) closeSession(createdId).catch(() => {});
+            return null;
+          };
+
+          if (destroyed) return abort();
+          unlistenOutputRef.current = unlistenOutput;
+          unlistenExitRef.current = unlistenExit;
+
+          // Character-cell measurements (and therefore fit()'s cols/rows)
+          // depend on the terminal font actually being loaded — fitting
+          // against a fallback font can under/over-count columns.
+          await ensureTerminalFontLoaded(appearance).catch(() => {});
+          await waitForLayoutAndFit();
+
+          if (destroyed) return abort();
+
           const info = await createSession({
+            sessionId: newSid,
             cwd: cwd ?? "",
             initialCommand: initialCommand ?? null,
             hostId: hostId ?? null,
             readyMarker: readyMarker ?? null,
+            cols: term.cols || undefined,
+            rows: term.rows || undefined,
           });
-          sid = info.id;
-          sessionRef.current = sid;
-          notifiedSessionRef.current = sid;
-          onSessionCreated?.(sid);
+
+          if (destroyed) return abort(info.id);
+
+          sessionRef.current = info.id;
+          notifiedSessionRef.current = info.id;
+          onSessionCreated?.(info.id);
+          return info.id;
+        };
+
+        let sid = sessionRef.current;
+        if (!sid) {
+          sid = await createFresh();
+          if (!sid) return;
+        } else {
+          // Reattaching to an already-running session (e.g. remount, or a
+          // tab restored from before an app restart/backend rebuild — in
+          // which case the backend has no memory of this id at all). Probe
+          // liveness with resize_session; if the backend reports the
+          // session doesn't exist, fall back to creating a fresh one instead
+          // of surfacing "Session not found" as a hard connection failure.
+          try {
+            if (term.cols && term.rows) {
+              await resizeSession(sid, term.cols, term.rows);
+            }
+            const unlistenOutput = await onSessionOutput(sid, (chunk) => {
+              if (!readyMarker) setIsConnecting(false);
+              term.write(chunk);
+            });
+            const unlistenExit = await onSessionExited(sid, () => {
+              if (!readyMarker) setIsConnecting(false);
+              handleDisconnect();
+            });
+            // Orphaned mid-flight: dispose only our own listeners, never the
+            // shared refs — a newer setup pass may own them by now.
+            if (destroyed) {
+              unlistenOutput();
+              unlistenExit();
+              return;
+            }
+            unlistenOutputRef.current = unlistenOutput;
+            unlistenExitRef.current = unlistenExit;
+          } catch (err) {
+            if (!String(err).toLowerCase().includes("not found")) throw err;
+            sid = await createFresh();
+            if (!sid) return;
+          }
         }
 
-        // Listen for PTY output
-        unlistenOutputRef.current = await onSessionOutput(sid, (chunk) => {
-          if (!readyMarker) setIsConnecting(false);
-          term.write(chunk);
-        });
-
-        // Listen for shell exit
-        unlistenExitRef.current = await onSessionExited(sid, () => {
-          if (!readyMarker) setIsConnecting(false);
-          term.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
-        });
+        if (destroyed) return;
 
         // Do an initial fit + resize notification to backend
         safeFit();
@@ -535,11 +895,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         destroyed = true;
         ro.disconnect();
         dataDisp.dispose();
+        selectionDisp.dispose();
         resizeDisp.dispose();
         isInitializedRef.current = false;
         return;
       }
       destroyed = true;
+      clearReconnectTimers();
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
       window.removeEventListener(appThemeChangedEvent, onAppThemeChanged);
@@ -549,6 +911,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       unlistenAppearance?.();
       ro.disconnect();
       dataDisp.dispose();
+      selectionDisp.dispose();
       resizeDisp.dispose();
       unlistenOutputRef.current?.();
       unlistenExitRef.current?.();
@@ -590,24 +953,46 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     }
   }, [onSessionCreated]);
 
+  // A single requestAnimationFrame after a tab's container flips from
+  // display:none to visible isn't reliably enough time for layout to land
+  // on slower machines (seen on Intel Macs) — fitting too early measures a
+  // stale/zero-size box and corrupts how the terminal reflows. Poll across
+  // frames until the container actually has a size, capped so we don't spin
+  // forever if it's legitimately hidden.
+  const fitWhenLaidOut = useCallback((onDone?: () => void) => {
+    let attempts = 0;
+    const tick = () => {
+      const el = ref.current;
+      if (el && el.clientWidth > 0 && el.clientHeight > 0) {
+        fitAddonRef.current?.fit();
+        // fit() -> term.resize() is a no-op when it computes the same
+        // cols/rows as before, which skips xterm's internal re-render. If
+        // an earlier fit ran against a measurement that turned out to be
+        // wrong (e.g. taken while the container was still hidden), this
+        // guarantees a real repaint against the current, correct dimensions
+        // instead of leaving stale content painted into a stale pixel box.
+        const term = termRef.current;
+        if (term) term.refresh(0, term.rows - 1);
+        onDone?.();
+        return;
+      }
+      if (++attempts < 20) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }, []);
+
   // Re-fit and focus when this tab becomes active
   useEffect(() => {
     if (!isActive || isConnecting) return;
-    requestAnimationFrame(() => {
-      fitAddonRef.current?.fit();
-      requestAnimationFrame(() => termRef.current?.focus());
-    });
-  }, [isActive, isConnecting]);
+    fitWhenLaidOut(() => requestAnimationFrame(() => termRef.current?.focus()));
+  }, [isActive, isConnecting, fitWhenLaidOut]);
 
   // Focus terminal when connection overlay is dismissed
   useEffect(() => {
     if (!isConnecting && termRef.current) {
-      requestAnimationFrame(() => {
-        fitAddonRef.current?.fit();
-        requestAnimationFrame(() => termRef.current?.focus());
-      });
+      fitWhenLaidOut(() => requestAnimationFrame(() => termRef.current?.focus()));
     }
-  }, [isConnecting]);
+  }, [isConnecting, fitWhenLaidOut]);
 
   // ── Snippet Palette Logic ──────────────────────────────────────────────────
 
@@ -812,11 +1197,104 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
           </div>
         </div>
       )}
-      <div
-        ref={ref}
-        className="xterm-wrapper h-full w-full pl-1 pt-1"
-        style={{ visibility: isConnecting ? "hidden" : "visible" }}
-      />
+      {!isConnecting && reconnectState && (reconnectState.phase === "waiting" || reconnectState.phase === "connecting") && (
+        <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-3 border-b border-border bg-[var(--color-surface)]/95 px-4 py-2 text-xs backdrop-blur">
+          <div className="flex items-center gap-2">
+            <div className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-muted-foreground border-t-red-400" />
+            <span className="font-medium text-foreground">
+              {reconnectState.phase === "connecting"
+                ? `Reconnecting… (attempt ${reconnectState.attempt} of ${MAX_RECONNECT_ATTEMPTS})`
+                : `Connection lost — retrying (${reconnectState.attempt}/${MAX_RECONNECT_ATTEMPTS}) in ${reconnectState.countdown}s`}
+            </span>
+          </div>
+          {reconnectState.phase === "waiting" && (
+            <button
+              type="button"
+              onClick={() => { clearReconnectTimers(); void performReconnect(reconnectState.attempt); }}
+              className="shrink-0 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-semibold text-foreground hover:bg-[var(--color-surface)]"
+            >
+              Retry now
+            </button>
+          )}
+        </div>
+      )}
+
+      {!isConnecting && reconnectState?.phase === "failed" && (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-background/95 px-4 text-center backdrop-blur">
+          <div className="w-full max-w-sm">
+            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-red-500/15 text-red-400">
+              <span className="text-2xl">⚠</span>
+            </div>
+            <h3 className="text-base font-bold text-foreground">Connection lost</h3>
+            <p className="mt-1.5 text-sm text-muted-foreground">
+              Couldn&apos;t reconnect after {MAX_RECONNECT_ATTEMPTS} attempts. Your terminal history is preserved.
+            </p>
+            <button
+              type="button"
+              onClick={manualReconnect}
+              className="mt-5 h-9 w-full rounded-md bg-[var(--color-brand-orange,oklch(0.75_0.15_55))] text-sm font-semibold text-white hover:opacity-90"
+            >
+              Connect
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/*
+        The terminal element is never itself hidden while connecting — the
+        opaque, fully-covering overlay above (bg-background, inset-0, z-10)
+        already obscures it visually. Toggling this element's own
+        `visibility` used to also gate it, but xterm.js's FitAddon/
+        CharSizeService measures character-cell size via a probe element in
+        this same DOM subtree, and `visibility:hidden` produced unreliable
+        cell measurements on some platforms — cols/rows would get pinned to
+        a stale, too-small size that a later fit (once visible) wouldn't
+        recompute, since xterm.js treats a resize() to the same cols/rows as
+        a no-op and skips re-rendering its internal canvas to the right
+        pixel size.
+      */}
+      {platform === "windows" ? (
+        <div
+          ref={ref}
+          className="xterm-wrapper h-full w-full pl-1 pt-1"
+          onContextMenu={handleWindowsRightClick}
+        />
+      ) : (
+        <ContextMenu.Root>
+          <ContextMenu.Trigger asChild>
+            <div
+              ref={ref}
+              className="xterm-wrapper h-full w-full pl-1 pt-1"
+            />
+          </ContextMenu.Trigger>
+          <ContextMenu.Portal>
+            <ContextMenu.Content
+              className="z-50 min-w-[180px] overflow-hidden rounded-lg border border-border bg-popover p-1 shadow-xl"
+              onCloseAutoFocus={(e) => {
+                e.preventDefault();
+                refocusTerminal();
+              }}
+            >
+              <ContextMenu.Item className={menuItemCls} disabled={!hasSelection} onSelect={copySelection}>
+                <span className="flex-1">Copy</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["terminal-copy"]} />
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItemCls} onSelect={pasteClipboard}>
+                <span className="flex-1">Paste</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["terminal-paste"]} />
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItemCls} onSelect={() => termRef.current?.selectAll()}>
+                <span className="flex-1">Select All</span>
+              </ContextMenu.Item>
+              <ContextMenu.Separator className="my-1 h-px bg-border" />
+              <ContextMenu.Item className={menuItemCls} onSelect={() => termRef.current?.clear()}>
+                <span className="flex-1">Clear</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["clear-terminal"]} />
+              </ContextMenu.Item>
+            </ContextMenu.Content>
+          </ContextMenu.Portal>
+        </ContextMenu.Root>
+      )}
 
       {/* Snippet Palette */}
       {snippetPalette && (
