@@ -55,6 +55,10 @@ import {
   type AppThemeId,
 } from "@/lib/app-theme";
 import {
+  loadSemanticHighlighting,
+  saveSemanticHighlighting,
+} from "@/lib/terminal-highlighter";
+import {
   eventToShortcutBinding,
   formatShortcut,
   getShortcutsUpdatedAt,
@@ -98,6 +102,7 @@ export function SettingsWindow() {
   const isMac = platform === "macos";
   const [terminalAppearance, setTerminalAppearance] = useState(loadTerminalAppearance);
   const [selectedThemeId, setSelectedThemeId] = useState(loadAppTheme().id);
+  const [semanticHighlighting, setSemanticHighlighting] = useState(loadSemanticHighlighting);
   const [mainWindowOpacity, setMainWindowOpacity] = useState(() => {
     try {
       const stored = localStorage.getItem("termifai:main-window-opacity");
@@ -957,6 +962,26 @@ export function SettingsWindow() {
                   </button>
                   );
                 })}
+              </div>
+            </div>
+
+            {/* Semantic Highlighting */}
+            <div className="rounded-xl bg-[var(--color-card)] p-5">
+              <div className="flex items-center justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-base font-medium text-foreground">Smart highlighting</div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    Color URLs, IPs, file paths, emails, IDs, timestamps and log keywords
+                    (error/warning/success) in terminal output, using the active theme&apos;s palette.
+                  </div>
+                </div>
+                <Switch
+                  checked={semanticHighlighting}
+                  onCheckedChange={(checked) => {
+                    setSemanticHighlighting(checked);
+                    saveSemanticHighlighting(checked);
+                  }}
+                />
               </div>
             </div>
 
