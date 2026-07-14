@@ -156,7 +156,45 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
     // when tmux isn't installed.
     const tmuxSession = id.replace(/[^a-zA-Z0-9_-]/g, "_");
     const plainShell = "${SHELL:-/bin/sh} -i";
-    const tmuxAttach = `tmux new-session -A -s ${tmuxSession}`;
+    // -D detaches every other client from the session when attaching. Without
+    // it, a client left over from a previous connection that died without
+    // detaching (network drop, app quit, reconnect) stays "attached" from
+    // tmux's point of view, and tmux clamps the window to the smallest
+    // attached client — pinning the visible area to that dead client's old
+    // geometry and filling the rest of the pane with its dotted placeholder
+    // pattern. Each tab owns its named session exclusively, so stealing the
+    // attachment is always correct here.
+    //
+    // `\; set-option status off` hides tmux's status bar in these sessions:
+    // tmux here is an invisible resilience layer (the session survives a
+    // dropped connection), not something the user asked for, so its status
+    // line reads as unexplained UI. Session-scoped — a user's own tmux
+    // sessions on the host keep their status bar.
+    //
+    // `smcup@:rmcup@` tells tmux the outer terminal has no alternate
+    // screen, so tmux draws on the NORMAL buffer. That's what keeps the
+    // terminal behaving like a plain (non-tmux) one: lines that scroll off
+    // the top land in xterm.js's own local scrollback, giving the native
+    // scrollbar, instant wheel scrolling with no network round-trip, and no
+    // wheel→arrow-keys translation (xterm.js only does that in the alt
+    // buffer). tmux's mouse mode stays OFF for the same reason — with it
+    // on, tmux owns the wheel (laggy remote copy-mode), drag-selection, and
+    // right-click (its own popup menu instead of the app's). This is the
+    // standard "native scrollback" tmux setup.
+    //
+    // `-L termifai` runs these sessions on a dedicated tmux server socket:
+    // terminal-overrides is server-global, and quietly stripping alt-screen
+    // support from the user's own tmux sessions on the host would corrupt
+    // their setup.
+    //
+    // terminal-overrides must be set BEFORE new-session — it's consulted
+    // when the client attaches. status off is session-scoped, so it comes
+    // after. Plain -g (not -ga) keeps the override idempotent across
+    // reconnects.
+    const tmuxAttach =
+      `tmux -L termifai set-option -g terminal-overrides ",xterm-256color:smcup@:rmcup@"` +
+      ` \\; new-session -AD -s ${tmuxSession}` +
+      ` \\; set-option status off`;
     const remoteBootstrap =
       `printf '${readyMarker}\\n'; ${cdPart}` +
       `if command -v tmux >/dev/null 2>&1; then exec ${tmuxAttach}; else exec ${plainShell}; fi`;

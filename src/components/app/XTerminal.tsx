@@ -1,5 +1,6 @@
 import { useEffect, useRef, useLayoutEffect, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
@@ -283,28 +284,55 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   const performReconnect = async (attempt: number) => {
     clearReconnectTimers();
+    // termRef is nulled on unmount — a reconnect completing after that would
+    // create an ownerless ssh session that (via tmux attach -D on the same
+    // named session) kicks the client of whichever terminal replaced us.
+    if (!termRef.current) return;
     setReconnectState({ phase: "connecting", attempt, countdown: 0 });
+    const staleSid = sessionRef.current;
     try {
+      const term = termRef.current;
+      const newSid = crypto.randomUUID();
+
+      // Register listeners against the new id before creating the session,
+      // same ordering as the initial connect — otherwise output emitted
+      // right after reconnect can be dropped before anything is listening.
+      unlistenOutputRef.current?.();
+      unlistenExitRef.current?.();
+      unlistenOutputRef.current = await onSessionOutput(newSid, (chunk) => {
+        termRef.current?.write(chunk);
+      });
+      unlistenExitRef.current = await onSessionExited(newSid, () => {
+        handleDisconnect();
+      });
+
       const info = await createSession({
+        sessionId: newSid,
         cwd: cwd ?? "",
         initialCommand: initialCommand ?? null,
         hostId: hostId ?? null,
         readyMarker: readyMarker ?? null,
+        cols: term?.cols || undefined,
+        rows: term?.rows || undefined,
       });
+      if (!termRef.current) {
+        closeSession(info.id).catch(() => {});
+        return;
+      }
       sessionRef.current = info.id;
 
-      unlistenOutputRef.current?.();
-      unlistenExitRef.current?.();
-      unlistenOutputRef.current = await onSessionOutput(info.id, (chunk) => {
-        termRef.current?.write(chunk);
-      });
-      unlistenExitRef.current = await onSessionExited(info.id, () => {
-        handleDisconnect();
-      });
-
-      const term = termRef.current;
       if (term?.cols && term?.rows) {
         await resizeSession(info.id, term.cols, term.rows);
+      }
+
+      // Keep the tab's persisted session id (AppShell state) in sync with the
+      // live session — otherwise it stays pinned to the pre-reconnect id and
+      // any later resync of sessionRef.current from that stale prop makes
+      // every keystroke write into a dead/nonexistent session.
+      notifiedSessionRef.current = info.id;
+      onSessionCreated?.(info.id);
+      if (staleSid && staleSid !== info.id) {
+        closeSession(staleSid).catch(() => {});
       }
 
       reconnectAttemptRef.current = 0;
@@ -441,6 +469,12 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     fitAddonRef.current = fit;
     term.loadAddon(fit);
     term.loadAddon(new WebLinksAddon());
+    // OSC52 clipboard support: with tmux mouse mode on (see AppShell's
+    // remote bootstrap), drag-selection is handled by tmux on the host and
+    // lands in a tmux buffer — tmux then forwards it as an OSC52 escape,
+    // which this addon writes into the system clipboard so drag-to-copy
+    // keeps working exactly like it does without the tmux layer.
+    term.loadAddon(new ClipboardAddon());
     term.open(ref.current);
     termRef.current = term;
     requestAnimationFrame(() => term.focus());
@@ -511,6 +545,56 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     };
     requestAnimationFrame(safeFit);
 
+    // Poll across frames until the container's layout box has been the same
+    // size for a few consecutive frames, then fit. Used before creating a
+    // fresh SSH session: `ssh -tt` execs straight into `tmux new-session -A`,
+    // which births the remote window at whatever size the local PTY has *at
+    // that moment* — tmux/byobu's window-size handling frequently doesn't
+    // retroactively grow a window past its birth size even after a later
+    // resize is forwarded over SSH. So the PTY needs the real, *settled*
+    // size up front, not a guess corrected later. A single non-zero reading
+    // isn't enough: right after a new tab is inserted the flex layout can
+    // still be reflowing (and the terminal font may still be loading, which
+    // changes cell measurements), so the first non-zero frame is often a
+    // transient, too-small intermediate size rather than the final one.
+    const waitForLayoutAndFit = (): Promise<void> =>
+      new Promise((resolve) => {
+        let attempts = 0;
+        let lastW = -1;
+        let lastH = -1;
+        let stableFrames = 0;
+        const tick = () => {
+          const el = ref.current;
+          const w = el?.clientWidth ?? 0;
+          const h = el?.clientHeight ?? 0;
+          if (w > 0 && h > 0) {
+            stableFrames = w === lastW && h === lastH ? stableFrames + 1 : 0;
+            lastW = w;
+            lastH = h;
+            if (stableFrames >= 4) {
+              try {
+                fit.fit();
+              } catch {
+                /* element not visible yet */
+              }
+              resolve();
+              return;
+            }
+          }
+          if (++attempts < 60) {
+            requestAnimationFrame(tick);
+          } else {
+            try {
+              fit.fit();
+            } catch {
+              /* element not visible yet */
+            }
+            resolve();
+          }
+        };
+        requestAnimationFrame(tick);
+      });
+
     const ro = new ResizeObserver(safeFit);
     ro.observe(ref.current);
     const applyAppearance = (nextAppearance: TerminalAppearance) => {
@@ -579,7 +663,18 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       if (!sid) return;
 
       const send = (payload: string) =>
-        writeToSession(sid, payload).catch((err) => console.error("write_to_session failed:", err));
+        writeToSession(sid, payload).catch((err) => {
+          console.error("write_to_session failed:", err);
+          // A "Session not found" write means the backend PTY behind sid is
+          // gone (e.g. it was superseded by a reconnect this component
+          // missed, or the process exited) — every future keystroke would
+          // silently no-op otherwise. Trigger the same recovery path as an
+          // unexpected disconnect instead of leaving the user stuck typing
+          // into a dead session.
+          if (sid === sessionRef.current && String(err).toLowerCase().includes("not found")) {
+            handleDisconnect();
+          }
+        });
 
       if (data === "\r") {
         currentLineRef.current = "";
@@ -654,31 +749,127 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
           );
         }
 
-        let sid = sessionRef.current;
-        if (!sid) {
+        // Registers listeners for a brand-new session id *before* calling
+        // createSession (Tauri drops events emitted with no listener
+        // attached — any output the backend emits before this registration
+        // lands would otherwise be silently lost), waits for the container's
+        // real, settled layout so the PTY is opened at the right size (SSH
+        // hosts exec straight into `tmux new-session -A`, which births the
+        // remote window at whatever size the PTY has *right now* — tmux/byobu
+        // won't reliably grow a window past its birth size even once a
+        // later resize is forwarded), then creates the session.
+        // Returns null when this setup pass was orphaned mid-flight (its
+        // mount got cleaned up — Strict Mode double-invoke or a fast
+        // unmount). Aborting matters beyond hygiene: a leaked ssh session
+        // attaches the same named tmux session as the live one, and since
+        // the attach uses `-D` (detach other clients), the orphan and the
+        // real session would kick each other's client off in a loop — seen
+        // by the user as several spurious auto-reconnects right after
+        // connecting.
+        const createFresh = async (): Promise<string | null> => {
+          if (destroyed) return null;
+          const newSid = crypto.randomUUID();
+          sessionRef.current = newSid;
+
+          unlistenOutputRef.current?.();
+          unlistenExitRef.current?.();
+          unlistenOutputRef.current = null;
+          unlistenExitRef.current = null;
+
+          const unlistenOutput = await onSessionOutput(newSid, (chunk) => {
+            if (!readyMarker) setIsConnecting(false);
+            term.write(chunk);
+          });
+          const unlistenExit = await onSessionExited(newSid, () => {
+            if (!readyMarker) setIsConnecting(false);
+            handleDisconnect();
+          });
+
+          // Tears down only what THIS pass created. The shared refs must
+          // never be blanket-disposed here: with two setup passes in flight
+          // (Strict Mode double-invoke), the refs may already hold the
+          // *newer* pass's live listeners, and disposing those would leave
+          // the surviving terminal deaf to all PTY output.
+          const abort = (createdId?: string): null => {
+            unlistenOutput();
+            unlistenExit();
+            if (unlistenOutputRef.current === unlistenOutput) unlistenOutputRef.current = null;
+            if (unlistenExitRef.current === unlistenExit) unlistenExitRef.current = null;
+            if (sessionRef.current === newSid) sessionRef.current = null;
+            if (createdId) closeSession(createdId).catch(() => {});
+            return null;
+          };
+
+          if (destroyed) return abort();
+          unlistenOutputRef.current = unlistenOutput;
+          unlistenExitRef.current = unlistenExit;
+
+          // Character-cell measurements (and therefore fit()'s cols/rows)
+          // depend on the terminal font actually being loaded — fitting
+          // against a fallback font can under/over-count columns.
+          await ensureTerminalFontLoaded(appearance).catch(() => {});
+          await waitForLayoutAndFit();
+
+          if (destroyed) return abort();
+
           const info = await createSession({
+            sessionId: newSid,
             cwd: cwd ?? "",
             initialCommand: initialCommand ?? null,
             hostId: hostId ?? null,
             readyMarker: readyMarker ?? null,
+            cols: term.cols || undefined,
+            rows: term.rows || undefined,
           });
-          sid = info.id;
-          sessionRef.current = sid;
-          notifiedSessionRef.current = sid;
-          onSessionCreated?.(sid);
+
+          if (destroyed) return abort(info.id);
+
+          sessionRef.current = info.id;
+          notifiedSessionRef.current = info.id;
+          onSessionCreated?.(info.id);
+          return info.id;
+        };
+
+        let sid = sessionRef.current;
+        if (!sid) {
+          sid = await createFresh();
+          if (!sid) return;
+        } else {
+          // Reattaching to an already-running session (e.g. remount, or a
+          // tab restored from before an app restart/backend rebuild — in
+          // which case the backend has no memory of this id at all). Probe
+          // liveness with resize_session; if the backend reports the
+          // session doesn't exist, fall back to creating a fresh one instead
+          // of surfacing "Session not found" as a hard connection failure.
+          try {
+            if (term.cols && term.rows) {
+              await resizeSession(sid, term.cols, term.rows);
+            }
+            const unlistenOutput = await onSessionOutput(sid, (chunk) => {
+              if (!readyMarker) setIsConnecting(false);
+              term.write(chunk);
+            });
+            const unlistenExit = await onSessionExited(sid, () => {
+              if (!readyMarker) setIsConnecting(false);
+              handleDisconnect();
+            });
+            // Orphaned mid-flight: dispose only our own listeners, never the
+            // shared refs — a newer setup pass may own them by now.
+            if (destroyed) {
+              unlistenOutput();
+              unlistenExit();
+              return;
+            }
+            unlistenOutputRef.current = unlistenOutput;
+            unlistenExitRef.current = unlistenExit;
+          } catch (err) {
+            if (!String(err).toLowerCase().includes("not found")) throw err;
+            sid = await createFresh();
+            if (!sid) return;
+          }
         }
 
-        // Listen for PTY output
-        unlistenOutputRef.current = await onSessionOutput(sid, (chunk) => {
-          if (!readyMarker) setIsConnecting(false);
-          term.write(chunk);
-        });
-
-        // Listen for shell exit
-        unlistenExitRef.current = await onSessionExited(sid, () => {
-          if (!readyMarker) setIsConnecting(false);
-          handleDisconnect();
-        });
+        if (destroyed) return;
 
         // Do an initial fit + resize notification to backend
         safeFit();
@@ -774,6 +965,14 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       const el = ref.current;
       if (el && el.clientWidth > 0 && el.clientHeight > 0) {
         fitAddonRef.current?.fit();
+        // fit() -> term.resize() is a no-op when it computes the same
+        // cols/rows as before, which skips xterm's internal re-render. If
+        // an earlier fit ran against a measurement that turned out to be
+        // wrong (e.g. taken while the container was still hidden), this
+        // guarantees a real repaint against the current, correct dimensions
+        // instead of leaving stale content painted into a stale pixel box.
+        const term = termRef.current;
+        if (term) term.refresh(0, term.rows - 1);
         onDone?.();
         return;
       }
@@ -1041,11 +1240,23 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         </div>
       )}
 
+      {/*
+        The terminal element is never itself hidden while connecting — the
+        opaque, fully-covering overlay above (bg-background, inset-0, z-10)
+        already obscures it visually. Toggling this element's own
+        `visibility` used to also gate it, but xterm.js's FitAddon/
+        CharSizeService measures character-cell size via a probe element in
+        this same DOM subtree, and `visibility:hidden` produced unreliable
+        cell measurements on some platforms — cols/rows would get pinned to
+        a stale, too-small size that a later fit (once visible) wouldn't
+        recompute, since xterm.js treats a resize() to the same cols/rows as
+        a no-op and skips re-rendering its internal canvas to the right
+        pixel size.
+      */}
       {platform === "windows" ? (
         <div
           ref={ref}
           className="xterm-wrapper h-full w-full pl-1 pt-1"
-          style={{ visibility: isConnecting ? "hidden" : "visible" }}
           onContextMenu={handleWindowsRightClick}
         />
       ) : (
@@ -1054,7 +1265,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
             <div
               ref={ref}
               className="xterm-wrapper h-full w-full pl-1 pt-1"
-              style={{ visibility: isConnecting ? "hidden" : "visible" }}
             />
           </ContextMenu.Trigger>
           <ContextMenu.Portal>

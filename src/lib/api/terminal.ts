@@ -1,10 +1,13 @@
 import { call, subscribe, type UnlistenFn } from "./transport";
 
 export interface CreateSessionRequest {
+  sessionId: string;
   cwd: string;
   initialCommand: string | null;
   hostId: string | null;
   readyMarker: string | null;
+  cols?: number;
+  rows?: number;
 }
 
 export interface SessionInfo {
