@@ -2050,6 +2050,10 @@ fn force_quit_app(app: tauri::AppHandle) {
     // Without this flag the ExitRequested handler treats the exit as a
     // window close and hides the app instead of quitting it.
     SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+    // supervise:false must hit disk BEFORE the daemon dies: a daemon tick
+    // racing the pkill would otherwise see a dead app and resurrect it with
+    // a --background instance (which would in turn respawn the daemon).
+    global_hotkey::clean_quit(&app);
     global_hotkey::kill_daemon();
     app.exit(0);
 }
@@ -2430,6 +2434,9 @@ pub fn run() {
                         api.prevent_close();
                     } else {
                         log::info!("run_in_background is false: quitting app");
+                        // supervise:false before killing the daemon — see
+                        // force_quit_app.
+                        global_hotkey::clean_quit(app);
                         global_hotkey::kill_daemon();
                         app.exit(0);
                     }
@@ -2735,6 +2742,9 @@ pub fn run() {
                     }
                     "custom-force-quit" => {
                         SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // supervise:false before killing the daemon — see
+                        // force_quit_app.
+                        global_hotkey::clean_quit(&handle);
                         global_hotkey::kill_daemon();
                         handle.exit(0);
                     }
@@ -2796,6 +2806,9 @@ pub fn run() {
                     }
                     "tray-force-quit" => {
                         SHOULD_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+                        // supervise:false before killing the daemon — see
+                        // force_quit_app.
+                        global_hotkey::clean_quit(app);
                         global_hotkey::kill_daemon();
                         app.exit(0);
                     }
@@ -2845,6 +2858,9 @@ pub fn run() {
                     SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst)
                 );
                 if !run_in_background {
+                    // Backstop for any exit path (e.g. Cmd+Q): stop the
+                    // daemon from resurrecting the app — see force_quit_app.
+                    global_hotkey::clean_quit(app_handle);
                     global_hotkey::kill_daemon();
                 } else if !SHOULD_EXIT.load(std::sync::atomic::Ordering::SeqCst) {
                     api.prevent_exit();
