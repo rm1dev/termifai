@@ -36,15 +36,22 @@ export interface SystemMetrics {
   ip: string;
 }
 
+export type ContainerHealth = "healthy" | "unhealthy" | "starting";
+
 export interface ContainerMetric {
   id: string;
   name: string;
   state: string;
+  statusText: string; // e.g. "Up 3 hours", "Exited (137) 2 minutes ago"
+  health: ContainerHealth | null;
+  restartCount: number;
   cpuPct: number;
   memUsedBytes: number;
   memLimitBytes: number;
   netRxRate: number;
   netTxRate: number;
+  diskReadRate: number;  // bytes/sec
+  diskWriteRate: number; // bytes/sec
 }
 
 export interface ProcessInfo {
@@ -55,10 +62,16 @@ export interface ProcessInfo {
   memKb: number;
 }
 
+export interface ContainerSummary {
+  running: number;
+  stopped: number;
+}
+
 export interface HostPollResult {
   hostId: string;
   ok: boolean;
   system: SystemMetrics | null;
+  containerSummary: ContainerSummary | null; // null = docker not installed on this host
   containers: ContainerMetric[] | null;
   processes: ProcessInfo[] | null;
   error: string | null;
@@ -81,8 +94,10 @@ interface DashStatusEvent {
 
 const OVERVIEW_INTERVAL_ACTIVE_MS = 30_000;
 const OVERVIEW_INTERVAL_INACTIVE_MS = 120_000;
-const PROCESS_INTERVAL_MS = 5_000;
-const CONTAINER_INTERVAL_MS = 30_000;
+// Processes and containers share this cadence — the batched docker collection (Phase A of
+// the container-monitoring plan) is cheap enough that container state doesn't need its own
+// slower interval anymore.
+const DETAIL_INTERVAL_MS = 5_000;
 
 /**
  * Module-level singleton so dashboard polling and connection state survive the
@@ -229,4 +244,4 @@ class DashboardStore {
 
 export const dashboardStore = new DashboardStore();
 
-export { PROCESS_INTERVAL_MS, CONTAINER_INTERVAL_MS };
+export { DETAIL_INTERVAL_MS };

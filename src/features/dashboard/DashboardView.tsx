@@ -40,7 +40,7 @@ import {
   YAxis,
 } from "recharts";
 import type { Host, HostGroup } from "@/components/app/types";
-import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostStatusEntry, type HostPhase, type CoreMetrics } from "@/lib/dashboard";
+import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostStatusEntry, type HostPhase, type ContainerSummary, type CoreMetrics } from "@/lib/dashboard";
 
 function CircularGauge({ value, label }: { value: number; label: string }) {
   const r = 24;
@@ -161,28 +161,33 @@ function IoStat({
   label: string;
   rows: { icon: React.ComponentType<{ className?: string }>; value: string; unit: string; letter?: string }[];
 }) {
+  // The outer div claims an equal share of the row (flex-1) while the inner block is
+  // content-sized and centered inside it — leftover space splits evenly on both sides
+  // instead of piling up to the right of left-aligned text.
   return (
-    <div className="flex min-w-0 flex-1 flex-col gap-1">
-      <span className="text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
-        {label}
-      </span>
-      <div className="flex flex-col gap-0.5">
+    <div className="flex min-w-0 flex-1 justify-center">
+      <div className="flex min-w-0 flex-col gap-1">
+        <span className="text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
+          {label}
+        </span>
+        <div className="flex min-w-0 flex-col gap-0.5">
         {rows.map((r, i) => {
           const Icon = r.icon;
           return (
-            <div key={i} className="flex items-center gap-1.5 font-mono tabular-nums">
+            <div key={i} className="flex min-w-0 items-center gap-1 font-mono tabular-nums">
               {r.letter ? (
-                <span className="flex h-3 w-3 items-center justify-center rounded-full border border-border text-[7px] font-bold text-muted-foreground">
+                <span className="flex h-3 w-3 shrink-0 items-center justify-center rounded-full border border-border text-[7px] font-bold text-muted-foreground">
                   {r.letter}
                 </span>
               ) : (
-                <Icon className="h-2.5 w-2.5 text-muted-foreground" />
+                <Icon className="h-2.5 w-2.5 shrink-0 text-muted-foreground" />
               )}
-              <span className="text-[11px] font-bold text-foreground">{r.value}</span>
-              <span className="text-[9px] text-muted-foreground">{r.unit}</span>
+              <span className="truncate text-[10px] font-bold text-foreground">{r.value}</span>
+              <span className="shrink-0 text-[9px] text-muted-foreground">{r.unit}</span>
             </div>
           );
         })}
+        </div>
       </div>
     </div>
   );
@@ -222,6 +227,26 @@ function statusLabel(phase: HostPhase, hostStatus?: HostStatusEntry): string {
     default:
       return "Connecting…";
   }
+}
+
+/** Running/stopped container counts on the overview card — container health is often more
+ *  urgent than host-level CPU/RAM, so it's surfaced here instead of only in detail view. */
+function ContainerSummaryBadge({ summary }: { summary: ContainerSummary }) {
+  const hasStopped = summary.stopped > 0;
+  return (
+    <span
+      className={`flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-bold tabular-nums ${
+        hasStopped
+          ? "bg-[color-mix(in_oklab,var(--color-brand-orange)_16%,transparent)] text-[var(--color-brand-orange)]"
+          : "bg-[color-mix(in_oklab,var(--color-brand-green)_14%,transparent)] text-[var(--color-brand-green)]"
+      }`}
+      title={`${summary.running} running, ${summary.stopped} stopped`}
+    >
+      <Container className="h-3 w-3" />
+      {summary.running}
+      {hasStopped && <span className="opacity-70">/{summary.stopped}↓</span>}
+    </span>
+  );
 }
 
 export function DashboardView() {
@@ -264,6 +289,7 @@ export function DashboardView() {
     const hostStatus = status[host.id];
     const phase: HostPhase = hostStatus?.phase ?? "connecting";
     const sys = poll?.system ?? null;
+    const containerSummary = poll?.containerSummary ?? null;
 
     return (
       <button
@@ -275,7 +301,10 @@ export function DashboardView() {
       >
         {/* Header */}
         <div className="flex items-center justify-between">
-          <span className="text-sm font-semibold text-foreground">{host.name}</span>
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-foreground">{host.name}</span>
+            {containerSummary && <ContainerSummaryBadge summary={containerSummary} />}
+          </div>
           <div className="flex items-center gap-1.5">
             <span className={`h-2 w-2 rounded-full ${statusDotClass(phase)}`} />
             <span
@@ -354,7 +383,7 @@ export function DashboardView() {
 
         {hasDirectHosts && (
           <div 
-            className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(340px,1fr))]"
+            className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(min(340px,100%),1fr))]"
             style={{ marginLeft: `${depth * 8}px` }}
           >
             {groupHosts.map(host => renderHostCard(host))}
@@ -373,7 +402,7 @@ export function DashboardView() {
   return (
     <div className="flex h-full min-h-0 flex-col overflow-y-auto p-5">
       {/* Summary stats */}
-      <div className="mb-5 grid grid-cols-3 gap-4">
+      <div className="mb-5 grid grid-cols-3 gap-2 sm:gap-4">
         <div className="rounded-xl border border-border bg-[var(--color-surface)] p-4">
           <div className="text-xs text-muted-foreground">Total Servers</div>
           <div className="mt-1 flex items-center gap-2">
@@ -759,6 +788,42 @@ function SectionLabel({
   );
 }
 
+/** Zero-value container card shown while the per-container list is still loading but we
+ *  already know (from containerSummary) how many containers to expect — same "structure
+ *  exists, data is zero" pattern as the overview cards, no shimmer. */
+function ContainerPlaceholderCard({ index }: { index: number }) {
+  return (
+    <div className="relative overflow-hidden rounded-xl border border-border bg-background/40 p-3">
+      <div aria-hidden className="absolute inset-y-0 left-0 w-[3px]" style={{ background: "var(--color-border)" }} />
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0 truncate text-[12px] font-semibold text-muted-foreground">Container</div>
+        <div className="flex shrink-0 items-center gap-1.5 text-[10px] text-muted-foreground">
+          <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-pulse" />
+          <span className="font-mono">loading…</span>
+        </div>
+      </div>
+      <div className="mt-2.5 flex items-start gap-2.5">
+        <RingGauge value={0} label="CPU" gradientId={`g-cpu-ph-${index}`} size={40} stroke={5} />
+        <RingGauge value={0} label="RAM" gradientId={`g-ram-ph-${index}`} size={40} stroke={5} />
+        <IoStat
+          label="Network"
+          rows={[
+            { icon: ArrowDownToLine, value: fmtBytes(0), unit: "/s" },
+            { icon: ArrowUpFromLine, value: fmtBytes(0), unit: "/s" },
+          ]}
+        />
+        <IoStat
+          label="Disk I/O"
+          rows={[
+            { letter: "R", icon: ArrowDownToLine, value: fmtBytes(0), unit: "/s" },
+            { letter: "W", icon: ArrowUpFromLine, value: fmtBytes(0), unit: "/s" },
+          ]}
+        />
+      </div>
+    </div>
+  );
+}
+
 function HostDashboardView({
   host,
   hostStatus,
@@ -774,10 +839,40 @@ function HostDashboardView({
   const { detail: poll } = useHostDetail(host.id);
   const sys = poll?.system ?? null;
   const pollProcesses = poll?.processes ?? null;
-  const pollContainers = poll?.containers ?? null; // null = docker not installed
+  const pollContainers = poll?.containers ?? null; // null until the per-container list has loaded
+  // Comes from the (much cheaper) overview poll, so it's usually already known — running/
+  // stopped counts and the section itself can show immediately instead of appearing empty
+  // while the full per-container list is still loading. null = docker not installed.
+  const containerSummary = poll?.containerSummary ?? null;
   const phase: HostPhase = hostStatus?.phase ?? "connecting";
 
   const [procSearch, setProcSearch] = useState("");
+
+  // Briefly highlight a container card when its state changes between polls (e.g. a crash
+  // or restart) — a client-side diff against the previous poll, no backend support needed.
+  const prevContainerStatesRef = useRef<Record<string, string>>({});
+  const [changedContainerIds, setChangedContainerIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!pollContainers) return;
+    const prevStates = prevContainerStatesRef.current;
+    const nextStates: Record<string, string> = {};
+    const changed: string[] = [];
+    for (const c of pollContainers) {
+      nextStates[c.id] = c.state;
+      if (prevStates[c.id] !== undefined && prevStates[c.id] !== c.state) changed.push(c.id);
+    }
+    prevContainerStatesRef.current = nextStates;
+    if (changed.length === 0) return;
+    setChangedContainerIds((prev) => new Set([...prev, ...changed]));
+    const timer = setTimeout(() => {
+      setChangedContainerIds((prev) => {
+        const next = new Set(prev);
+        for (const id of changed) next.delete(id);
+        return next;
+      });
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [pollContainers]);
 
   // Accumulate load average history for the chart (max 32 points)
   const loadHistoryRef = useRef<{ t: number; m1: number; m5: number; m15: number }[]>([]);
@@ -810,10 +905,14 @@ function HostDashboardView({
   ];
 
   return (
-    <ScrollArea className="h-full">
-      <div className="mx-auto max-w-[1400px] space-y-5 p-6">
+    // Native overflow scroll, NOT Radix ScrollArea: its viewport wraps content in a
+    // `display:table` div whose width tracks content max-content. Combined with the fixed
+    // pixel width recharts leaves on its rendered SVG, that deadlocks window shrinking
+    // (everything grows fine, nothing ever shrinks until a remount re-measures).
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto max-w-[1400px] space-y-4 p-4 sm:space-y-5 sm:p-6">
         {/* ─── HERO IDENTITY BAR ───────────────────────────────────── */}
-        <header className="relative overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-5">
+        <header className="relative overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-4 sm:p-5">
           <div
             aria-hidden
             className="pointer-events-none absolute inset-x-0 top-0 h-px"
@@ -822,8 +921,8 @@ function HostDashboardView({
                 "linear-gradient(90deg, transparent, color-mix(in oklab, var(--color-brand-cyan) 40%, transparent), transparent)",
             }}
           />
-          <div className="flex flex-wrap items-center justify-between gap-6">
-            <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-4 sm:gap-6">
+            <div className="flex min-w-0 items-center gap-3 sm:gap-4">
               <Button
                 variant="outline"
                 size="icon"
@@ -835,7 +934,7 @@ function HostDashboardView({
               </Button>
 
               <div
-                className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-border bg-background shadow-inner"
+                className="hidden h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-border bg-background shadow-inner sm:flex"
                 style={{
                   boxShadow:
                     "inset 0 1px 0 color-mix(in oklab, var(--color-brand-cyan) 12%, transparent), 0 0 24px color-mix(in oklab, var(--color-brand-cyan) 8%, transparent)",
@@ -844,8 +943,8 @@ function HostDashboardView({
                 <Server className="h-6 w-6" style={{ color: "var(--color-brand-cyan)" }} />
               </div>
 
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-2.5">
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
                   <h1 className="text-xl font-bold tracking-tight text-foreground">{host.name}</h1>
                   <Badge
                     variant="secondary"
@@ -884,14 +983,14 @@ function HostDashboardView({
               </div>
             </div>
 
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-5 rounded-xl border border-border bg-background/60 px-4 py-2.5">
-                <MiniGauge value={sys?.cpuPct ?? 0} label="CPU" color="var(--color-brand-cyan)" />
-                <span className="h-9 w-px bg-border" />
-                <MiniGauge value={memUsedPct} label="RAM" color="oklch(0.7 0.28 320)" />
-                <span className="h-9 w-px bg-border" />
-                <MiniGauge value={diskPct} label="Disk" color="var(--color-brand-yellow)" />
-              </div>
+            {/* Grows to a full evenly-spread row when it wraps under the title on
+                narrow screens; compact pill on desktop. */}
+            <div className="flex flex-1 items-center justify-around gap-3 rounded-xl border border-border bg-background/60 px-4 py-2.5 sm:gap-5 lg:flex-none lg:justify-start">
+              <MiniGauge value={sys?.cpuPct ?? 0} label="CPU" color="var(--color-brand-cyan)" />
+              <span className="h-9 w-px bg-border" />
+              <MiniGauge value={memUsedPct} label="RAM" color="oklch(0.7 0.28 320)" />
+              <span className="h-9 w-px bg-border" />
+              <MiniGauge value={diskPct} label="Disk" color="var(--color-brand-yellow)" />
             </div>
           </div>
         </header>
@@ -905,14 +1004,16 @@ function HostDashboardView({
         />
 
         {/* ─── CPU LOAD CHART + PROCESSES ─────────────────────────── */}
-        <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-          <section className="flex flex-col rounded-2xl border border-border bg-[var(--color-surface)] p-5 lg:col-span-7">
+        {/* Window minimum is 900px, so this pair is always side by side */}
+        <div className="grid grid-cols-12 gap-5">
+          {/* min-w-0: let the grid item shrink below the chart SVG's last rendered width */}
+          <section className="col-span-7 flex min-w-0 flex-col rounded-2xl border border-border bg-[var(--color-surface)] p-5">
             <SectionLabel
               color="var(--color-brand-yellow)"
               icon={Activity}
               title="CPU Load Average"
               action={
-                <div className="flex gap-3 text-[11px]">
+                <div className="flex flex-wrap justify-end gap-x-3 gap-y-1 text-[11px]">
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-red)]" />
                     <span className="text-muted-foreground">1m</span>
@@ -931,7 +1032,8 @@ function HostDashboardView({
                 </div>
               }
             />
-            <div className="flex-1 min-h-0 w-full">
+            {/* Row height is driven by the fixed-height processes table beside it */}
+            <div className="min-h-0 w-full flex-1">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart data={loadHistory} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
                   <defs>
@@ -977,7 +1079,7 @@ function HostDashboardView({
             </div>
           </section>
 
-          <section className="overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] lg:col-span-5">
+          <section className="col-span-5 min-w-0 overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)]">
             <div className="px-4 pt-4 pb-2">
               <SectionLabel
                 color="var(--color-brand-red)"
@@ -1068,7 +1170,7 @@ function HostDashboardView({
         </div>
 
         {/* ─── MEMORY · NETWORK · STORAGE BENTO ───────────────────── */}
-        <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+        <div className="grid grid-cols-2 gap-5 lg:grid-cols-3">
           {/* Memory */}
           <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
             <SectionLabel color="oklch(0.7 0.28 320)" icon={Activity} title="Memory" />
@@ -1159,8 +1261,8 @@ function HostDashboardView({
             </div>
           </section>
 
-          {/* Storage */}
-          <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-4">
+          {/* Storage — spans the full second row in the 2-col layout below lg */}
+          <section className="col-span-2 rounded-2xl border border-border bg-[var(--color-surface)] p-4 lg:col-span-1">
             <SectionLabel
               color="var(--color-brand-green)"
               icon={HardDrive}
@@ -1228,7 +1330,9 @@ function HostDashboardView({
         </div>
 
         {/* ─── DOCKER CONTAINERS ──────────────────────────────────── */}
-        {pollContainers !== null && (
+        {/* Shown as soon as containerSummary is known (from the cheap overview poll) —
+            running/stopped counts don't wait on the full per-container list. */}
+        {(pollContainers !== null || containerSummary !== null) && (
           <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
             <SectionLabel
               color="oklch(0.65 0.22 270)"
@@ -1238,62 +1342,100 @@ function HostDashboardView({
                 <div className="flex items-center gap-2 text-[11px]">
                   <span className="flex items-center gap-1 text-muted-foreground">
                     <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
-                    {pollContainers.filter((c) => c.state === "running").length} running
+                    {pollContainers !== null
+                      ? pollContainers.filter((c) => c.state === "running").length
+                      : (containerSummary?.running ?? 0)}{" "}
+                    running
                   </span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span className="flex items-center gap-1 text-muted-foreground">
                     <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
-                    {pollContainers.filter((c) => c.state !== "running").length} stopped
+                    {pollContainers !== null
+                      ? pollContainers.filter((c) => c.state !== "running").length
+                      : (containerSummary?.stopped ?? 0)}{" "}
+                    stopped
                   </span>
                 </div>
               }
             />
-            {pollContainers.length === 0 ? (
+            {pollContainers === null ? (
+              containerSummary && containerSummary.running + containerSummary.stopped > 0 ? (
+                <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+                  {Array.from({ length: containerSummary.running + containerSummary.stopped }).map((_, i) => (
+                    <ContainerPlaceholderCard key={i} index={i} />
+                  ))}
+                </div>
+              ) : (
+                <div className="py-8 text-center text-sm text-muted-foreground">No containers found.</div>
+              )
+            ) : pollContainers.length === 0 ? (
               <div className="py-8 text-center text-sm text-muted-foreground">No containers found.</div>
             ) : (
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
                 {pollContainers.map((c) => {
                   const isUp = c.state === "running";
                   const memPct = c.memLimitBytes > 0 ? (c.memUsedBytes / c.memLimitBytes) * 100 : 0;
+                  const dotClass =
+                    c.health === "unhealthy"
+                      ? "bg-[var(--color-brand-red)] shadow-[0_0_6px_var(--color-brand-red)]"
+                      : c.health === "starting"
+                        ? "bg-[var(--color-brand-yellow)]"
+                        : c.health === "healthy" || isUp
+                          ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
+                          : "bg-muted-foreground/50";
+                  const justChangedState = changedContainerIds.has(c.id);
                   return (
                     <div
                       key={c.id}
-                      className="group relative overflow-hidden rounded-xl border border-border bg-background/40 p-3.5 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))]"
+                      className={`group relative overflow-hidden rounded-xl border bg-background/40 p-3 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))] ${
+                        justChangedState ? "border-[var(--color-brand-orange)] ring-1 ring-[var(--color-brand-orange)]" : "border-border"
+                      }`}
                     >
                       <div
                         aria-hidden
                         className="absolute inset-y-0 left-0 w-[3px]"
                         style={{ background: isUp ? "var(--color-brand-green)" : "var(--color-border)" }}
                       />
-                      <div className="flex items-center justify-between">
-                        <div className="min-w-0">
+                      {/* Row 1 — name (left) · status (right) */}
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-1.5">
                           <div className="truncate text-[12px] font-semibold text-foreground">{c.name}</div>
-                          <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                          {c.restartCount > 0 && (
                             <span
-                              className={`h-1.5 w-1.5 rounded-full ${
-                                isUp
-                                  ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
-                                  : "bg-muted-foreground/50"
+                              className={`shrink-0 rounded px-1 text-[9px] font-bold tabular-nums ${
+                                c.restartCount >= 3
+                                  ? "bg-[color-mix(in_oklab,var(--color-brand-red)_18%,transparent)] text-[var(--color-brand-red)]"
+                                  : "bg-[color-mix(in_oklab,var(--color-brand-orange)_18%,transparent)] text-[var(--color-brand-orange)]"
                               }`}
-                            />
-                            <span className="font-mono">{c.state}</span>
-                          </div>
+                              title={`Restarted ${c.restartCount} time${c.restartCount === 1 ? "" : "s"}`}
+                            >
+                              ↻ {c.restartCount}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex min-w-0 shrink items-center gap-1.5 text-[10px] text-muted-foreground">
+                          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} />
+                          <span className="truncate font-mono" title={c.statusText || c.state}>{c.statusText || c.state}</span>
                         </div>
                       </div>
-                      <div className="mt-3 flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-3">
-                          <RingGauge value={c.cpuPct} label="CPU" gradientId={`g-cpu-${c.id}`} />
-                          <RingGauge value={memPct} label="RAM" gradientId={`g-ram-${c.id}`} />
-                        </div>
-                        <div className="flex flex-1 items-stretch gap-3 text-[10px]">
-                          <IoStat
-                            label="Network"
-                            rows={[
-                              { icon: ArrowDownToLine, value: fmtBytes(c.netRxRate), unit: "/s" },
-                              { icon: ArrowUpFromLine, value: fmtBytes(c.netTxRate), unit: "/s" },
-                            ]}
-                          />
-                        </div>
+                      {/* Row 2 — all four stats on a single compact line */}
+                      <div className="mt-2.5 flex items-start gap-2.5">
+                        <RingGauge value={c.cpuPct} label="CPU" gradientId={`g-cpu-${c.id}`} size={40} stroke={5} />
+                        <RingGauge value={memPct} label="RAM" gradientId={`g-ram-${c.id}`} size={40} stroke={5} />
+                        <IoStat
+                          label="Network"
+                          rows={[
+                            { icon: ArrowDownToLine, value: fmtBytes(c.netRxRate), unit: "/s" },
+                            { icon: ArrowUpFromLine, value: fmtBytes(c.netTxRate), unit: "/s" },
+                          ]}
+                        />
+                        <IoStat
+                          label="Disk I/O"
+                          rows={[
+                            { letter: "R", icon: ArrowDownToLine, value: fmtBytes(c.diskReadRate), unit: "/s" },
+                            { letter: "W", icon: ArrowUpFromLine, value: fmtBytes(c.diskWriteRate), unit: "/s" },
+                          ]}
+                        />
                       </div>
                     </div>
                   );
@@ -1303,7 +1445,7 @@ function HostDashboardView({
           </section>
         )}
       </div>
-    </ScrollArea>
+    </div>
   );
 }
 

@@ -2,14 +2,14 @@ import { call } from "./api/transport";
 import { useEffect, useRef, useSyncExternalStore } from "react";
 import {
   dashboardStore,
-  PROCESS_INTERVAL_MS,
-  CONTAINER_INTERVAL_MS,
+  DETAIL_INTERVAL_MS,
   type HostPollResult,
   type HostStatusEntry,
   type HostPhase,
   type CoreMetrics,
   type SystemMetrics,
   type ContainerMetric,
+  type ContainerSummary,
   type ProcessInfo,
 } from "./dashboardStore";
 
@@ -20,15 +20,20 @@ export type {
   CoreMetrics,
   SystemMetrics,
   ContainerMetric,
+  ContainerSummary,
   ProcessInfo,
 };
 
-/** Converts bytes to a human-readable string */
+/** Converts bytes to a compact human-readable string. Kept short on purpose — these render
+ *  in tight stat columns: byte values are integers ("107 B", not "107.4 B") and anything
+ *  ≥ 100 drops the decimal ("121 K"), so values never wrap or truncate. */
 export function fmtBytes(bytes: number): string {
-  if (bytes === 0) return "0 B";
+  if (bytes < 1) return "0 B";
   const units = ["B", "K", "M", "G", "T"];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const v = bytes / Math.pow(1024, i);
+  const s = i === 0 || v >= 100 ? Math.round(v).toString() : v.toFixed(1);
+  return `${s} ${units[i]}`;
 }
 
 /** Converts seconds to "Xd Xh Xm" format */
@@ -82,15 +87,9 @@ export function useHostDetail(hostId: string | null): {
   const hostIdRef = useRef(hostId);
   hostIdRef.current = hostId;
 
-  const refreshProcesses = () => {
+  const refreshDetail = () => {
     if (!hostIdRef.current) return;
-    call("dashboard_poll", { wantProcesses: true, wantContainers: false, hostId: hostIdRef.current }).catch(
-      console.error,
-    );
-  };
-  const refreshContainers = () => {
-    if (!hostIdRef.current) return;
-    call("dashboard_poll", { wantProcesses: false, wantContainers: true, hostId: hostIdRef.current }).catch(
+    call("dashboard_poll", { wantProcesses: true, wantContainers: true, hostId: hostIdRef.current }).catch(
       console.error,
     );
   };
@@ -98,22 +97,23 @@ export function useHostDetail(hostId: string | null): {
   useEffect(() => {
     if (!hostId) return;
 
-    refreshProcesses();
-    refreshContainers();
+    refreshDetail();
+    // Tells the actor to start a docker-events watcher for near-1s container state changes
+    // (a container dying between two 5s polls shouldn't take up to 5s to show up).
+    call("dashboard_watch_containers", { hostId, watch: true }).catch(console.error);
 
-    // Poll processes every 5s (fast, lightweight — /proc/*/stat reads) and containers
-    // on a slower cadence (docker inspect + cgroup reads per container). Both requests
-    // return the same HostPollResult shape; the store merges whichever field is present
-    // into the cached detail, preserving the other from the previous merge.
-    const procInterval = setInterval(refreshProcesses, PROCESS_INTERVAL_MS);
-    const containerInterval = setInterval(refreshContainers, CONTAINER_INTERVAL_MS);
+    // Processes and containers are requested together on the same 5s cadence. The batched
+    // docker collection (single exec regardless of container count) makes this cheap enough
+    // that container state — often more important than host-level CPU/RAM — doesn't lag
+    // 30s behind everything else.
+    const interval = setInterval(refreshDetail, DETAIL_INTERVAL_MS);
 
     return () => {
-      clearInterval(procInterval);
-      clearInterval(containerInterval);
+      clearInterval(interval);
+      call("dashboard_watch_containers", { hostId, watch: false }).catch(console.error);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId]);
 
-  return { detail, refresh: refreshProcesses };
+  return { detail, refresh: refreshDetail };
 }

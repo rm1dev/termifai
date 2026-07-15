@@ -6,9 +6,21 @@ use tauri::{AppHandle, Emitter};
 
 // ─── Internal type aliases ────────────────────────────────────────────────────
 
-/// Return type of `parse_container_cgroup`:
-/// (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu_ns, next_net)
-type CgroupStats = (f32, u64, u64, f64, f64, Option<u64>, Option<(u64, u64)>);
+/// Return of `parse_container_cgroup`: current-poll rates plus the cumulative counters to
+/// hand back as `prev_*` on the next poll (`None` when the source file was unreadable, so a
+/// stale delta isn't computed against a value that was never actually read).
+pub(crate) struct ContainerCgroupSample {
+    pub cpu_pct: f32,
+    pub mem_used: u64,
+    pub mem_limit: u64,
+    pub net_rx_rate: f64,
+    pub net_tx_rate: f64,
+    pub disk_read_rate: f64,
+    pub disk_write_rate: f64,
+    pub next_cpu_ns: Option<u64>,
+    pub next_net: Option<(u64, u64)>,
+    pub next_io: Option<(u64, u64)>,
+}
 
 // ─── Public types emitted to frontend ────────────────────────────────────────
 
@@ -58,11 +70,16 @@ pub struct ContainerMetric {
     pub id: String,
     pub name: String,
     pub state: String,
+    pub status_text: String,               // e.g. "Up 3 hours", "Exited (137) 2 minutes ago"
+    pub health: Option<String>,             // "healthy" | "unhealthy" | "starting", from the status suffix
+    pub restart_count: u32,
     pub cpu_pct: f32,
     pub mem_used_bytes: u64,
     pub mem_limit_bytes: u64,
     pub net_rx_rate: f64,
     pub net_tx_rate: f64,
+    pub disk_read_rate: f64,  // bytes/sec, from cgroup blkio/io.stat
+    pub disk_write_rate: f64, // bytes/sec
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,12 +92,23 @@ pub struct ProcessInfo {
     pub mem_kb: u64,
 }
 
+/// Cheap running/stopped container counts, collected on every poll (including the 30s
+/// overview poll) so container trouble is visible on the overview cards without opening a
+/// host's detail view. `None` means Docker isn't installed on the host.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerSummary {
+    pub running: u32,
+    pub stopped: u32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostPollResult {
     pub host_id: String,
     pub ok: bool,
     pub system: Option<SystemMetrics>,
+    pub container_summary: Option<ContainerSummary>,
     pub containers: Option<Vec<ContainerMetric>>,
     pub processes: Option<Vec<ProcessInfo>>,
     pub error: Option<String>,
@@ -499,51 +527,157 @@ fn is_whole_disk(dev: &str) -> bool {
     !dev.ends_with(|c: char| c.is_ascii_digit())
 }
 
-/// raw = output of docker ps --no-trunc --format '{"id":"{{.ID}}","name":"{{.Names}}","state":"{{.State}}"}'
-/// One JSON object per line (JSONL)
-pub(crate) fn parse_docker_ps(raw: &str) -> Vec<(String, String, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DockerPsEntry {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub status_text: String,
+}
+
+/// raw = output of `docker ps -a --no-trunc --format '{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Status}}'`
+/// (docker expands `\t`/`\n` escapes in the format string itself, independent of shell quoting)
+pub(crate) fn parse_docker_ps(raw: &str) -> Vec<DockerPsEntry> {
     raw.lines()
-        .filter(|l| l.trim_start().starts_with('{'))
         .filter_map(|line| {
-            // Parse manually — no serde_json derive needed for this simple structure
-            let get = |key: &str| -> String {
-                let needle = format!("\"{}\":\"", key);
-                line.find(&needle)
-                    .map(|i| {
-                        let start = i + needle.len();
-                        let end = line[start..].find('"').map(|j| start + j).unwrap_or(start);
-                        line[start..end].to_string()
-                    })
-                    .unwrap_or_default()
-            };
-            let id = get("id");
-            let name = get("name");
-            let state = get("state");
+            let fields: Vec<&str> = line.splitn(4, '\t').collect();
+            let id = *fields.first()?;
             if id.is_empty() {
-                None
-            } else {
-                Some((id, name, state))
+                return None;
             }
+            Some(DockerPsEntry {
+                id: id.to_string(),
+                name: fields.get(1).copied().unwrap_or_default().to_string(),
+                state: fields.get(2).copied().unwrap_or_default().to_string(),
+                status_text: fields.get(3).copied().unwrap_or_default().to_string(),
+            })
         })
         .collect()
 }
 
-/// raw = output of cat /proc/<pid>/cgroup + memory.current + cpu.stat + /proc/<pid>/net/dev
-/// prev_cpu_ns: CPU nanoseconds from previous poll for delta
-/// poll_secs: poll interval
+/// Extracts a health suffix like "(healthy)" / "(unhealthy)" / "(health: starting)" from a
+/// `docker ps` Status string, e.g. "Up 3 hours (healthy)".
+pub(crate) fn parse_health(status_text: &str) -> Option<String> {
+    let start = status_text.rfind('(')?;
+    let end = status_text.rfind(')')?;
+    if end <= start {
+        return None;
+    }
+    let inner = &status_text[start + 1..end];
+    let health = inner.strip_prefix("health: ").unwrap_or(inner);
+    match health {
+        "healthy" | "unhealthy" | "starting" => Some(health.to_string()),
+        _ => None,
+    }
+}
+
+/// raw = the `===STATS===`-delimited block from the batched docker collection exec: for each
+/// running container, a `CID=<id> PID=<pid> RC=<restart_count>` header line followed by the
+/// same cgroup+net shape `parse_container_cgroup` already understands, terminated by `===END===`.
+pub(crate) struct ContainerStatsEntry {
+    pub restart_count: u32,
+    pub sample: ContainerCgroupSample,
+}
+
+pub(crate) fn parse_container_stats_batch(
+    stats_raw: &str,
+    prev_cpu: &HashMap<String, u64>,
+    prev_net: &HashMap<String, (u64, u64)>,
+    prev_io: &HashMap<String, (u64, u64)>,
+    poll_secs: f64,
+) -> HashMap<String, ContainerStatsEntry> {
+    let mut out = HashMap::new();
+    for block in stats_raw.split("===END===") {
+        let block = block.trim_start_matches('\n');
+        let (header, rest) = match block.split_once('\n') {
+            Some(v) => v,
+            None => continue,
+        };
+        if !header.starts_with("CID=") {
+            continue;
+        }
+        let mut id = String::new();
+        let mut restart_count: u32 = 0;
+        for tok in header.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("CID=") {
+                id = v.to_string();
+            } else if let Some(v) = tok.strip_prefix("RC=") {
+                restart_count = v.parse().unwrap_or(0);
+            }
+        }
+        if id.is_empty() {
+            continue;
+        }
+        let sample = parse_container_cgroup(
+            rest,
+            prev_cpu.get(&id).copied(),
+            prev_net.get(&id).copied(),
+            prev_io.get(&id).copied(),
+            poll_secs,
+        );
+        out.insert(id, ContainerStatsEntry { restart_count, sample });
+    }
+    out
+}
+
+/// Sums cumulative read/write bytes out of a container's block-IO accounting file. Handles
+/// both cgroup v2 `io.stat` (`<maj>:<min> rbytes=N wbytes=N rios=N wios=N dbytes=N dios=N`,
+/// one line per backing device) and cgroup v1 `blkio.throttle.io_service_bytes`
+/// (`<maj>:<min> Read|Write|Sync|Async|Discard|Total N`, same per-device shape plus a grand
+/// "Total N" footer that's skipped so devices aren't double-counted).
+pub(crate) fn parse_container_io_bytes(io_raw: &str) -> (u64, u64) {
+    let mut read_bytes = 0u64;
+    let mut write_bytes = 0u64;
+
+    for line in io_raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.contains("rbytes=") || line.contains("wbytes=") {
+            for field in line.split_whitespace() {
+                if let Some(v) = field.strip_prefix("rbytes=") {
+                    read_bytes += v.parse::<u64>().unwrap_or(0);
+                } else if let Some(v) = field.strip_prefix("wbytes=") {
+                    write_bytes += v.parse::<u64>().unwrap_or(0);
+                }
+            }
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() == 3 {
+            match parts[1] {
+                "Read" => read_bytes += parts[2].parse::<u64>().unwrap_or(0),
+                "Write" => write_bytes += parts[2].parse::<u64>().unwrap_or(0),
+                _ => {} // Sync/Async/Discard/Total — redundant with Read+Write, skip
+            }
+        }
+    }
+
+    (read_bytes, write_bytes)
+}
+
+/// raw = memory.current + memory.max + cpu.stat, then `===IO===`, then the block-IO
+/// accounting file, then `===NET===`, then /proc/<pid>/net/dev — see the batched exec built
+/// in `collect_docker_metrics`. Explicit markers (rather than sniffing line shape) keep the
+/// net-dev parser from misreading `io.stat`'s `<maj>:<min> ...` lines, which also contain ':'.
 pub(crate) fn parse_container_cgroup(
     cgroup_raw: &str,
     prev_cpu_ns: Option<u64>,
     prev_net: Option<(u64, u64)>,
+    prev_io: Option<(u64, u64)>,
     poll_secs: f64,
-) -> CgroupStats {
+) -> ContainerCgroupSample {
+    let (mem_cpu_part, rest) = cgroup_raw.split_once("===IO===\n").unwrap_or((cgroup_raw, ""));
+    let (io_part, net_part) = rest.split_once("===NET===\n").unwrap_or((rest, ""));
+
     let mut mem_used: u64 = 0;
     let mut mem_limit: u64 = u64::MAX;
     let mut cpu_usage_ns: u64 = 0;
-    let mut net_rx: u64 = 0;
-    let mut net_tx: u64 = 0;
 
-    for line in cgroup_raw.lines() {
+    for line in mem_cpu_part.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() == 1 {
             if let Ok(v) = parts[0].parse::<u64>() {
@@ -565,7 +699,13 @@ pub(crate) fn parse_container_cgroup(
                 _ => {}
             }
         }
-        // /proc/<pid>/net/dev lines
+    }
+
+    let (read_bytes, write_bytes) = parse_container_io_bytes(io_part);
+
+    let mut net_rx: u64 = 0;
+    let mut net_tx: u64 = 0;
+    for line in net_part.lines() {
         let trimmed = line.trim();
         if trimmed.contains(':')
             && !trimmed.starts_with("lo:")
@@ -594,7 +734,7 @@ pub(crate) fn parse_container_cgroup(
         _ => 0.0,
     };
 
-    let (rx_rate, tx_rate) = match prev_net {
+    let (net_rx_rate, net_tx_rate) = match prev_net {
         Some((prev_rx, prev_tx)) if poll_secs > 0.0 => (
             net_rx.saturating_sub(prev_rx) as f64 / poll_secs,
             net_tx.saturating_sub(prev_tx) as f64 / poll_secs,
@@ -602,19 +742,34 @@ pub(crate) fn parse_container_cgroup(
         _ => (0.0, 0.0),
     };
 
-    let next_cpu = if cpu_usage_ns > 0 {
-        Some(cpu_usage_ns)
+    let (disk_read_rate, disk_write_rate) = match prev_io {
+        Some((prev_read, prev_write)) if poll_secs > 0.0 => (
+            read_bytes.saturating_sub(prev_read) as f64 / poll_secs,
+            write_bytes.saturating_sub(prev_write) as f64 / poll_secs,
+        ),
+        _ => (0.0, 0.0),
+    };
+
+    let next_cpu_ns = if cpu_usage_ns > 0 { Some(cpu_usage_ns) } else { None };
+    let next_net = if net_rx > 0 || net_tx > 0 { Some((net_rx, net_tx)) } else { None };
+    let next_io = if read_bytes > 0 || write_bytes > 0 {
+        Some((read_bytes, write_bytes))
     } else {
         None
     };
-    let next_net = if net_rx > 0 || net_tx > 0 {
-        Some((net_rx, net_tx))
-    } else {
-        None
-    };
-    (
-        cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu, next_net,
-    )
+
+    ContainerCgroupSample {
+        cpu_pct,
+        mem_used,
+        mem_limit,
+        net_rx_rate,
+        net_tx_rate,
+        disk_read_rate,
+        disk_write_rate,
+        next_cpu_ns,
+        next_net,
+        next_io,
+    }
 }
 
 // ─── Actor types ─────────────────────────────────────────────────────────────
@@ -629,6 +784,13 @@ pub enum ActorCmd {
         want_containers: bool,
         reply: tokio::sync::oneshot::Sender<HostPollResult>,
     },
+    /// Frontend signal that a host's detail view opened/closed. While watching, a second
+    /// dedicated SSH session short-polls `docker events` so a container dying/restarting is
+    /// picked up in ~1-2s instead of waiting for the next 5s detail poll.
+    WatchContainers(bool),
+    /// Internal wake-up from the events watcher thread: do an out-of-band container poll
+    /// and emit it directly, no reply channel — nothing is synchronously waiting on it.
+    PokeContainers,
     Disconnect,
 }
 
@@ -702,6 +864,7 @@ struct ActorState {
     prev_disk: Option<DiskSnapshot>,
     prev_container_cpu: HashMap<String, u64>, // container_id → cpu_ns
     prev_container_net: HashMap<String, (u64, u64)>,
+    prev_container_io: HashMap<String, (u64, u64)>, // container_id → (read_bytes, write_bytes)
     has_docker: Option<bool>,
     last_poll: Option<Instant>,
     prev_proc_ticks: HashMap<u32, u64>, // pid → utime+stime at last sample
@@ -716,6 +879,9 @@ struct ActorConfig {
     password: Option<String>,
     key_path: Option<std::path::PathBuf>,
     gate: std::sync::Arc<ConnectGate>,
+    /// Clone of this actor's own command sender, handed to the events-watcher thread so it
+    /// can loop `PokeContainers` back into the main actor loop.
+    self_tx: std::sync::mpsc::SyncSender<ActorCmd>,
 }
 
 /// Blocks (via `rx.recv_timeout`) retrying the SSH connection with backoff until it
@@ -758,12 +924,16 @@ fn connect_with_backoff(
                             host_id: host_id.to_string(),
                             ok: false,
                             system: None,
+                            container_summary: None,
                             containers: None,
                             processes: None,
                             error: Some(e),
                             latency_ms: None,
                         });
                     }
+                    // Not connected yet — nothing to watch/poke; the frontend will still be
+                    // sending its regular Poll requests once the connection recovers.
+                    Ok(ActorCmd::WatchContainers(_)) | Ok(ActorCmd::PokeContainers) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
                 emit_status(app, host_id, "reconnecting", None);
@@ -781,7 +951,11 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
         password,
         key_path,
         gate,
+        self_tx,
     } = cfg;
+
+    // Set only while a host's detail view is open (see ActorCmd::WatchContainers).
+    let mut watcher_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
 
     emit_status(&app, &host_id, "connecting", None);
 
@@ -808,6 +982,7 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
         prev_disk: None,
         prev_container_cpu: HashMap::new(),
         prev_container_net: HashMap::new(),
+        prev_container_io: HashMap::new(),
         has_docker: None,
         last_poll: None,
         prev_proc_ticks: HashMap::new(),
@@ -818,13 +993,55 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
         // recv_timeout → send keepalive if idle for 10s
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(ActorCmd::Disconnect) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                break
+                if let Some(stop) = watcher_stop.take() {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                break;
             }
 
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 // keepalive — no poll
                 state.session.keepalive_send().ok();
                 continue;
+            }
+
+            Ok(ActorCmd::WatchContainers(watch)) => {
+                if watch {
+                    if watcher_stop.is_none() {
+                        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        watcher_stop = Some(stop.clone());
+                        let watcher_cfg = EventsWatcherConfig {
+                            hostname: hostname.clone(),
+                            port,
+                            user: user.clone(),
+                            password: password.clone(),
+                            key_path: key_path.clone(),
+                            self_tx: self_tx.clone(),
+                            stop,
+                        };
+                        std::thread::Builder::new()
+                            .name(format!("dashboard-events-{}", host_id))
+                            .spawn(move || run_events_watcher(watcher_cfg))
+                            .ok();
+                    }
+                } else if let Some(stop) = watcher_stop.take() {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+
+            Ok(ActorCmd::PokeContainers) => {
+                // Best-effort out-of-band refresh triggered by a docker events line — the
+                // regular 5s detail poll is the reliable fallback, so failures here are fine
+                // to just drop.
+                let now = Instant::now();
+                let poll_secs = state
+                    .last_poll
+                    .map(|t| t.elapsed().as_secs_f64())
+                    .unwrap_or(5.0);
+                state.last_poll = Some(now);
+                if let Ok(result) = do_poll(&mut state, &host_id, false, true, poll_secs) {
+                    let _ = app.emit("dash:stat", result);
+                }
             }
 
             Ok(ActorCmd::Poll {
@@ -861,9 +1078,16 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
                             state.prev_net = None;
                             state.prev_container_cpu.clear();
                             state.prev_container_net.clear();
+                            state.prev_container_io.clear();
                             do_poll(&mut state, &host_id, want_processes, want_containers, poll_secs)
                         }
-                        None => return, // Disconnect received while retrying
+                        None => {
+                            // Disconnect received while retrying
+                            if let Some(stop) = watcher_stop.take() {
+                                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            return;
+                        }
                     }
                 } else {
                     result
@@ -875,6 +1099,7 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
                         host_id: host_id.clone(),
                         ok: false,
                         system: None,
+                        container_summary: None,
                         containers: None,
                         processes: None,
                         error: Some(e),
@@ -887,6 +1112,65 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
     }
 }
 
+struct EventsWatcherConfig {
+    hostname: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    key_path: Option<std::path::PathBuf>,
+    self_tx: std::sync::mpsc::SyncSender<ActorCmd>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Runs on a dedicated SSH session (never shared with the actor's primary session — no
+/// cross-thread access to a single `ssh2::Session`) for as long as a host's detail view is
+/// open. Rather than a single long-lived `docker events` stream — which would need a way to
+/// force-interrupt a blocked read from another thread to stop promptly — this short-polls a
+/// 2s-bounded `docker events` window in a loop via the remote `timeout` command. Each
+/// non-empty window pokes the actor to do an immediate container refresh (throttled to at
+/// most once per 500ms), so container state changes surface in ~1-2s instead of waiting for
+/// the next scheduled 5s poll. It's a best-effort accelerant, not the source of truth — the
+/// regular detail poll keeps running regardless.
+fn run_events_watcher(cfg: EventsWatcherConfig) {
+    let EventsWatcherConfig {
+        hostname,
+        port,
+        user,
+        password,
+        key_path,
+        self_tx,
+        stop,
+    } = cfg;
+
+    let session = match ssh_connect(&hostname, port, &user, password.as_deref(), key_path.as_deref()) {
+        Ok(s) => s,
+        Err(_) => return, // best-effort — container state still refreshes via the 5s poll
+    };
+
+    let mut last_poke = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let raw = exec_cmd(
+            &session,
+            "timeout 2 docker events --filter type=container --format '{{.Status}}' 2>/dev/null",
+        );
+        match raw {
+            Ok(out) if !out.trim().is_empty() && last_poke.elapsed() >= Duration::from_millis(500) => {
+                last_poke = Instant::now();
+                let _ = self_tx.try_send(ActorCmd::PokeContainers);
+            }
+            Ok(_) => {}
+            Err(_) => {
+                // Host briefly unreachable or `timeout`/docker missing — back off instead of
+                // spinning; the stop flag is still checked every iteration.
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+    }
+}
+
 fn do_poll(
     state: &mut ActorState,
     host_id: &str,
@@ -894,19 +1178,23 @@ fn do_poll(
     want_containers: bool,
     poll_secs: f64,
 ) -> Result<HostPollResult, String> {
-    // System metrics + disk usage + IP in a single round trip (latency measured on this
-    // exec since it runs on every poll and dominates round-trip time).
+    // System metrics + disk usage + IP + a cheap container running/stopped count, all in a
+    // single round trip (latency measured on this exec since it runs on every poll and
+    // dominates round-trip time). The docker line doubles as docker-installed detection —
+    // no separate `command -v docker` exec needed.
     let t0 = Instant::now();
     let sys_raw = exec_cmd(
         &state.session,
         "cat /proc/stat /proc/meminfo /proc/loadavg /proc/uptime /proc/net/dev /proc/diskstats; \
          echo ===DF===; df -k / 2>/dev/null | tail -1; \
-         echo ===IP===; hostname -I 2>/dev/null | awk '{print $1}'",
+         echo ===IP===; hostname -I 2>/dev/null | awk '{print $1}'; \
+         echo ===DOCKER===; command -v docker >/dev/null 2>&1 && docker ps -a --format '{{.State}}' 2>/dev/null || echo __nodocker__",
     )?;
     let latency_ms = (t0.elapsed().as_secs_f64() * 1000.0) as f32;
 
     let (proc_part, rest) = sys_raw.split_once("===DF===\n").unwrap_or((&sys_raw, ""));
-    let (df_part, ip_part) = rest.split_once("===IP===\n").unwrap_or((rest, ""));
+    let (df_part, rest2) = rest.split_once("===IP===\n").unwrap_or((rest, ""));
+    let (ip_part, docker_summary_part) = rest2.split_once("===DOCKER===\n").unwrap_or((rest2, ""));
 
     let (mut system, new_cpu, new_net, new_cpu_cores, new_disk) = parse_proc_output(
         proc_part,
@@ -930,21 +1218,27 @@ fn do_poll(
     }
     system.ip = ip_part.trim().to_string();
 
-    // Docker detection — done once and cached
-    if state.has_docker.is_none() {
-        state.has_docker = Some(
-            exec_cmd(
-                &state.session,
-                "command -v docker >/dev/null 2>&1 && echo yes || echo no",
-            )
-            .map(|o| o.trim() == "yes")
-            .unwrap_or(false),
-        );
-    }
+    let has_docker = !docker_summary_part.trim_start().starts_with("__nodocker__");
+    state.has_docker = Some(has_docker);
 
-    // Containers and processes are both opt-in: the 30s overview poll (all hosts) asks
-    // for neither, keeping it to one exec per host. The open detail view asks for
-    // processes every 5s and containers on a slower cadence.
+    let container_summary = if has_docker {
+        let mut running = 0u32;
+        let mut stopped = 0u32;
+        for line in docker_summary_part.lines() {
+            match line.trim() {
+                "" => continue,
+                "running" => running += 1,
+                _ => stopped += 1,
+            }
+        }
+        Some(ContainerSummary { running, stopped })
+    } else {
+        None
+    };
+
+    // Containers (full metrics) and processes are opt-in: the 30s overview poll (all hosts)
+    // asks for neither, keeping it to one exec per host — it already gets the cheap
+    // running/stopped counts above. The open detail view asks for both every 5s.
     let containers = if want_containers && state.has_docker == Some(true) {
         Some(collect_docker_metrics(state, poll_secs)?)
     } else {
@@ -961,6 +1255,7 @@ fn do_poll(
         host_id: host_id.to_string(),
         ok: true,
         system: Some(system),
+        container_summary,
         containers,
         processes,
         error: None,
@@ -968,83 +1263,115 @@ fn do_poll(
     })
 }
 
+/// Collects every container's state + resource usage in a single SSH exec regardless of
+/// container count: one `docker ps -a` to list, one `docker inspect` covering every running
+/// ID at once (it accepts multiple IDs), with cgroup/net reads done inline per container.
+/// This is what makes polling this on the same 5s cadence as processes affordable — the old
+/// one-`docker inspect`-exec-per-container approach cost 3-6s with just 15 containers.
 fn collect_docker_metrics(
     state: &mut ActorState,
     poll_secs: f64,
 ) -> Result<Vec<ContainerMetric>, String> {
-    let ps_raw = exec_cmd(
+    let raw = exec_cmd(
         &state.session,
-        r#"docker ps -a --no-trunc --format '{"id":"{{.ID}}","name":"{{.Names}}","state":"{{.State}}"}' 2>/dev/null || echo '__nodock__'"#,
+        r#"docker ps -a --no-trunc --format '{{.ID}}\t{{.Names}}\t{{.State}}\t{{.Status}}' 2>/dev/null || echo __nodock__
+echo ===STATS===
+ids=$(docker ps -q --no-trunc 2>/dev/null)
+if [ -n "$ids" ]; then
+  docker inspect --format '{{.Id}} {{.State.Pid}} {{.RestartCount}}' $ids 2>/dev/null | while read id pid rc; do
+    cgpath=$(awk -F: 'NR==1{print $3}' /proc/$pid/cgroup 2>/dev/null)
+    echo CID=$id PID=$pid RC=$rc
+    cat /sys/fs/cgroup$cgpath/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/docker/$id/memory.usage_in_bytes 2>/dev/null || echo 0
+    cat /sys/fs/cgroup$cgpath/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/docker/$id/memory.limit_in_bytes 2>/dev/null || echo 0
+    grep '^usage_usec\|^usage ' /sys/fs/cgroup$cgpath/cpu.stat 2>/dev/null || cat /sys/fs/cgroup/cpu/docker/$id/cpuacct.usage 2>/dev/null || echo 'usage 0'
+    echo ===IO===
+    cat /sys/fs/cgroup$cgpath/io.stat 2>/dev/null || cat /sys/fs/cgroup/blkio/docker/$id/blkio.throttle.io_service_bytes 2>/dev/null || true
+    echo ===NET===
+    cat /proc/$pid/net/dev 2>/dev/null
+    echo ===END===
+  done
+fi"#,
     )?;
 
-    if ps_raw.contains("__nodock__") {
+    let (ps_raw, stats_raw) = raw.split_once("===STATS===\n").unwrap_or((&raw, ""));
+
+    if ps_raw.trim_start().starts_with("__nodock__") {
         state.has_docker = Some(false);
         return Ok(vec![]);
     }
 
-    let container_list = parse_docker_ps(&ps_raw);
-    let mut result = Vec::new();
+    let entries = parse_docker_ps(ps_raw);
+    let stats = parse_container_stats_batch(
+        stats_raw,
+        &state.prev_container_cpu,
+        &state.prev_container_net,
+        &state.prev_container_io,
+        poll_secs,
+    );
 
-    for (id, name, container_state) in &container_list {
-        // Container IDs must be hex-only before interpolating into shell
-        if !id.chars().all(|c| c.is_ascii_hexdigit()) {
+    const EMPTY_CGROUP_SAMPLE: ContainerCgroupSample = ContainerCgroupSample {
+        cpu_pct: 0.0,
+        mem_used: 0,
+        mem_limit: 0,
+        net_rx_rate: 0.0,
+        net_tx_rate: 0.0,
+        disk_read_rate: 0.0,
+        disk_write_rate: 0.0,
+        next_cpu_ns: None,
+        next_net: None,
+        next_io: None,
+    };
+
+    let mut next_cpu_map = HashMap::new();
+    let mut next_net_map = HashMap::new();
+    let mut next_io_map = HashMap::new();
+    let mut result = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        // Container IDs must be hex-only before interpolating into the inspect/cgroup shell
+        // commands next poll (defense in depth — docker itself always emits hex IDs).
+        if !entry.id.chars().all(|c| c.is_ascii_hexdigit()) {
             continue;
         }
+        let health = parse_health(&entry.status_text);
 
-        if container_state != "running" {
-            result.push(ContainerMetric {
-                id: id.clone(),
-                name: name.clone(),
-                state: container_state.clone(),
-                cpu_pct: 0.0,
-                mem_used_bytes: 0,
-                mem_limit_bytes: 0,
-                net_rx_rate: 0.0,
-                net_tx_rate: 0.0,
-            });
-            continue;
-        }
-
-        // Get PID via docker inspect, then read cgroup + network from /proc/<pid>/
-        let cgroup_cmd = format!(
-            r#"pid=$(docker inspect --format '{{{{.State.Pid}}}}' {id} 2>/dev/null); \
-[ -z "$pid" ] || [ "$pid" = "0" ] || {{ \
-  cgpath=$(awk -F: 'NR==1{{print $3}}' /proc/$pid/cgroup 2>/dev/null); \
-  echo "PID=$pid"; \
-  cat /sys/fs/cgroup$cgpath/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/docker/{id}/memory.usage_in_bytes 2>/dev/null || echo 0; \
-  cat /sys/fs/cgroup$cgpath/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/docker/{id}/memory.limit_in_bytes 2>/dev/null || echo 0; \
-  grep '^usage_usec\|^usage ' /sys/fs/cgroup$cgpath/cpu.stat 2>/dev/null || cat /sys/fs/cgroup/cpu/docker/{id}/cpuacct.usage 2>/dev/null || echo 'usage 0'; \
-  cat /proc/$pid/net/dev 2>/dev/null; \
-}}"#,
-            id = id
-        );
-
-        let cgroup_raw = exec_cmd(&state.session, &cgroup_cmd).unwrap_or_default();
-
-        let prev_cpu_ns = state.prev_container_cpu.get(id).copied();
-        let prev_net = state.prev_container_net.get(id).copied();
-
-        let (cpu_pct, mem_used, mem_limit, rx_rate, tx_rate, next_cpu, next_net) =
-            parse_container_cgroup(&cgroup_raw, prev_cpu_ns, prev_net, poll_secs);
-
-        if let Some(ns) = next_cpu {
-            state.prev_container_cpu.insert(id.clone(), ns);
-        }
-        if let Some(net) = next_net {
-            state.prev_container_net.insert(id.clone(), net);
-        }
+        let (restart_count, sample) = match stats.get(&entry.id) {
+            Some(s) => {
+                if let Some(ns) = s.sample.next_cpu_ns {
+                    next_cpu_map.insert(entry.id.clone(), ns);
+                }
+                if let Some(net) = s.sample.next_net {
+                    next_net_map.insert(entry.id.clone(), net);
+                }
+                if let Some(io) = s.sample.next_io {
+                    next_io_map.insert(entry.id.clone(), io);
+                }
+                (s.restart_count, &s.sample)
+            }
+            // No stats block — container isn't running (docker ps -q didn't list it).
+            None => (0, &EMPTY_CGROUP_SAMPLE),
+        };
 
         result.push(ContainerMetric {
-            id: id.clone(),
-            name: name.clone(),
-            state: container_state.clone(),
-            cpu_pct,
-            mem_used_bytes: mem_used,
-            mem_limit_bytes: mem_limit,
-            net_rx_rate: rx_rate,
-            net_tx_rate: tx_rate,
+            id: entry.id,
+            name: entry.name,
+            state: entry.state,
+            status_text: entry.status_text,
+            health,
+            restart_count,
+            cpu_pct: sample.cpu_pct,
+            mem_used_bytes: sample.mem_used,
+            mem_limit_bytes: sample.mem_limit,
+            net_rx_rate: sample.net_rx_rate,
+            net_tx_rate: sample.net_tx_rate,
+            disk_read_rate: sample.disk_read_rate,
+            disk_write_rate: sample.disk_write_rate,
         });
     }
+
+    state.prev_container_cpu = next_cpu_map;
+    state.prev_container_net = next_net_map;
+    state.prev_container_io = next_io_map;
 
     Ok(result)
 }
@@ -1234,6 +1561,7 @@ pub fn spawn_host_actor(
 ) -> HostActor {
     // SyncSender with buffer=4 — prevents blocking Tauri commands
     let (tx, rx) = std::sync::mpsc::sync_channel::<ActorCmd>(4);
+    let self_tx = tx.clone();
 
     std::thread::Builder::new()
         .name(format!("dashboard-{}", host_id))
@@ -1248,6 +1576,7 @@ pub fn spawn_host_actor(
                     password,
                     key_path,
                     gate,
+                    self_tx,
                 },
                 rx,
             )
@@ -1387,32 +1716,72 @@ eth0: 5100000 0 0 0 0 0 0 0 2100000 0
 
     #[test]
     fn test_parse_docker_ps() {
-        let raw = r#"{"id":"abc123","name":"web-app","state":"running"}
-{"id":"def456","name":"db","state":"exited"}
-"#;
+        let raw = "abc123\tweb-app\trunning\tUp 3 hours (healthy)\ndef456\tdb\texited\tExited (137) 2 minutes ago\n";
         let result = parse_docker_ps(raw);
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].0, "abc123");
-        assert_eq!(result[0].1, "web-app");
-        assert_eq!(result[0].2, "running");
-        assert_eq!(result[1].2, "exited");
+        assert_eq!(result[0].id, "abc123");
+        assert_eq!(result[0].name, "web-app");
+        assert_eq!(result[0].state, "running");
+        assert_eq!(result[0].status_text, "Up 3 hours (healthy)");
+        assert_eq!(result[1].state, "exited");
     }
 
     #[test]
-    fn test_parse_docker_ps_no_docker() {
-        let result = parse_docker_ps("__nodock__");
-        assert!(result.is_empty());
+    fn test_parse_health() {
+        assert_eq!(parse_health("Up 3 hours (healthy)"), Some("healthy".to_string()));
+        assert_eq!(parse_health("Up 2 seconds (health: starting)"), Some("starting".to_string()));
+        assert_eq!(parse_health("Up 3 hours (unhealthy)"), Some("unhealthy".to_string()));
+        assert_eq!(parse_health("Up 3 hours"), None);
+        assert_eq!(parse_health("Exited (137) 2 minutes ago"), None);
+    }
+
+    #[test]
+    fn test_parse_container_stats_batch() {
+        let raw = "CID=abc123 PID=4242 RC=2\n10485760\n8589934592\nusage_usec 500000\n===IO===\n253:0 rbytes=1048576 wbytes=524288 rios=10 wios=5 dbytes=0 dios=0\n===NET===\nlo: 0 0 0 0 0 0 0 0 0 0\n===END===\nCID=def456 PID=99 RC=0\n2048\n4096\nusage_usec 1000\n===IO===\n===NET===\n===END===\n";
+        let prev_cpu = HashMap::new();
+        let prev_net = HashMap::new();
+        let prev_io = HashMap::new();
+        let result = parse_container_stats_batch(raw, &prev_cpu, &prev_net, &prev_io, 30.0);
+        assert_eq!(result.len(), 2);
+        let abc = &result["abc123"];
+        assert_eq!(abc.sample.cpu_pct, 0.0, "first poll — no delta yet");
+        assert_eq!(abc.sample.mem_used, 10485760);
+        assert_eq!(abc.sample.mem_limit, 8589934592);
+        assert_eq!(abc.restart_count, 2);
+        assert_eq!(abc.sample.next_cpu_ns, Some(500_000_000));
+        assert_eq!(abc.sample.next_io, Some((1048576, 524288)));
+        assert_eq!(result["def456"].restart_count, 0);
     }
 
     #[test]
     fn test_parse_container_cgroup_first_poll() {
-        let raw = "10485760\n8589934592\nusage_usec 500000\n";
-        let (cpu, mem_used, mem_limit, _, _, next_cpu, _) =
-            parse_container_cgroup(raw, None, None, 30.0);
-        assert_eq!(cpu, 0.0);
-        assert_eq!(mem_used, 10485760);
-        assert_eq!(mem_limit, 8589934592);
-        assert_eq!(next_cpu, Some(500_000_000)); // 500_000 µs × 1000 = 500_000_000 ns
+        let raw = "10485760\n8589934592\nusage_usec 500000\n===IO===\n===NET===\n";
+        let sample = parse_container_cgroup(raw, None, None, None, 30.0);
+        assert_eq!(sample.cpu_pct, 0.0);
+        assert_eq!(sample.mem_used, 10485760);
+        assert_eq!(sample.mem_limit, 8589934592);
+        assert_eq!(sample.next_cpu_ns, Some(500_000_000)); // 500_000 µs × 1000 = 500_000_000 ns
+    }
+
+    #[test]
+    fn test_parse_container_io_bytes_cgroup_v2() {
+        let raw = "253:0 rbytes=1048576 wbytes=524288 rios=10 wios=5 dbytes=0 dios=0\n253:16 rbytes=2048 wbytes=1024 rios=1 wios=1 dbytes=0 dios=0\n";
+        let (read, write) = parse_container_io_bytes(raw);
+        assert_eq!(read, 1048576 + 2048, "sums rbytes across devices");
+        assert_eq!(write, 524288 + 1024, "sums wbytes across devices");
+    }
+
+    #[test]
+    fn test_parse_container_io_bytes_cgroup_v1() {
+        let raw = "8:0 Read 1048576\n8:0 Write 524288\n8:0 Sync 0\n8:0 Async 1572864\n8:0 Discard 0\n8:0 Total 1572864\nTotal 1572864\n";
+        let (read, write) = parse_container_io_bytes(raw);
+        assert_eq!(read, 1048576);
+        assert_eq!(write, 524288, "Total/Sync/Async footer lines are not double-counted");
+    }
+
+    #[test]
+    fn test_parse_container_io_bytes_empty() {
+        assert_eq!(parse_container_io_bytes(""), (0, 0));
     }
 }
 
