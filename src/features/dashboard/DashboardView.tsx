@@ -328,25 +328,32 @@ export function DashboardView() {
         </div>
 
         {/* Gauges — always rendered at full structure, zeroed until the first poll lands */}
-        <div className="mt-4 flex items-start gap-4">
-          <RingGauge value={sys?.cpuPct ?? 0} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
+        <div className="mt-4 flex items-start gap-3">
+          <RingGauge value={sys?.cpuPct ?? 0} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={48} />
           <RingGauge
             value={sys && sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
             label="RAM"
             gradientId={`g-dash-ram-${host.id}`}
-            size={52}
+            size={48}
           />
           <RingGauge
             value={sys && sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
             label="Disk"
             gradientId={`g-dash-disk-${host.id}`}
-            size={52}
+            size={48}
           />
           <IoStat
             label="Network"
             rows={[
               { icon: ArrowDownToLine, value: fmtBytes(sys?.netRxRate ?? 0), unit: "/s" },
               { icon: ArrowUpFromLine, value: fmtBytes(sys?.netTxRate ?? 0), unit: "/s" },
+            ]}
+          />
+          <IoStat
+            label="Disk I/O"
+            rows={[
+              { letter: "R", icon: ArrowDownToLine, value: fmtBytes(sys?.diskReadRate ?? 0), unit: "/s" },
+              { letter: "W", icon: ArrowUpFromLine, value: fmtBytes(sys?.diskWriteRate ?? 0), unit: "/s" },
             ]}
           />
         </div>
