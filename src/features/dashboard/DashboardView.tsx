@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useTransition } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { call } from "@/lib/api/transport";
 import {
   Activity,
@@ -500,7 +500,7 @@ const CPU_CATEGORIES: { key: CpuCategory; label: string; color: string }[] = [
   { key: "steal", label: "Steal", color: "var(--color-brand-orange)" },
 ];
 
-function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetrics[]) {
+function buildCpuData(cpuPct: number, cores: number, coreMetrics?: CoreMetrics[]) {
   // Use real per-core breakdown when available (second poll onwards)
   const threads: CpuThread[] = (coreMetrics && coreMetrics.length > 0)
     ? coreMetrics.map((c) => ({
@@ -510,13 +510,12 @@ function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetric
         iowait: Math.max(0, c.iowait),
         steal:  Math.max(0, c.steal),
       }))
-    : Array.from({ length: cores }, (_, i) => {
+    : Array.from({ length: cores }, () => {
         // Fallback: first poll has no per-core data yet — show aggregate evenly
-        const total = Math.max(0, Math.min(100, samples[0] ?? 0));
+        const total = Math.max(0, Math.min(100, cpuPct));
         const system = total > 0 ? Math.min(total, Math.round(total * 0.05)) : 0;
-        const iowait = 0;
         const user = Math.max(0, total - system);
-        return { user, system, nice: 0, iowait, steal: 0 };
+        return { user, system, nice: 0, iowait: 0, steal: 0 };
       });
   const sum = (k: CpuCategory) => threads.reduce((a, t) => a + t[k], 0) / Math.max(threads.length, 1);
   const breakdown: Record<CpuCategory, number> = {
@@ -530,57 +529,46 @@ function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetric
   return { threads, breakdown, total };
 }
 
-function useColumnCount(blockWidth = 8, gap = 2) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [cols, setCols] = useState(0);
+/* Each usage bar is a SINGLE div: a hard-stop linear-gradient paints the per-category
+   segments and a repeating-gradient mask carves the 6px-block/1px-gap pattern. The old
+   implementation rendered one <span> per block — ~175 spans per bar × 33 bars ≈ 5,700 DOM
+   nodes rebuilt on every 5s poll (and every keystroke in the process filter), plus a
+   ResizeObserver re-render loop to recount columns. Gradients are percentage-based, so
+   they also resize for free. */
 
-  useEffect(() => {
-    if (!ref.current) return;
-    const ro = new ResizeObserver(([entry]) => {
-      const w = entry.contentRect.width;
-      const next = Math.max(10, Math.floor((w + gap) / (blockWidth + gap)));
-      setCols(next);
-    });
-    ro.observe(ref.current);
-    return () => ro.disconnect();
-  }, [blockWidth, gap]);
+const CPU_BAR_MASK: React.CSSProperties = {
+  maskImage: "repeating-linear-gradient(90deg, #000 0 6px, transparent 6px 7px)",
+  WebkitMaskImage: "repeating-linear-gradient(90deg, #000 0 6px, transparent 6px 7px)",
+};
 
-  return { ref, cols };
+function cpuBarGradient(thread: CpuThread): string {
+  const stops: string[] = [];
+  let acc = 0;
+  for (const c of CPU_CATEGORIES) {
+    const v = Math.max(0, thread[c.key]);
+    if (v <= 0) continue;
+    stops.push(`${c.color} ${acc.toFixed(2)}% ${Math.min(acc + v, 100).toFixed(2)}%`);
+    acc += v;
+  }
+  const dim = "color-mix(in oklab, var(--color-border) 45%, transparent)";
+  stops.push(`${dim} ${Math.min(acc, 100).toFixed(2)}% 100%`);
+  return `linear-gradient(90deg, ${stops.join(", ")})`;
 }
 
-function CpuThreadRow({ thread, cols }: { thread: CpuThread; cols: number }) {
-  const total = thread.user + thread.system + thread.nice + thread.iowait + thread.steal;
-  const filled = Math.round((total / 100) * cols);
-  const raw = CPU_CATEGORIES.map((c) => ({ key: c.key, color: c.color, exact: (thread[c.key] / 100) * cols }));
-  const counts = raw.map((r) => ({ ...r, n: Math.floor(r.exact), rem: r.exact - Math.floor(r.exact) }));
-  let assigned = counts.reduce((a, c) => a + c.n, 0);
-  const remainders = [...counts].sort((a, b) => b.rem - a.rem);
-  let ri = 0;
-  while (assigned < filled && ri < remainders.length) {
-    const target = counts.find((c) => c.key === remainders[ri].key)!;
-    if (target.exact > 0) target.n += 1;
-    assigned += 1;
-    ri += 1;
-  }
-  const blocks: string[] = [];
-  for (const c of counts) for (let i = 0; i < c.n; i++) blocks.push(c.color);
-  while (blocks.length < filled) blocks.push("var(--color-brand-cyan)");
-  blocks.length = Math.min(blocks.length, cols);
+function CpuBar({ thread }: { thread: CpuThread }) {
+  return (
+    <div
+      className="h-[10px] min-w-0 flex-1"
+      style={{ backgroundImage: cpuBarGradient(thread), ...CPU_BAR_MASK }}
+    />
+  );
+}
 
+function CpuThreadRow({ thread }: { thread: CpuThread }) {
+  const total = thread.user + thread.system + thread.nice + thread.iowait + thread.steal;
   return (
     <div className="flex items-center gap-2">
-      <div className="flex flex-1 gap-[1px] overflow-hidden">
-        {Array.from({ length: cols }).map((_, i) => (
-          <span
-            key={i}
-            className="h-[10px] w-[6px] shrink-0 rounded-[1px]"
-            style={{
-              background: i < blocks.length ? blocks[i] : "var(--color-border)",
-              opacity: i < blocks.length ? 1 : 0.4,
-            }}
-          />
-        ))}
-      </div>
+      <CpuBar thread={thread} />
       <span className="w-9 text-right text-[10px] font-semibold tabular-nums text-foreground">
         {Math.round(total)}%
       </span>
@@ -588,17 +576,28 @@ function CpuThreadRow({ thread, cols }: { thread: CpuThread; cols: number }) {
   );
 }
 
-function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number[]; cores: number; model: string; coreMetrics?: CoreMetrics[] }) {
+// memo: the parent re-renders on every poll, keystroke in the process filter, and load
+// history tick — this component only needs to redraw when its own (scalar/array) props
+// actually change with a new poll.
+const CpuUsageChart = memo(function CpuUsageChart({
+  cpuPct,
+  cores,
+  model,
+  coreMetrics,
+}: {
+  cpuPct: number;
+  cores: number;
+  model: string;
+  coreMetrics?: CoreMetrics[];
+}) {
   const [open, setOpen] = useState(false);
-  const [isPending, startTransition] = useTransition();
-  const data = buildCpuData(samples, cores, coreMetrics);
-  const { ref, cols } = useColumnCount(6, 1);
+  const data = useMemo(() => buildCpuData(cpuPct, cores, coreMetrics), [cpuPct, cores, coreMetrics]);
 
   return (
     <section className="overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-4">
       <button
         type="button"
-        onClick={() => startTransition(() => setOpen((v) => !v))}
+        onClick={() => setOpen((v) => !v)}
         className="flex w-full items-center gap-3 text-left"
         aria-expanded={open}
       >
@@ -620,52 +619,15 @@ function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number
       </div>
 
       {/* always-visible single-line overall load bar */}
-      <div ref={ref} className="mt-3 flex gap-[1px] overflow-hidden">
-        {(() => {
-          const raw = CPU_CATEGORIES.map((c) => ({ color: c.color, exact: (data.breakdown[c.key] / 100) * cols }));
-          const counts = raw.map((r) => ({ ...r, n: Math.floor(r.exact), rem: r.exact - Math.floor(r.exact) }));
-          const filled = Math.round((data.total / 100) * cols);
-          let assigned = counts.reduce((a, c) => a + c.n, 0);
-          const order = counts.map((_, i) => i).sort((a, b) => counts[b].rem - counts[a].rem);
-          let ri = 0;
-          while (assigned < filled && ri < order.length) {
-            if (counts[order[ri]].exact > 0) counts[order[ri]].n += 1;
-            assigned += 1;
-            ri += 1;
-          }
-          const blocks: string[] = [];
-          for (const c of counts) for (let i = 0; i < c.n; i++) blocks.push(c.color);
-          return Array.from({ length: cols }).map((_, i) => (
-            <span
-              key={i}
-              className="h-[10px] w-[6px] shrink-0 rounded-[1px]"
-              style={{
-                background: i < blocks.length ? blocks[i] : "var(--color-border)",
-                opacity: i < blocks.length ? 1 : 0.4,
-              }}
-            />
-          ));
-        })()}
+      <div className="mt-3 flex">
+        <CpuBar thread={data.breakdown} />
       </div>
 
       {open && (
-        <div className="mt-3 border-t border-border pt-3">
-          {isPending ? (
-            <div className="space-y-1.5">
-              {Array.from({ length: cores }).map((_, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <div className="h-[10px] flex-1 rounded-[1px] animate-shimmer" />
-                  <span className="w-9" />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="space-y-1">
-              {data.threads.map((t, i) => (
-                <CpuThreadRow key={i} thread={t} cols={Math.max(10, cols - Math.round(44 / 7))} />
-              ))}
-            </div>
-          )}
+        <div className="mt-3 space-y-1 border-t border-border pt-3">
+          {data.threads.map((t, i) => (
+            <CpuThreadRow key={i} thread={t} />
+          ))}
         </div>
       )}
 
@@ -693,7 +655,7 @@ function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number
       </div>
     </section>
   );
-}
+});
 
 function PanelHeader({
   icon: Icon,
@@ -997,7 +959,7 @@ function HostDashboardView({
 
         {/* ─── CPU USAGE ──────────────────────────────────────────── */}
         <CpuUsageChart
-          samples={sys ? [sys.cpuPct] : [0]}
+          cpuPct={sys?.cpuPct ?? 0}
           cores={sys?.cores ?? 1}
           model={sys ? `Load: ${sys.load1m.toFixed(2)} / ${sys.load5m.toFixed(2)} / ${sys.load15m.toFixed(2)}` : "—"}
           coreMetrics={sys?.cpuCores}
