@@ -1552,6 +1552,21 @@ fn dashboard_disconnect(
     Ok(())
 }
 
+/// Toggled by the frontend when a host's detail view opens/closes, so the actor can run a
+/// short-lived `docker events` watcher only while someone is actually looking at that host.
+#[tauri::command]
+fn dashboard_watch_containers(
+    state: tauri::State<'_, AppState>,
+    host_id: String,
+    watch: bool,
+) -> Result<(), String> {
+    let sender = { state.dashboard_manager.lock().unwrap().sender(&host_id) };
+    if let Some(tx) = sender {
+        let _ = tx.try_send(dashboard::ActorCmd::WatchContainers(watch));
+    }
+    Ok(())
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct GeneralSettings {
@@ -2401,6 +2416,7 @@ pub fn run() {
             dashboard_connect,
             dashboard_poll,
             dashboard_disconnect,
+            dashboard_watch_containers,
             quit_app,
             get_general_settings,
             set_general_settings,
