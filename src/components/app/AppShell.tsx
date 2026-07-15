@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, forwardRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
+import { posixShellQuote } from "@/lib/shell-quote";
 import { subscribe } from "@/lib/api/transport";
 import { forceQuitApp, openSettingsWindow, quitApp, takePendingOpenFolders } from "@/lib/api/terminal";
 import { listSshKeys } from "@/lib/api/ssh-keys";
@@ -132,7 +133,6 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [variant]);
 
-  const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const openSshTerminal = async (host: Host) => {
     const id = `t-ssh-${host.id}-${Date.now()}`;
     let keyArg = "";
@@ -140,7 +140,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
       try {
         const keys = await listSshKeys();
         const key = keys.find((item) => item.id === host.sshKeyId);
-        if (key?.privateKeyPath) keyArg = ` -i ${shellQuote(key.privateKeyPath)}`;
+        if (key?.privateKeyPath) keyArg = ` -i ${posixShellQuote(key.privateKeyPath)}`;
       } catch {
         /* SSH can still use agent/default keys. */
       }
@@ -204,7 +204,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
     // ServerAlive*: let ssh itself detect a dead connection (3 missed keepalives,
     // ~15s) instead of us guessing from unanswered keystrokes — that would
     // misfire on ordinary latency spikes or brief network blips.
-    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3${keyArg}${portArg} ${posixShellQuote(`${host.user}@${host.hostname}`)} ${posixShellQuote(remoteBootstrap)}`;
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
