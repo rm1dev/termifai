@@ -84,6 +84,29 @@ pub struct HostPollResult {
     pub containers: Option<Vec<ContainerMetric>>,
     pub processes: Option<Vec<ProcessInfo>>,
     pub error: Option<String>,
+    pub latency_ms: Option<f32>,
+}
+
+/// Connection lifecycle event for a host actor, independent of poll results —
+/// lets the frontend show Connecting/Online/Offline/Reconnecting without
+/// waiting on (or inferring from) the next poll payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DashStatus {
+    pub host_id: String,
+    pub phase: String, // "connecting" | "online" | "offline" | "reconnecting"
+    pub error: Option<String>,
+}
+
+fn emit_status(app: &AppHandle, host_id: &str, phase: &str, error: Option<String>) {
+    let _ = app.emit(
+        "dash:status",
+        DashStatus {
+            host_id: host_id.to_string(),
+            phase: phase.to_string(),
+            error,
+        },
+    );
 }
 
 // ─── Internal delta state ─────────────────────────────────────────────────────
@@ -597,9 +620,13 @@ pub(crate) fn parse_container_cgroup(
 // ─── Actor types ─────────────────────────────────────────────────────────────
 
 pub enum ActorCmd {
-    /// Poll system + docker + processes
+    /// Poll system metrics, optionally including processes and/or docker containers.
+    /// System metrics are always collected; the other two are opt-in per request so the
+    /// 30s overview poll (all hosts) doesn't pay for docker/process collection that only
+    /// the open detail view needs.
     Poll {
-        want_detail: bool,
+        want_processes: bool,
+        want_containers: bool,
         reply: tokio::sync::oneshot::Sender<HostPollResult>,
     },
     Disconnect,
@@ -607,6 +634,39 @@ pub enum ActorCmd {
 
 pub struct HostActor {
     pub(crate) tx: std::sync::mpsc::SyncSender<ActorCmd>,
+}
+
+/// Bounds how many SSH handshakes can be in flight at once. Without this, connecting to
+/// e.g. 30 hosts at dashboard load fires 30 concurrent handshakes; with it, hosts connect
+/// as a rolling wave and cards flip from Connecting to Online progressively.
+pub struct ConnectGate {
+    count: std::sync::Mutex<usize>,
+    cvar: std::sync::Condvar,
+    max: usize,
+}
+
+impl ConnectGate {
+    pub fn new(max: usize) -> Self {
+        Self {
+            count: std::sync::Mutex::new(0),
+            cvar: std::sync::Condvar::new(),
+            max,
+        }
+    }
+
+    fn acquire(&self) {
+        let mut count = self.count.lock().unwrap();
+        while *count >= self.max {
+            count = self.cvar.wait(count).unwrap();
+        }
+        *count += 1;
+    }
+
+    fn release(&self) {
+        let mut count = self.count.lock().unwrap();
+        *count = count.saturating_sub(1);
+        self.cvar.notify_one();
+    }
 }
 
 // ─── SSH helpers ──────────────────────────────────────────────────────────────
@@ -655,6 +715,61 @@ struct ActorConfig {
     user: String,
     password: Option<String>,
     key_path: Option<std::path::PathBuf>,
+    gate: std::sync::Arc<ConnectGate>,
+}
+
+/// Blocks (via `rx.recv_timeout`) retrying the SSH connection with backoff until it
+/// succeeds or a `Disconnect` arrives. `Poll` commands received while waiting are
+/// answered with the current error so callers don't hang. Returns `None` if the actor
+/// should terminate.
+#[allow(clippy::too_many_arguments)]
+fn connect_with_backoff(
+    app: &AppHandle,
+    host_id: &str,
+    hostname: &str,
+    port: u16,
+    user: &str,
+    password: Option<&str>,
+    key_path: Option<&std::path::Path>,
+    gate: &ConnectGate,
+    rx: &std::sync::mpsc::Receiver<ActorCmd>,
+) -> Option<Session> {
+    const BACKOFF_SECS: [u64; 3] = [5, 15, 60];
+    let mut attempt = 0usize;
+    loop {
+        gate.acquire();
+        let result = ssh_connect(hostname, port, user, password, key_path);
+        gate.release();
+
+        match result {
+            Ok(s) => {
+                emit_status(app, host_id, "online", None);
+                return Some(s);
+            }
+            Err(e) => {
+                emit_status(app, host_id, "offline", Some(e.clone()));
+                let wait = Duration::from_secs(BACKOFF_SECS[attempt.min(BACKOFF_SECS.len() - 1)]);
+                attempt += 1;
+                match rx.recv_timeout(wait) {
+                    Ok(ActorCmd::Disconnect)
+                    | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return None,
+                    Ok(ActorCmd::Poll { reply, .. }) => {
+                        let _ = reply.send(HostPollResult {
+                            host_id: host_id.to_string(),
+                            ok: false,
+                            system: None,
+                            containers: None,
+                            processes: None,
+                            error: Some(e),
+                            latency_ms: None,
+                        });
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                emit_status(app, host_id, "reconnecting", None);
+            }
+        }
+    }
 }
 
 fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<ActorCmd>) {
@@ -665,44 +780,24 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
         user,
         password,
         key_path,
+        gate,
     } = cfg;
-    // Initial connection
-    let session = match ssh_connect(
+
+    emit_status(&app, &host_id, "connecting", None);
+
+    let session = match connect_with_backoff(
+        &app,
+        &host_id,
         &hostname,
         port,
         &user,
         password.as_deref(),
         key_path.as_deref(),
+        &gate,
+        &rx,
     ) {
-        Ok(s) => s,
-        Err(e) => {
-            // Emit error so frontend clears the loading spinner
-            let _ = app.emit(
-                "dash:stat",
-                HostPollResult {
-                    host_id: host_id.clone(),
-                    ok: false,
-                    system: None,
-                    containers: None,
-                    processes: None,
-                    error: Some(e.clone()),
-                },
-            );
-            // Also reply to any already-queued Poll commands
-            while let Ok(cmd) = rx.try_recv() {
-                if let ActorCmd::Poll { reply, .. } = cmd {
-                    let _ = reply.send(HostPollResult {
-                        host_id: host_id.clone(),
-                        ok: false,
-                        system: None,
-                        containers: None,
-                        processes: None,
-                        error: Some(e.clone()),
-                    });
-                }
-            }
-            return;
-        }
+        Some(s) => s,
+        None => return, // Disconnect received while retrying the initial connection
     };
 
     let mut state = ActorState {
@@ -732,7 +827,11 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
                 continue;
             }
 
-            Ok(ActorCmd::Poll { want_detail, reply }) => {
+            Ok(ActorCmd::Poll {
+                want_processes,
+                want_containers,
+                reply,
+            }) => {
                 let now = Instant::now();
                 let poll_secs = state
                     .last_poll
@@ -740,26 +839,31 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
                     .unwrap_or(30.0);
                 state.last_poll = Some(now);
 
-                let result = do_poll(&mut state, &host_id, want_detail, poll_secs);
+                let result = do_poll(&mut state, &host_id, want_processes, want_containers, poll_secs);
 
-                // If session died, attempt one reconnect and retry
+                // If the session died, retry with backoff and re-poll once reconnected.
                 let result = if result.is_err() {
-                    match ssh_connect(
+                    emit_status(&app, &host_id, "reconnecting", None);
+                    match connect_with_backoff(
+                        &app,
+                        &host_id,
                         &hostname,
                         port,
                         &user,
                         password.as_deref(),
                         key_path.as_deref(),
+                        &gate,
+                        &rx,
                     ) {
-                        Ok(new_session) => {
+                        Some(new_session) => {
                             state.session = new_session;
                             state.prev_cpu = None;
                             state.prev_net = None;
                             state.prev_container_cpu.clear();
                             state.prev_container_net.clear();
-                            do_poll(&mut state, &host_id, want_detail, poll_secs)
+                            do_poll(&mut state, &host_id, want_processes, want_containers, poll_secs)
                         }
-                        Err(e) => Err(e),
+                        None => return, // Disconnect received while retrying
                     }
                 } else {
                     result
@@ -774,6 +878,7 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
                         containers: None,
                         processes: None,
                         error: Some(e),
+                        latency_ms: None,
                     },
                 };
                 let _ = reply.send(payload);
@@ -785,17 +890,26 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
 fn do_poll(
     state: &mut ActorState,
     host_id: &str,
-    want_detail: bool,
+    want_processes: bool,
+    want_containers: bool,
     poll_secs: f64,
 ) -> Result<HostPollResult, String> {
-    // System metrics — single channel, single cat
+    // System metrics + disk usage + IP in a single round trip (latency measured on this
+    // exec since it runs on every poll and dominates round-trip time).
+    let t0 = Instant::now();
     let sys_raw = exec_cmd(
         &state.session,
-        "cat /proc/stat /proc/meminfo /proc/loadavg /proc/uptime /proc/net/dev /proc/diskstats",
+        "cat /proc/stat /proc/meminfo /proc/loadavg /proc/uptime /proc/net/dev /proc/diskstats; \
+         echo ===DF===; df -k / 2>/dev/null | tail -1; \
+         echo ===IP===; hostname -I 2>/dev/null | awk '{print $1}'",
     )?;
+    let latency_ms = (t0.elapsed().as_secs_f64() * 1000.0) as f32;
+
+    let (proc_part, rest) = sys_raw.split_once("===DF===\n").unwrap_or((&sys_raw, ""));
+    let (df_part, ip_part) = rest.split_once("===IP===\n").unwrap_or((rest, ""));
 
     let (mut system, new_cpu, new_net, new_cpu_cores, new_disk) = parse_proc_output(
-        &sys_raw,
+        proc_part,
         state.prev_cpu.as_ref(),
         state.prev_net,
         poll_secs,
@@ -809,19 +923,12 @@ fn do_poll(
         state.prev_disk = new_disk;
     }
 
-    // Disk usage from df
-    if let Ok(df_raw) = exec_cmd(&state.session, "df -k / 2>/dev/null | tail -1") {
-        let parts: Vec<&str> = df_raw.split_whitespace().collect();
-        if parts.len() >= 3 {
-            system.disk_total_kb = parts[1].parse().unwrap_or(0);
-            system.disk_used_kb = parts[2].parse().unwrap_or(0);
-        }
+    let df_fields: Vec<&str> = df_part.split_whitespace().collect();
+    if df_fields.len() >= 3 {
+        system.disk_total_kb = df_fields[1].parse().unwrap_or(0);
+        system.disk_used_kb = df_fields[2].parse().unwrap_or(0);
     }
-
-    // IP from hostname -I
-    if let Ok(ip_raw) = exec_cmd(&state.session, "hostname -I 2>/dev/null | awk '{print $1}'") {
-        system.ip = ip_raw.trim().to_string();
-    }
+    system.ip = ip_part.trim().to_string();
 
     // Docker detection — done once and cached
     if state.has_docker.is_none() {
@@ -835,15 +942,16 @@ fn do_poll(
         );
     }
 
-    // When want_detail=true (frequent process polls), skip Docker to keep overhead low.
-    // Docker metrics are collected on the slow path (want_detail=false, every 30s).
-    let containers = if !want_detail && state.has_docker == Some(true) {
+    // Containers and processes are both opt-in: the 30s overview poll (all hosts) asks
+    // for neither, keeping it to one exec per host. The open detail view asks for
+    // processes every 5s and containers on a slower cadence.
+    let containers = if want_containers && state.has_docker == Some(true) {
         Some(collect_docker_metrics(state, poll_secs)?)
     } else {
         None
     };
 
-    let processes = if want_detail {
+    let processes = if want_processes {
         Some(collect_processes(state, system.cores.max(1))?)
     } else {
         None
@@ -856,6 +964,7 @@ fn do_poll(
         containers,
         processes,
         error: None,
+        latency_ms: Some(latency_ms),
     })
 }
 
@@ -1053,6 +1162,7 @@ fn collect_processes(state: &mut ActorState, num_cores: u32) -> Result<Vec<Proce
 
 pub struct DashboardManager {
     actors: HashMap<String, HostActor>,
+    connect_gate: std::sync::Arc<ConnectGate>,
 }
 
 impl Default for DashboardManager {
@@ -1062,10 +1172,18 @@ impl Default for DashboardManager {
 }
 
 impl DashboardManager {
+    /// Max concurrent SSH handshakes across all hosts (initial connects + reconnects).
+    const MAX_CONCURRENT_CONNECTS: usize = 6;
+
     pub fn new() -> Self {
         Self {
             actors: HashMap::new(),
+            connect_gate: std::sync::Arc::new(ConnectGate::new(Self::MAX_CONCURRENT_CONNECTS)),
         }
+    }
+
+    pub fn connect_gate(&self) -> std::sync::Arc<ConnectGate> {
+        self.connect_gate.clone()
     }
 
     pub fn connect(&mut self, host_id: String, actor: HostActor) {
@@ -1103,6 +1221,7 @@ impl DashboardManager {
 
 // ─── Public spawn function ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_host_actor(
     app: AppHandle,
     host_id: String,
@@ -1111,6 +1230,7 @@ pub fn spawn_host_actor(
     user: String,
     password: Option<String>,
     key_path: Option<std::path::PathBuf>,
+    gate: std::sync::Arc<ConnectGate>,
 ) -> HostActor {
     // SyncSender with buffer=4 — prevents blocking Tauri commands
     let (tx, rx) = std::sync::mpsc::sync_channel::<ActorCmd>(4);
@@ -1127,6 +1247,7 @@ pub fn spawn_host_actor(
                     user,
                     password,
                     key_path,
+                    gate,
                 },
                 rx,
             )
