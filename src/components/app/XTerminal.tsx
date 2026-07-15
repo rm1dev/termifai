@@ -15,6 +15,8 @@ import {
 } from "@/lib/api/terminal";
 import { subscribe, type UnlistenFn } from "@/lib/api/transport";
 import { open as openExternalUrl } from "@tauri-apps/plugin-shell";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { quotePathForShell } from "@/lib/shell-quote";
 import { listSnippets } from "@/lib/api/snippets";
 import { listHosts } from "@/lib/api/hosts";
 import { onSnippetsChanged } from "@/lib/snippets-events";
@@ -250,6 +252,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const reconnectAttemptRef = useRef(0);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The drag-drop event fires at the webview level, not per-DOM-element, and
+  // every tab's XTerminal (including hidden ones) mounts this listener — so
+  // handlers read isActive from a ref to ignore drops over background tabs.
+  const isActiveRef = useRef(isActive);
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
 
   const clearReconnectTimers = () => {
     if (reconnectTimeoutRef.current) {
@@ -405,6 +414,35 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     },
     [copySelection, pasteClipboard]
   );
+
+  // Dropping a file/folder from the OS file manager onto the terminal types
+  // its (shell-quoted) path, same convention as iTerm2/Terminal.app/Warp.
+  // Tauri's drag-drop event is webview-scoped rather than per-element, so
+  // every tab mounts this listener; isActiveRef filters drops that land
+  // while this pane isn't the visible one.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (!isActiveRef.current || event.payload.type !== "drop") return;
+        const { paths } = event.payload;
+        const sid = sessionRef.current;
+        if (!sid || !paths.length) return;
+        const text = paths.map(quotePathForShell).join(" ");
+        writeToSession(sid, text).catch(() => {});
+        refocusTerminal();
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [refocusTerminal]);
 
   const loadSnippets = useCallback(() => {
     return listSnippets().then((data) => {
