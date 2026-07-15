@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useTransition } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { call } from "@/lib/api/transport";
 import {
   Activity,
@@ -40,7 +40,7 @@ import {
   YAxis,
 } from "recharts";
 import type { Host, HostGroup } from "@/components/app/types";
-import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
+import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostStatusEntry, type HostPhase, type ContainerSummary, type CoreMetrics } from "@/lib/dashboard";
 
 function CircularGauge({ value, label }: { value: number; label: string }) {
   const r = 24;
@@ -161,28 +161,33 @@ function IoStat({
   label: string;
   rows: { icon: React.ComponentType<{ className?: string }>; value: string; unit: string; letter?: string }[];
 }) {
+  // The outer div claims an equal share of the row (flex-1) while the inner block is
+  // content-sized and centered inside it — leftover space splits evenly on both sides
+  // instead of piling up to the right of left-aligned text.
   return (
-    <div className="flex min-w-0 flex-1 flex-col gap-1">
-      <span className="text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
-        {label}
-      </span>
-      <div className="flex flex-col gap-0.5">
+    <div className="flex min-w-0 flex-1 justify-center">
+      <div className="flex min-w-0 flex-col gap-1">
+        <span className="text-[9px] font-bold uppercase tracking-[0.12em] text-muted-foreground">
+          {label}
+        </span>
+        <div className="flex min-w-0 flex-col gap-0.5">
         {rows.map((r, i) => {
           const Icon = r.icon;
           return (
-            <div key={i} className="flex items-center gap-1.5 font-mono tabular-nums">
+            <div key={i} className="flex min-w-0 items-center gap-1 font-mono tabular-nums">
               {r.letter ? (
-                <span className="flex h-3 w-3 items-center justify-center rounded-full border border-border text-[7px] font-bold text-muted-foreground">
+                <span className="flex h-3 w-3 shrink-0 items-center justify-center rounded-full border border-border text-[7px] font-bold text-muted-foreground">
                   {r.letter}
                 </span>
               ) : (
-                <Icon className="h-2.5 w-2.5 text-muted-foreground" />
+                <Icon className="h-2.5 w-2.5 shrink-0 text-muted-foreground" />
               )}
-              <span className="text-[11px] font-bold text-foreground">{r.value}</span>
-              <span className="text-[9px] text-muted-foreground">{r.unit}</span>
+              <span className="truncate text-[10px] font-bold text-foreground">{r.value}</span>
+              <span className="shrink-0 text-[9px] text-muted-foreground">{r.unit}</span>
             </div>
           );
         })}
+        </div>
       </div>
     </div>
   );
@@ -192,48 +197,63 @@ function IoStat({
 
 
 
-type ServerStat = {
-  id: string;
-  name: string;
-  status: "online" | "error";
-  cores: number;
-  ram: string;
-  storage: string;
-  uptime: string;
-  cpu: number;
-  ramUsed: number;
-  diskUsed: number;
-  os: string;
-  ip: string;
-  netDown: string; netDownUnit: string;
-  netUp: string; netUpUnit: string;
-  diskRead: string; diskReadUnit: string;
-  diskWrite: string; diskWriteUnit: string;
-  cpuSamples?: number[];
-};
+function statusDotClass(phase: HostPhase): string {
+  switch (phase) {
+    case "online":
+      return "bg-[oklch(0.65_0.18_145)]";
+    case "offline":
+      return "bg-[oklch(0.65_0.2_25)]";
+    case "reconnecting":
+      return "bg-[var(--color-brand-orange)] animate-pulse";
+    default:
+      return "bg-muted-foreground/40 animate-pulse"; // connecting
+  }
+}
 
-const DASHBOARD_SERVERS: ServerStat[] = [
-  { id: "h1", name: "Sentry", status: "online", cores: 8, ram: "126 G", storage: "111 G", uptime: "23 Days", cpu: 14, ramUsed: 40, diskUsed: 52, os: "Ubuntu 22.04 LTS", ip: "10.0.0.11/24", cpuSamples: [4, 22, 9, 31, 6, 18, 11, 12],
-    netDown: "151", netDownUnit: "K/s", netUp: "11.1", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h2", name: "Ariyapanel Bot", status: "error", cores: 8, ram: "0 B", storage: "0 B", uptime: "0 Minutes", cpu: 0, ramUsed: 0, diskUsed: 0, os: "Debian 11", ip: "—", cpuSamples: [0, 0, 0, 0, 0, 0, 0, 0],
-    netDown: "0", netDownUnit: "B/s", netUp: "0", netUpUnit: "B/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h3", name: "AriyaPanel Monitoring", status: "online", cores: 8, ram: "2.90 G", storage: "26.2 G", uptime: "134 Days", cpu: 68, ramUsed: 95, diskUsed: 60, os: "Debian 11", ip: "192.168.90.198/24", cpuSamples: [82, 47, 91, 55, 73, 38, 88, 70],
-    netDown: "31.6", netDownUnit: "K/s", netUp: "9.99", netUpUnit: "K/s", diskRead: "1.30", diskReadUnit: "M/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h4", name: "AriyaPanel DB", status: "online", cores: 8, ram: "19.6 G", storage: "299 G", uptime: "167 Days", cpu: 23, ramUsed: 82, diskUsed: 71, os: "Ubuntu 20.04", ip: "192.168.90.200/24", cpuSamples: [12, 34, 8, 41, 18, 27, 15, 29],
-    netDown: "401", netDownUnit: "K/s", netUp: "165", netUpUnit: "K/s", diskRead: "188", diskReadUnit: "K/s", diskWrite: "380", diskWriteUnit: "K/s" },
-  { id: "h5", name: "AriyaPanel Elastic", status: "online", cores: 8, ram: "15.6 G", storage: "92.0 G", uptime: "210 Days", cpu: 53, ramUsed: 63, diskUsed: 86, os: "Debian GNU/Linux 11 (bullseye)", ip: "192.168.90.199/24", cpuSamples: [94, 96, 10, 19, 48, 99, 95, 5],
-    netDown: "10.9", netDownUnit: "K/s", netUp: "10.8", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "192", diskWriteUnit: "K/s" },
-  { id: "h6", name: "AriyaPanel", status: "online", cores: 8, ram: "17.5 G", storage: "44.5 G", uptime: "210 Days", cpu: 37, ramUsed: 21, diskUsed: 44, os: "Ubuntu 22.04", ip: "192.168.90.201/24", cpuSamples: [21, 64, 18, 52, 33, 47, 25, 39],
-    netDown: "25", netDownUnit: "K/s", netUp: "07", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "8.0", diskWriteUnit: "K/s" },
-];
+function latencyColor(ms: number): string {
+  if (ms < 100) return "text-[oklch(0.65_0.18_145)]";
+  if (ms < 300) return "text-[var(--color-brand-yellow)]";
+  return "text-[var(--color-brand-orange)]";
+}
+
+function statusLabel(phase: HostPhase, hostStatus?: HostStatusEntry): string {
+  switch (phase) {
+    case "online":
+      return hostStatus?.latencyMs != null ? `${Math.round(hostStatus.latencyMs)} ms` : "Online";
+    case "offline":
+      return "Offline";
+    case "reconnecting":
+      return "Reconnecting…";
+    default:
+      return "Connecting…";
+  }
+}
+
+/** Running/stopped container counts on the overview card — container health is often more
+ *  urgent than host-level CPU/RAM, so it's surfaced here instead of only in detail view. */
+function ContainerSummaryBadge({ summary }: { summary: ContainerSummary }) {
+  const hasStopped = summary.stopped > 0;
+  return (
+    <span
+      className={`flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-bold tabular-nums ${
+        hasStopped
+          ? "bg-[color-mix(in_oklab,var(--color-brand-orange)_16%,transparent)] text-[var(--color-brand-orange)]"
+          : "bg-[color-mix(in_oklab,var(--color-brand-green)_14%,transparent)] text-[var(--color-brand-green)]"
+      }`}
+      title={`${summary.running} running, ${summary.stopped} stopped`}
+    >
+      <Container className="h-3 w-3" />
+      {summary.running}
+      {hasStopped && <span className="opacity-70">/{summary.stopped}↓</span>}
+    </span>
+  );
+}
 
 export function DashboardView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hosts, setHosts] = useState<Host[]>([]);
   const [groups, setGroups] = useState<HostGroup[]>([]);
-  // Cache the last full detail result (including processes) per host.
-  // Stored in a ref so re-entering a host shows data instantly without re-fetching.
-  const detailCacheRef = useRef<Record<string, HostPollResult>>({});
+  const [hostsLoaded, setHostsLoaded] = useState(false);
 
   // Load hosts that have showStatusInDashboard enabled
   useEffect(() => {
@@ -241,12 +261,15 @@ export function DashboardView() {
       .then((v) => {
         setHosts(v.hosts.filter((h) => h.showStatusInDashboard !== false));
         setGroups(v.groups || []);
+        setHostsLoaded(true);
       })
       .catch(console.error);
   }, []);
 
   const hostIds = hosts.map((h) => h.id);
-  const { stats, loading } = useDashboard(hostIds);
+  // Pass null until the host list has actually loaded — an empty array during that
+  // window would otherwise look like "all hosts were removed" to the store.
+  const { stats, status } = useDashboard(hostsLoaded ? hostIds : null);
 
   if (selectedId) {
     const selectedHost = hosts.find((h) => h.id === selectedId);
@@ -254,8 +277,7 @@ export function DashboardView() {
       return (
         <HostDashboardView
           host={selectedHost}
-          initialStats={detailCacheRef.current[selectedId] ?? stats[selectedId] ?? null}
-          onDetailUpdate={(result) => { detailCacheRef.current[selectedId] = result; }}
+          hostStatus={status[selectedId]}
           onBack={() => setSelectedId(null)}
         />
       );
@@ -264,86 +286,77 @@ export function DashboardView() {
 
   const renderHostCard = (host: Host) => {
     const poll = stats[host.id];
-    const isLoading = loading.has(host.id);
-    const sys = poll?.system;
+    const hostStatus = status[host.id];
+    const phase: HostPhase = hostStatus?.phase ?? "connecting";
+    const sys = poll?.system ?? null;
+    const containerSummary = poll?.containerSummary ?? null;
 
     return (
       <button
         key={host.id}
         type="button"
         onClick={() => setSelectedId(host.id)}
+        title={phase === "offline" ? (hostStatus?.error ?? undefined) : undefined}
         className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
       >
         {/* Header */}
         <div className="flex items-center justify-between">
-          <span className="text-sm font-semibold text-foreground">{host.name}</span>
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-foreground">{host.name}</span>
+            {containerSummary && <ContainerSummaryBadge summary={containerSummary} />}
+          </div>
           <div className="flex items-center gap-1.5">
-            {isLoading ? (
-              <span className="h-2 w-2 rounded-full bg-muted-foreground/40 animate-pulse" />
-            ) : (
-              <span className={`h-2 w-2 rounded-full ${poll?.ok ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
-            )}
-            <span className="text-xs text-muted-foreground">
-              {isLoading ? "Connecting…" : poll?.ok ? "Online" : poll?.error ? "Error" : "—"}
+            <span className={`h-2 w-2 rounded-full ${statusDotClass(phase)}`} />
+            <span
+              className={`text-xs font-mono tabular-nums ${
+                phase === "online" && hostStatus?.latencyMs != null
+                  ? latencyColor(hostStatus.latencyMs)
+                  : "text-muted-foreground"
+              }`}
+            >
+              {statusLabel(phase, hostStatus)}
             </span>
           </div>
         </div>
 
-        {/* Specs from real system data */}
+        {/* Specs from real system data — zeroed placeholders before the first poll */}
         <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-          {sys && (
-            <>
-              <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys.cores} Cores</span>
-              <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes(sys.memTotalKb * 1024)}</span>
-              <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes(sys.diskTotalKb * 1024)}</span>
-              <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {fmtUptime(sys.uptimeSecs)}</span>
-            </>
-          )}
-          {isLoading && !sys && (
-            <span className="h-3 w-48 rounded animate-shimmer inline-block" />
-          )}
+          <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys?.cores ?? 0} Cores</span>
+          <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes((sys?.memTotalKb ?? 0) * 1024)}</span>
+          <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes((sys?.diskTotalKb ?? 0) * 1024)}</span>
+          <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {sys ? fmtUptime(sys.uptimeSecs) : "0m"}</span>
         </div>
 
-        {/* Gauges */}
-        {sys ? (
-          <div className="mt-4 flex items-start gap-4">
-            <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
-            <RingGauge
-              value={sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
-              label="RAM"
-              gradientId={`g-dash-ram-${host.id}`}
-              size={52}
-            />
-            <RingGauge
-              value={sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
-              label="Disk"
-              gradientId={`g-dash-disk-${host.id}`}
-              size={52}
-            />
-            <IoStat
-              label="Network"
-              rows={[
-                { icon: ArrowDownToLine, value: fmtBytes(sys.netRxRate), unit: "/s" },
-                { icon: ArrowUpFromLine, value: fmtBytes(sys.netTxRate), unit: "/s" },
-              ]}
-            />
-          </div>
-        ) : (
-          <div className="mt-4 flex items-start gap-4">
-            {/* Gauge placeholders */}
-            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-            {/* Network placeholder */}
-            <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-              <div className="h-2.5 w-14 rounded animate-shimmer" />
-              <div className="flex flex-col gap-1">
-                <div className="h-2.5 w-16 rounded animate-shimmer" />
-                <div className="h-2.5 w-16 rounded animate-shimmer" />
-              </div>
-            </div>
-          </div>
-        )}
+        {/* Gauges — always rendered at full structure, zeroed until the first poll lands */}
+        <div className="mt-4 flex items-start gap-3">
+          <RingGauge value={sys?.cpuPct ?? 0} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={48} />
+          <RingGauge
+            value={sys && sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
+            label="RAM"
+            gradientId={`g-dash-ram-${host.id}`}
+            size={48}
+          />
+          <RingGauge
+            value={sys && sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
+            label="Disk"
+            gradientId={`g-dash-disk-${host.id}`}
+            size={48}
+          />
+          <IoStat
+            label="Network"
+            rows={[
+              { icon: ArrowDownToLine, value: fmtBytes(sys?.netRxRate ?? 0), unit: "/s" },
+              { icon: ArrowUpFromLine, value: fmtBytes(sys?.netTxRate ?? 0), unit: "/s" },
+            ]}
+          />
+          <IoStat
+            label="Disk I/O"
+            rows={[
+              { letter: "R", icon: ArrowDownToLine, value: fmtBytes(sys?.diskReadRate ?? 0), unit: "/s" },
+              { letter: "W", icon: ArrowUpFromLine, value: fmtBytes(sys?.diskWriteRate ?? 0), unit: "/s" },
+            ]}
+          />
+        </div>
       </button>
     );
   };
@@ -377,7 +390,7 @@ export function DashboardView() {
 
         {hasDirectHosts && (
           <div 
-            className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(340px,1fr))]"
+            className="grid gap-4 [grid-template-columns:repeat(auto-fill,minmax(min(340px,100%),1fr))]"
             style={{ marginLeft: `${depth * 8}px` }}
           >
             {groupHosts.map(host => renderHostCard(host))}
@@ -390,13 +403,13 @@ export function DashboardView() {
   };
 
   const total = hosts.length;
-  const online = hosts.filter((h) => stats[h.id]?.ok).length;
-  const offline = hosts.filter((h) => stats[h.id] && !stats[h.id].ok).length;
+  const online = hosts.filter((h) => status[h.id]?.phase === "online").length;
+  const offline = hosts.filter((h) => status[h.id]?.phase === "offline").length;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-y-auto p-5">
       {/* Summary stats */}
-      <div className="mb-5 grid grid-cols-3 gap-4">
+      <div className="mb-5 grid grid-cols-3 gap-2 sm:gap-4">
         <div className="rounded-xl border border-border bg-[var(--color-surface)] p-4">
           <div className="text-xs text-muted-foreground">Total Servers</div>
           <div className="mt-1 flex items-center gap-2">
@@ -494,7 +507,7 @@ const CPU_CATEGORIES: { key: CpuCategory; label: string; color: string }[] = [
   { key: "steal", label: "Steal", color: "var(--color-brand-orange)" },
 ];
 
-function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetrics[]) {
+function buildCpuData(cpuPct: number, cores: number, coreMetrics?: CoreMetrics[]) {
   // Use real per-core breakdown when available (second poll onwards)
   const threads: CpuThread[] = (coreMetrics && coreMetrics.length > 0)
     ? coreMetrics.map((c) => ({
@@ -504,13 +517,12 @@ function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetric
         iowait: Math.max(0, c.iowait),
         steal:  Math.max(0, c.steal),
       }))
-    : Array.from({ length: cores }, (_, i) => {
+    : Array.from({ length: cores }, () => {
         // Fallback: first poll has no per-core data yet — show aggregate evenly
-        const total = Math.max(0, Math.min(100, samples[0] ?? 0));
+        const total = Math.max(0, Math.min(100, cpuPct));
         const system = total > 0 ? Math.min(total, Math.round(total * 0.05)) : 0;
-        const iowait = 0;
         const user = Math.max(0, total - system);
-        return { user, system, nice: 0, iowait, steal: 0 };
+        return { user, system, nice: 0, iowait: 0, steal: 0 };
       });
   const sum = (k: CpuCategory) => threads.reduce((a, t) => a + t[k], 0) / Math.max(threads.length, 1);
   const breakdown: Record<CpuCategory, number> = {
@@ -524,57 +536,46 @@ function buildCpuData(samples: number[], cores: number, coreMetrics?: CoreMetric
   return { threads, breakdown, total };
 }
 
-function useColumnCount(blockWidth = 8, gap = 2) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [cols, setCols] = useState(0);
+/* Each usage bar is a SINGLE div: a hard-stop linear-gradient paints the per-category
+   segments and a repeating-gradient mask carves the 6px-block/1px-gap pattern. The old
+   implementation rendered one <span> per block — ~175 spans per bar × 33 bars ≈ 5,700 DOM
+   nodes rebuilt on every 5s poll (and every keystroke in the process filter), plus a
+   ResizeObserver re-render loop to recount columns. Gradients are percentage-based, so
+   they also resize for free. */
 
-  useEffect(() => {
-    if (!ref.current) return;
-    const ro = new ResizeObserver(([entry]) => {
-      const w = entry.contentRect.width;
-      const next = Math.max(10, Math.floor((w + gap) / (blockWidth + gap)));
-      setCols(next);
-    });
-    ro.observe(ref.current);
-    return () => ro.disconnect();
-  }, [blockWidth, gap]);
+const CPU_BAR_MASK: React.CSSProperties = {
+  maskImage: "repeating-linear-gradient(90deg, #000 0 6px, transparent 6px 7px)",
+  WebkitMaskImage: "repeating-linear-gradient(90deg, #000 0 6px, transparent 6px 7px)",
+};
 
-  return { ref, cols };
+function cpuBarGradient(thread: CpuThread): string {
+  const stops: string[] = [];
+  let acc = 0;
+  for (const c of CPU_CATEGORIES) {
+    const v = Math.max(0, thread[c.key]);
+    if (v <= 0) continue;
+    stops.push(`${c.color} ${acc.toFixed(2)}% ${Math.min(acc + v, 100).toFixed(2)}%`);
+    acc += v;
+  }
+  const dim = "color-mix(in oklab, var(--color-border) 45%, transparent)";
+  stops.push(`${dim} ${Math.min(acc, 100).toFixed(2)}% 100%`);
+  return `linear-gradient(90deg, ${stops.join(", ")})`;
 }
 
-function CpuThreadRow({ thread, cols }: { thread: CpuThread; cols: number }) {
-  const total = thread.user + thread.system + thread.nice + thread.iowait + thread.steal;
-  const filled = Math.round((total / 100) * cols);
-  const raw = CPU_CATEGORIES.map((c) => ({ key: c.key, color: c.color, exact: (thread[c.key] / 100) * cols }));
-  const counts = raw.map((r) => ({ ...r, n: Math.floor(r.exact), rem: r.exact - Math.floor(r.exact) }));
-  let assigned = counts.reduce((a, c) => a + c.n, 0);
-  const remainders = [...counts].sort((a, b) => b.rem - a.rem);
-  let ri = 0;
-  while (assigned < filled && ri < remainders.length) {
-    const target = counts.find((c) => c.key === remainders[ri].key)!;
-    if (target.exact > 0) target.n += 1;
-    assigned += 1;
-    ri += 1;
-  }
-  const blocks: string[] = [];
-  for (const c of counts) for (let i = 0; i < c.n; i++) blocks.push(c.color);
-  while (blocks.length < filled) blocks.push("var(--color-brand-cyan)");
-  blocks.length = Math.min(blocks.length, cols);
+function CpuBar({ thread }: { thread: CpuThread }) {
+  return (
+    <div
+      className="h-[10px] min-w-0 flex-1"
+      style={{ backgroundImage: cpuBarGradient(thread), ...CPU_BAR_MASK }}
+    />
+  );
+}
 
+function CpuThreadRow({ thread }: { thread: CpuThread }) {
+  const total = thread.user + thread.system + thread.nice + thread.iowait + thread.steal;
   return (
     <div className="flex items-center gap-2">
-      <div className="flex flex-1 gap-[1px] overflow-hidden">
-        {Array.from({ length: cols }).map((_, i) => (
-          <span
-            key={i}
-            className="h-[10px] w-[6px] shrink-0 rounded-[1px]"
-            style={{
-              background: i < blocks.length ? blocks[i] : "var(--color-border)",
-              opacity: i < blocks.length ? 1 : 0.4,
-            }}
-          />
-        ))}
-      </div>
+      <CpuBar thread={thread} />
       <span className="w-9 text-right text-[10px] font-semibold tabular-nums text-foreground">
         {Math.round(total)}%
       </span>
@@ -582,17 +583,28 @@ function CpuThreadRow({ thread, cols }: { thread: CpuThread; cols: number }) {
   );
 }
 
-function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number[]; cores: number; model: string; coreMetrics?: CoreMetrics[] }) {
+// memo: the parent re-renders on every poll, keystroke in the process filter, and load
+// history tick — this component only needs to redraw when its own (scalar/array) props
+// actually change with a new poll.
+const CpuUsageChart = memo(function CpuUsageChart({
+  cpuPct,
+  cores,
+  model,
+  coreMetrics,
+}: {
+  cpuPct: number;
+  cores: number;
+  model: string;
+  coreMetrics?: CoreMetrics[];
+}) {
   const [open, setOpen] = useState(false);
-  const [isPending, startTransition] = useTransition();
-  const data = buildCpuData(samples, cores, coreMetrics);
-  const { ref, cols } = useColumnCount(6, 1);
+  const data = useMemo(() => buildCpuData(cpuPct, cores, coreMetrics), [cpuPct, cores, coreMetrics]);
 
   return (
     <section className="overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-4">
       <button
         type="button"
-        onClick={() => startTransition(() => setOpen((v) => !v))}
+        onClick={() => setOpen((v) => !v)}
         className="flex w-full items-center gap-3 text-left"
         aria-expanded={open}
       >
@@ -614,52 +626,15 @@ function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number
       </div>
 
       {/* always-visible single-line overall load bar */}
-      <div ref={ref} className="mt-3 flex gap-[1px] overflow-hidden">
-        {(() => {
-          const raw = CPU_CATEGORIES.map((c) => ({ color: c.color, exact: (data.breakdown[c.key] / 100) * cols }));
-          const counts = raw.map((r) => ({ ...r, n: Math.floor(r.exact), rem: r.exact - Math.floor(r.exact) }));
-          const filled = Math.round((data.total / 100) * cols);
-          let assigned = counts.reduce((a, c) => a + c.n, 0);
-          const order = counts.map((_, i) => i).sort((a, b) => counts[b].rem - counts[a].rem);
-          let ri = 0;
-          while (assigned < filled && ri < order.length) {
-            if (counts[order[ri]].exact > 0) counts[order[ri]].n += 1;
-            assigned += 1;
-            ri += 1;
-          }
-          const blocks: string[] = [];
-          for (const c of counts) for (let i = 0; i < c.n; i++) blocks.push(c.color);
-          return Array.from({ length: cols }).map((_, i) => (
-            <span
-              key={i}
-              className="h-[10px] w-[6px] shrink-0 rounded-[1px]"
-              style={{
-                background: i < blocks.length ? blocks[i] : "var(--color-border)",
-                opacity: i < blocks.length ? 1 : 0.4,
-              }}
-            />
-          ));
-        })()}
+      <div className="mt-3 flex">
+        <CpuBar thread={data.breakdown} />
       </div>
 
       {open && (
-        <div className="mt-3 border-t border-border pt-3">
-          {isPending ? (
-            <div className="space-y-1.5">
-              {Array.from({ length: cores }).map((_, i) => (
-                <div key={i} className="flex items-center gap-2">
-                  <div className="h-[10px] flex-1 rounded-[1px] animate-shimmer" />
-                  <span className="w-9" />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="space-y-1">
-              {data.threads.map((t, i) => (
-                <CpuThreadRow key={i} thread={t} cols={Math.max(10, cols - Math.round(44 / 7))} />
-              ))}
-            </div>
-          )}
+        <div className="mt-3 space-y-1 border-t border-border pt-3">
+          {data.threads.map((t, i) => (
+            <CpuThreadRow key={i} thread={t} />
+          ))}
         </div>
       )}
 
@@ -687,7 +662,7 @@ function CpuUsageChart({ samples, cores, model, coreMetrics }: { samples: number
       </div>
     </section>
   );
-}
+});
 
 function PanelHeader({
   icon: Icon,
@@ -710,13 +685,6 @@ function PanelHeader({
     </CardHeader>
   );
 }
-
-const loadSeries = Array.from({ length: 32 }).map((_, i) => ({
-  t: i,
-  m1: 5.4 + Math.sin(i / 3) * 0.6 + Math.random() * 0.2,
-  m5: 5.6 + Math.sin(i / 5) * 0.4,
-  m15: 5.5 + Math.cos(i / 6) * 0.3,
-}));
 
 function MiniGauge({
   value,
@@ -789,31 +757,91 @@ function SectionLabel({
   );
 }
 
+/** Zero-value container card shown while the per-container list is still loading but we
+ *  already know (from containerSummary) how many containers to expect — same "structure
+ *  exists, data is zero" pattern as the overview cards, no shimmer. */
+function ContainerPlaceholderCard({ index }: { index: number }) {
+  return (
+    <div className="relative overflow-hidden rounded-xl border border-border bg-background/40 p-3">
+      <div aria-hidden className="absolute inset-y-0 left-0 w-[3px]" style={{ background: "var(--color-border)" }} />
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0 truncate text-[12px] font-semibold text-muted-foreground">Container</div>
+        <div className="flex shrink-0 items-center gap-1.5 text-[10px] text-muted-foreground">
+          <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/40 animate-pulse" />
+          <span className="font-mono">loading…</span>
+        </div>
+      </div>
+      <div className="mt-2.5 flex items-start gap-2.5">
+        <RingGauge value={0} label="CPU" gradientId={`g-cpu-ph-${index}`} size={40} stroke={5} />
+        <RingGauge value={0} label="RAM" gradientId={`g-ram-ph-${index}`} size={40} stroke={5} />
+        <IoStat
+          label="Network"
+          rows={[
+            { icon: ArrowDownToLine, value: fmtBytes(0), unit: "/s" },
+            { icon: ArrowUpFromLine, value: fmtBytes(0), unit: "/s" },
+          ]}
+        />
+        <IoStat
+          label="Disk I/O"
+          rows={[
+            { letter: "R", icon: ArrowDownToLine, value: fmtBytes(0), unit: "/s" },
+            { letter: "W", icon: ArrowUpFromLine, value: fmtBytes(0), unit: "/s" },
+          ]}
+        />
+      </div>
+    </div>
+  );
+}
+
 function HostDashboardView({
   host,
-  initialStats,
-  onDetailUpdate,
+  hostStatus,
   onBack,
 }: {
   host: Host;
-  initialStats: HostPollResult | null;
-  onDetailUpdate?: (result: HostPollResult) => void;
+  hostStatus?: HostStatusEntry;
   onBack: () => void;
 }) {
-  const { detail } = useHostDetail(host.id);
-  const poll = detail ?? initialStats;
+  // detail comes straight from the shared dashboardStore — already seeded from the
+  // overview poll, so it's non-null the moment any poll for this host has landed,
+  // even before this view mounts.
+  const { detail: poll } = useHostDetail(host.id);
   const sys = poll?.system ?? null;
   const pollProcesses = poll?.processes ?? null;
-  const pollContainers = poll?.containers ?? null; // null = docker not installed
-
-  // Persist detail (with processes) to parent cache so re-entry is instant
-  useEffect(() => {
-    if (detail?.ok && detail.processes !== null) {
-      onDetailUpdate?.(detail);
-    }
-  }, [detail]);
+  const pollContainers = poll?.containers ?? null; // null until the per-container list has loaded
+  // Comes from the (much cheaper) overview poll, so it's usually already known — running/
+  // stopped counts and the section itself can show immediately instead of appearing empty
+  // while the full per-container list is still loading. null = docker not installed.
+  const containerSummary = poll?.containerSummary ?? null;
+  const phase: HostPhase = hostStatus?.phase ?? "connecting";
 
   const [procSearch, setProcSearch] = useState("");
+
+  // Briefly highlight a container card when its state changes between polls (e.g. a crash
+  // or restart) — a client-side diff against the previous poll, no backend support needed.
+  const prevContainerStatesRef = useRef<Record<string, string>>({});
+  const [changedContainerIds, setChangedContainerIds] = useState<Set<string>>(new Set());
+  useEffect(() => {
+    if (!pollContainers) return;
+    const prevStates = prevContainerStatesRef.current;
+    const nextStates: Record<string, string> = {};
+    const changed: string[] = [];
+    for (const c of pollContainers) {
+      nextStates[c.id] = c.state;
+      if (prevStates[c.id] !== undefined && prevStates[c.id] !== c.state) changed.push(c.id);
+    }
+    prevContainerStatesRef.current = nextStates;
+    if (changed.length === 0) return;
+    setChangedContainerIds((prev) => new Set([...prev, ...changed]));
+    const timer = setTimeout(() => {
+      setChangedContainerIds((prev) => {
+        const next = new Set(prev);
+        for (const id of changed) next.delete(id);
+        return next;
+      });
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [pollContainers]);
 
   // Accumulate load average history for the chart (max 32 points)
   const loadHistoryRef = useRef<{ t: number; m1: number; m5: number; m15: number }[]>([]);
@@ -846,10 +874,14 @@ function HostDashboardView({
   ];
 
   return (
-    <ScrollArea className="h-full">
-      <div className="mx-auto max-w-[1400px] space-y-5 p-6">
+    // Native overflow scroll, NOT Radix ScrollArea: its viewport wraps content in a
+    // `display:table` div whose width tracks content max-content. Combined with the fixed
+    // pixel width recharts leaves on its rendered SVG, that deadlocks window shrinking
+    // (everything grows fine, nothing ever shrinks until a remount re-measures).
+    <div className="h-full overflow-y-auto">
+      <div className="mx-auto max-w-[1400px] space-y-4 p-4 sm:space-y-5 sm:p-6">
         {/* ─── HERO IDENTITY BAR ───────────────────────────────────── */}
-        <header className="relative overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-5">
+        <header className="relative overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] p-4 sm:p-5">
           <div
             aria-hidden
             className="pointer-events-none absolute inset-x-0 top-0 h-px"
@@ -858,8 +890,8 @@ function HostDashboardView({
                 "linear-gradient(90deg, transparent, color-mix(in oklab, var(--color-brand-cyan) 40%, transparent), transparent)",
             }}
           />
-          <div className="flex flex-wrap items-center justify-between gap-6">
-            <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-4 sm:gap-6">
+            <div className="flex min-w-0 items-center gap-3 sm:gap-4">
               <Button
                 variant="outline"
                 size="icon"
@@ -871,7 +903,7 @@ function HostDashboardView({
               </Button>
 
               <div
-                className="flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-border bg-background shadow-inner"
+                className="hidden h-14 w-14 shrink-0 items-center justify-center rounded-xl border border-border bg-background shadow-inner sm:flex"
                 style={{
                   boxShadow:
                     "inset 0 1px 0 color-mix(in oklab, var(--color-brand-cyan) 12%, transparent), 0 0 24px color-mix(in oklab, var(--color-brand-cyan) 8%, transparent)",
@@ -880,8 +912,8 @@ function HostDashboardView({
                 <Server className="h-6 w-6" style={{ color: "var(--color-brand-cyan)" }} />
               </div>
 
-              <div className="space-y-1.5">
-                <div className="flex items-center gap-2.5">
+              <div className="min-w-0 space-y-1.5">
+                <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
                   <h1 className="text-xl font-bold tracking-tight text-foreground">{host.name}</h1>
                   <Badge
                     variant="secondary"
@@ -891,10 +923,12 @@ function HostDashboardView({
                   </Badge>
                   <span className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
                     <span className="relative flex h-1.5 w-1.5">
-                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--color-brand-green)] opacity-60" />
-                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
+                      {phase === "online" && (
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--color-brand-green)] opacity-60" />
+                      )}
+                      <span className={`relative inline-flex h-1.5 w-1.5 rounded-full ${statusDotClass(phase)}`} />
                     </span>
-                    Online
+                    {statusLabel(phase, hostStatus)}
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
@@ -918,35 +952,37 @@ function HostDashboardView({
               </div>
             </div>
 
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-5 rounded-xl border border-border bg-background/60 px-4 py-2.5">
-                <MiniGauge value={sys?.cpuPct ?? 0} label="CPU" color="var(--color-brand-cyan)" />
-                <span className="h-9 w-px bg-border" />
-                <MiniGauge value={memUsedPct} label="RAM" color="oklch(0.7 0.28 320)" />
-                <span className="h-9 w-px bg-border" />
-                <MiniGauge value={diskPct} label="Disk" color="var(--color-brand-yellow)" />
-              </div>
+            {/* Grows to a full evenly-spread row when it wraps under the title on
+                narrow screens; compact pill on desktop. */}
+            <div className="flex flex-1 items-center justify-around gap-3 rounded-xl border border-border bg-background/60 px-4 py-2.5 sm:gap-5 lg:flex-none lg:justify-start">
+              <MiniGauge value={sys?.cpuPct ?? 0} label="CPU" color="var(--color-brand-cyan)" />
+              <span className="h-9 w-px bg-border" />
+              <MiniGauge value={memUsedPct} label="RAM" color="oklch(0.7 0.28 320)" />
+              <span className="h-9 w-px bg-border" />
+              <MiniGauge value={diskPct} label="Disk" color="var(--color-brand-yellow)" />
             </div>
           </div>
         </header>
 
         {/* ─── CPU USAGE ──────────────────────────────────────────── */}
         <CpuUsageChart
-          samples={sys ? [sys.cpuPct] : [0]}
+          cpuPct={sys?.cpuPct ?? 0}
           cores={sys?.cores ?? 1}
           model={sys ? `Load: ${sys.load1m.toFixed(2)} / ${sys.load5m.toFixed(2)} / ${sys.load15m.toFixed(2)}` : "—"}
           coreMetrics={sys?.cpuCores}
         />
 
         {/* ─── CPU LOAD CHART + PROCESSES ─────────────────────────── */}
-        <div className="grid grid-cols-1 gap-5 lg:grid-cols-12">
-          <section className="flex flex-col rounded-2xl border border-border bg-[var(--color-surface)] p-5 lg:col-span-7">
+        {/* Window minimum is 900px, so this pair is always side by side */}
+        <div className="grid grid-cols-12 gap-5">
+          {/* min-w-0: let the grid item shrink below the chart SVG's last rendered width */}
+          <section className="col-span-7 flex min-w-0 flex-col rounded-2xl border border-border bg-[var(--color-surface)] p-5">
             <SectionLabel
               color="var(--color-brand-yellow)"
               icon={Activity}
               title="CPU Load Average"
               action={
-                <div className="flex gap-3 text-[11px]">
+                <div className="flex flex-wrap justify-end gap-x-3 gap-y-1 text-[11px]">
                   <span className="flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-[var(--color-brand-red)]" />
                     <span className="text-muted-foreground">1m</span>
@@ -965,9 +1001,10 @@ function HostDashboardView({
                 </div>
               }
             />
-            <div className="flex-1 min-h-0 w-full">
+            {/* Row height is driven by the fixed-height processes table beside it */}
+            <div className="min-h-0 w-full flex-1">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={loadHistory.length > 0 ? loadHistory : loadSeries} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+                <AreaChart data={loadHistory} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
                   <defs>
                     <linearGradient id="g1m" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="var(--color-brand-red)" stopOpacity={0.45} />
@@ -1011,7 +1048,7 @@ function HostDashboardView({
             </div>
           </section>
 
-          <section className="overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)] lg:col-span-5">
+          <section className="col-span-5 min-w-0 overflow-hidden rounded-2xl border border-border bg-[var(--color-surface)]">
             <div className="px-4 pt-4 pb-2">
               <SectionLabel
                 color="var(--color-brand-red)"
@@ -1102,7 +1139,7 @@ function HostDashboardView({
         </div>
 
         {/* ─── MEMORY · NETWORK · STORAGE BENTO ───────────────────── */}
-        <div className="grid grid-cols-1 gap-5 lg:grid-cols-3">
+        <div className="grid grid-cols-2 gap-5 lg:grid-cols-3">
           {/* Memory */}
           <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
             <SectionLabel color="oklch(0.7 0.28 320)" icon={Activity} title="Memory" />
@@ -1193,8 +1230,8 @@ function HostDashboardView({
             </div>
           </section>
 
-          {/* Storage */}
-          <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-4">
+          {/* Storage — spans the full second row in the 2-col layout below lg */}
+          <section className="col-span-2 rounded-2xl border border-border bg-[var(--color-surface)] p-4 lg:col-span-1">
             <SectionLabel
               color="var(--color-brand-green)"
               icon={HardDrive}
@@ -1262,7 +1299,9 @@ function HostDashboardView({
         </div>
 
         {/* ─── DOCKER CONTAINERS ──────────────────────────────────── */}
-        {pollContainers !== null && (
+        {/* Shown as soon as containerSummary is known (from the cheap overview poll) —
+            running/stopped counts don't wait on the full per-container list. */}
+        {(pollContainers !== null || containerSummary !== null) && (
           <section className="rounded-2xl border border-border bg-[var(--color-surface)] p-5">
             <SectionLabel
               color="oklch(0.65 0.22 270)"
@@ -1272,62 +1311,100 @@ function HostDashboardView({
                 <div className="flex items-center gap-2 text-[11px]">
                   <span className="flex items-center gap-1 text-muted-foreground">
                     <span className="h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
-                    {pollContainers.filter((c) => c.state === "running").length} running
+                    {pollContainers !== null
+                      ? pollContainers.filter((c) => c.state === "running").length
+                      : (containerSummary?.running ?? 0)}{" "}
+                    running
                   </span>
                   <span className="h-1 w-1 rounded-full bg-border" />
                   <span className="flex items-center gap-1 text-muted-foreground">
                     <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground/60" />
-                    {pollContainers.filter((c) => c.state !== "running").length} stopped
+                    {pollContainers !== null
+                      ? pollContainers.filter((c) => c.state !== "running").length
+                      : (containerSummary?.stopped ?? 0)}{" "}
+                    stopped
                   </span>
                 </div>
               }
             />
-            {pollContainers.length === 0 ? (
+            {pollContainers === null ? (
+              containerSummary && containerSummary.running + containerSummary.stopped > 0 ? (
+                <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+                  {Array.from({ length: containerSummary.running + containerSummary.stopped }).map((_, i) => (
+                    <ContainerPlaceholderCard key={i} index={i} />
+                  ))}
+                </div>
+              ) : (
+                <div className="py-8 text-center text-sm text-muted-foreground">No containers found.</div>
+              )
+            ) : pollContainers.length === 0 ? (
               <div className="py-8 text-center text-sm text-muted-foreground">No containers found.</div>
             ) : (
-              <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
+              <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
                 {pollContainers.map((c) => {
                   const isUp = c.state === "running";
                   const memPct = c.memLimitBytes > 0 ? (c.memUsedBytes / c.memLimitBytes) * 100 : 0;
+                  const dotClass =
+                    c.health === "unhealthy"
+                      ? "bg-[var(--color-brand-red)] shadow-[0_0_6px_var(--color-brand-red)]"
+                      : c.health === "starting"
+                        ? "bg-[var(--color-brand-yellow)]"
+                        : c.health === "healthy" || isUp
+                          ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
+                          : "bg-muted-foreground/50";
+                  const justChangedState = changedContainerIds.has(c.id);
                   return (
                     <div
                       key={c.id}
-                      className="group relative overflow-hidden rounded-xl border border-border bg-background/40 p-3.5 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))]"
+                      className={`group relative overflow-hidden rounded-xl border bg-background/40 p-3 transition-colors hover:border-[color-mix(in_oklab,var(--color-brand-cyan)_30%,var(--color-border))] ${
+                        justChangedState ? "border-[var(--color-brand-orange)] ring-1 ring-[var(--color-brand-orange)]" : "border-border"
+                      }`}
                     >
                       <div
                         aria-hidden
                         className="absolute inset-y-0 left-0 w-[3px]"
                         style={{ background: isUp ? "var(--color-brand-green)" : "var(--color-border)" }}
                       />
-                      <div className="flex items-center justify-between">
-                        <div className="min-w-0">
+                      {/* Row 1 — name (left) · status (right) */}
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex min-w-0 items-center gap-1.5">
                           <div className="truncate text-[12px] font-semibold text-foreground">{c.name}</div>
-                          <div className="mt-0.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                          {c.restartCount > 0 && (
                             <span
-                              className={`h-1.5 w-1.5 rounded-full ${
-                                isUp
-                                  ? "bg-[var(--color-brand-green)] shadow-[0_0_6px_var(--color-brand-green)]"
-                                  : "bg-muted-foreground/50"
+                              className={`shrink-0 rounded px-1 text-[9px] font-bold tabular-nums ${
+                                c.restartCount >= 3
+                                  ? "bg-[color-mix(in_oklab,var(--color-brand-red)_18%,transparent)] text-[var(--color-brand-red)]"
+                                  : "bg-[color-mix(in_oklab,var(--color-brand-orange)_18%,transparent)] text-[var(--color-brand-orange)]"
                               }`}
-                            />
-                            <span className="font-mono">{c.state}</span>
-                          </div>
+                              title={`Restarted ${c.restartCount} time${c.restartCount === 1 ? "" : "s"}`}
+                            >
+                              ↻ {c.restartCount}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex min-w-0 shrink items-center gap-1.5 text-[10px] text-muted-foreground">
+                          <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} />
+                          <span className="truncate font-mono" title={c.statusText || c.state}>{c.statusText || c.state}</span>
                         </div>
                       </div>
-                      <div className="mt-3 flex items-center justify-between gap-3">
-                        <div className="flex items-center gap-3">
-                          <RingGauge value={c.cpuPct} label="CPU" gradientId={`g-cpu-${c.id}`} />
-                          <RingGauge value={memPct} label="RAM" gradientId={`g-ram-${c.id}`} />
-                        </div>
-                        <div className="flex flex-1 items-stretch gap-3 text-[10px]">
-                          <IoStat
-                            label="Network"
-                            rows={[
-                              { icon: ArrowDownToLine, value: fmtBytes(c.netRxRate), unit: "/s" },
-                              { icon: ArrowUpFromLine, value: fmtBytes(c.netTxRate), unit: "/s" },
-                            ]}
-                          />
-                        </div>
+                      {/* Row 2 — all four stats on a single compact line */}
+                      <div className="mt-2.5 flex items-start gap-2.5">
+                        <RingGauge value={c.cpuPct} label="CPU" gradientId={`g-cpu-${c.id}`} size={40} stroke={5} />
+                        <RingGauge value={memPct} label="RAM" gradientId={`g-ram-${c.id}`} size={40} stroke={5} />
+                        <IoStat
+                          label="Network"
+                          rows={[
+                            { icon: ArrowDownToLine, value: fmtBytes(c.netRxRate), unit: "/s" },
+                            { icon: ArrowUpFromLine, value: fmtBytes(c.netTxRate), unit: "/s" },
+                          ]}
+                        />
+                        <IoStat
+                          label="Disk I/O"
+                          rows={[
+                            { letter: "R", icon: ArrowDownToLine, value: fmtBytes(c.diskReadRate), unit: "/s" },
+                            { letter: "W", icon: ArrowUpFromLine, value: fmtBytes(c.diskWriteRate), unit: "/s" },
+                          ]}
+                        />
                       </div>
                     </div>
                   );
@@ -1337,7 +1414,7 @@ function HostDashboardView({
           </section>
         )}
       </div>
-    </ScrollArea>
+    </div>
   );
 }
 
