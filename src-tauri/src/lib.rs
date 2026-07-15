@@ -1465,6 +1465,7 @@ async fn dashboard_connect(
     host_ids: Vec<String>,
 ) -> Result<(), String> {
     let vault = hosts::list_hosts(&app)?;
+    let gate = { state.dashboard_manager.lock().unwrap().connect_gate() };
 
     for host in vault.hosts.iter().filter(|h| host_ids.contains(&h.id)) {
         let key_path = if let Some(key_id) = &host.ssh_key_id {
@@ -1484,6 +1485,7 @@ async fn dashboard_connect(
             host.user.clone(),
             hosts::decrypt_host_password(host),
             key_path,
+            gate.clone(),
         );
 
         let mut dm = state.dashboard_manager.lock().unwrap();
@@ -1496,7 +1498,8 @@ async fn dashboard_connect(
 async fn dashboard_poll(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    want_detail: bool,
+    want_processes: bool,
+    want_containers: bool,
     host_id: Option<String>,
 ) -> Result<(), String> {
     let senders = {
@@ -1517,7 +1520,8 @@ async fn dashboard_poll(
             tokio::spawn(async move {
                 let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 let cmd = dashboard::ActorCmd::Poll {
-                    want_detail,
+                    want_processes,
+                    want_containers,
                     reply: reply_tx,
                 };
 

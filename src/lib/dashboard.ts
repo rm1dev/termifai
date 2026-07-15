@@ -1,69 +1,27 @@
-import { call, subscribe } from "./api/transport";
-import { useEffect, useRef, useState } from "react";
+import { call } from "./api/transport";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import {
+  dashboardStore,
+  PROCESS_INTERVAL_MS,
+  CONTAINER_INTERVAL_MS,
+  type HostPollResult,
+  type HostStatusEntry,
+  type HostPhase,
+  type CoreMetrics,
+  type SystemMetrics,
+  type ContainerMetric,
+  type ProcessInfo,
+} from "./dashboardStore";
 
-export interface CoreMetrics {
-  total: number;
-  user: number;
-  system: number;
-  nice: number;
-  iowait: number;
-  steal: number;
-}
-
-export interface SystemMetrics {
-  cpuPct: number;
-  cpuCores: CoreMetrics[];
-  memTotalKb: number;
-  memUsedKb: number;
-  memCachedKb: number;
-  swapTotalKb: number;
-  swapUsedKb: number;
-  diskTotalKb: number;
-  diskUsedKb: number;
-  diskReadRate: number;       // bytes/sec
-  diskWriteRate: number;      // bytes/sec
-  diskIops: number;           // ops/sec
-  diskReadLatencyMs: number;  // avg ms per read op
-  diskWriteLatencyMs: number; // avg ms per write op
-  diskDev: string;
-  load1m: number;
-  load5m: number;
-  load15m: number;
-  uptimeSecs: number;
-  netRxRate: number; // bytes/sec
-  netTxRate: number;
-  netIface: string;
-  cores: number;
-  ip: string;
-}
-
-export interface ContainerMetric {
-  id: string;
-  name: string;
-  state: string;
-  cpuPct: number;
-  memUsedBytes: number;
-  memLimitBytes: number;
-  netRxRate: number;
-  netTxRate: number;
-}
-
-export interface ProcessInfo {
-  pid: number;
-  name: string;
-  user: string;
-  cpuPct: number;
-  memKb: number;
-}
-
-export interface HostPollResult {
-  hostId: string;
-  ok: boolean;
-  system: SystemMetrics | null;
-  containers: ContainerMetric[] | null;
-  processes: ProcessInfo[] | null;
-  error: string | null;
-}
+export type {
+  HostPollResult,
+  HostStatusEntry,
+  HostPhase,
+  CoreMetrics,
+  SystemMetrics,
+  ContainerMetric,
+  ProcessInfo,
+};
 
 /** Converts bytes to a human-readable string */
 export function fmtBytes(bytes: number): string {
@@ -83,60 +41,34 @@ export function fmtUptime(secs: number): string {
   return `${m}m`;
 }
 
-const POLL_INTERVAL_MS = 30_000;
-const PROCESS_INTERVAL_MS = 5_000;
-
-export function useDashboard(hostIds: string[]): {
+/**
+ * Reads dashboard state from the persistent store and keeps it reconciled with the
+ * current host list. Pass `null` for `hostIds` while the host list is still loading —
+ * that avoids the store treating a transient empty array as "all hosts removed".
+ * Polling and SSH connections live in the store, not this component, so switching
+ * away from the dashboard tab and back does not reconnect or reset anything.
+ */
+export function useDashboard(hostIds: string[] | null): {
   stats: Record<string, HostPollResult>;
-  loading: Set<string>;
+  status: Record<string, HostStatusEntry>;
 } {
-  const [stats, setStats] = useState<Record<string, HostPollResult>>({});
-  const [loading, setLoading] = useState<Set<string>>(new Set());
-  const hostIdsRef = useRef(hostIds);
+  const hostIdsKey = hostIds ? hostIds.join(",") : null;
 
   useEffect(() => {
-    hostIdsRef.current = hostIds;
-  }, [hostIds]);
-
-  // Stable key so the effect re-runs when host list changes (e.g. after async load)
-  const hostIdsKey = hostIds.join(",");
+    if (hostIds === null) return;
+    dashboardStore.reconcile(hostIds);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostIdsKey]);
 
   useEffect(() => {
-    if (hostIds.length === 0) return;
+    dashboardStore.setVisible(true);
+    return () => dashboardStore.setVisible(false);
+  }, []);
 
-    setLoading(new Set(hostIds));
+  const stats = useSyncExternalStore(dashboardStore.subscribe, dashboardStore.getStats);
+  const status = useSyncExternalStore(dashboardStore.subscribe, dashboardStore.getStatus);
 
-    // Connect and initial poll
-    call("dashboard_connect", { hostIds })
-      .then(() => call("dashboard_poll", { wantDetail: false, hostId: null }))
-      .catch(console.error);
-
-    // Receive streaming results
-    const unlistenPromise = subscribe<HostPollResult>("dash:stat", ({ payload }) => {
-      setStats((prev) => ({ ...prev, [payload.hostId]: payload }));
-      setLoading((prev) => {
-        const next = new Set(prev);
-        next.delete(payload.hostId);
-        return next;
-      });
-    });
-
-    // Poll every 30 seconds
-    const interval = setInterval(() => {
-      call("dashboard_poll", {
-        wantDetail: false,
-        hostId: null,
-      }).catch(console.error);
-    }, POLL_INTERVAL_MS);
-
-    return () => {
-      clearInterval(interval);
-      unlistenPromise.then((fn) => fn());
-      call("dashboard_disconnect", { hostIds: hostIdsRef.current }).catch(console.error);
-    };
-  }, [hostIdsKey]); // Re-run when host list changes (hosts load async)
-
-  return { stats, loading };
+  return { stats, status };
 }
 
 /** For detail view of a specific host */
@@ -144,46 +76,44 @@ export function useHostDetail(hostId: string | null): {
   detail: HostPollResult | null;
   refresh: () => void;
 } {
-  const [detail, setDetail] = useState<HostPollResult | null>(null);
+  const detail = useSyncExternalStore(dashboardStore.subscribe, () =>
+    hostId ? dashboardStore.getDetailCache(hostId) : null,
+  );
+  const hostIdRef = useRef(hostId);
+  hostIdRef.current = hostId;
 
-  const refresh = () => {
-    if (!hostId) return;
-    call("dashboard_poll", { wantDetail: true, hostId }).catch(console.error);
+  const refreshProcesses = () => {
+    if (!hostIdRef.current) return;
+    call("dashboard_poll", { wantProcesses: true, wantContainers: false, hostId: hostIdRef.current }).catch(
+      console.error,
+    );
+  };
+  const refreshContainers = () => {
+    if (!hostIdRef.current) return;
+    call("dashboard_poll", { wantProcesses: false, wantContainers: true, hostId: hostIdRef.current }).catch(
+      console.error,
+    );
   };
 
   useEffect(() => {
     if (!hostId) return;
 
-    setDetail(null);
-    refresh(); // initial poll — fetches system metrics + process list
+    refreshProcesses();
+    refreshContainers();
 
-    const unlistenPromise = subscribe<HostPollResult>("dash:stat", ({ payload }) => {
-      if (payload.hostId === hostId) {
-        setDetail((prev) => {
-          // want_detail=true polls: return processes + sys metrics, containers=null (Docker skipped).
-          // want_detail=false polls: return containers + sys metrics, processes=null.
-          // In both cases, preserve whichever field is missing from prev state.
-          return {
-            ...payload,
-            processes:  payload.processes  ?? prev?.processes  ?? null,
-            containers: payload.containers ?? prev?.containers ?? null,
-          };
-        });
-      }
-    });
-
-    // Poll processes every 5s — lightweight: reads /proc/*/stat, no ps CPU sorting.
-    // Docker metrics are handled by useDashboard's 30s interval separately.
-    const interval = setInterval(() => {
-      if (!hostId) return;
-      call("dashboard_poll", { wantDetail: true, hostId }).catch(console.error);
-    }, PROCESS_INTERVAL_MS);
+    // Poll processes every 5s (fast, lightweight — /proc/*/stat reads) and containers
+    // on a slower cadence (docker inspect + cgroup reads per container). Both requests
+    // return the same HostPollResult shape; the store merges whichever field is present
+    // into the cached detail, preserving the other from the previous merge.
+    const procInterval = setInterval(refreshProcesses, PROCESS_INTERVAL_MS);
+    const containerInterval = setInterval(refreshContainers, CONTAINER_INTERVAL_MS);
 
     return () => {
-      clearInterval(interval);
-      unlistenPromise.then((fn) => fn());
+      clearInterval(procInterval);
+      clearInterval(containerInterval);
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hostId]);
 
-  return { detail, refresh };
+  return { detail, refresh: refreshProcesses };
 }
