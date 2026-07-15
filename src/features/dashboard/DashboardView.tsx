@@ -40,7 +40,7 @@ import {
   YAxis,
 } from "recharts";
 import type { Host, HostGroup } from "@/components/app/types";
-import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostPollResult, type CoreMetrics } from "@/lib/dashboard";
+import { useDashboard, useHostDetail, fmtBytes, fmtUptime, type HostStatusEntry, type HostPhase, type CoreMetrics } from "@/lib/dashboard";
 
 function CircularGauge({ value, label }: { value: number; label: string }) {
   const r = 24;
@@ -192,48 +192,43 @@ function IoStat({
 
 
 
-type ServerStat = {
-  id: string;
-  name: string;
-  status: "online" | "error";
-  cores: number;
-  ram: string;
-  storage: string;
-  uptime: string;
-  cpu: number;
-  ramUsed: number;
-  diskUsed: number;
-  os: string;
-  ip: string;
-  netDown: string; netDownUnit: string;
-  netUp: string; netUpUnit: string;
-  diskRead: string; diskReadUnit: string;
-  diskWrite: string; diskWriteUnit: string;
-  cpuSamples?: number[];
-};
+function statusDotClass(phase: HostPhase): string {
+  switch (phase) {
+    case "online":
+      return "bg-[oklch(0.65_0.18_145)]";
+    case "offline":
+      return "bg-[oklch(0.65_0.2_25)]";
+    case "reconnecting":
+      return "bg-[var(--color-brand-orange)] animate-pulse";
+    default:
+      return "bg-muted-foreground/40 animate-pulse"; // connecting
+  }
+}
 
-const DASHBOARD_SERVERS: ServerStat[] = [
-  { id: "h1", name: "Sentry", status: "online", cores: 8, ram: "126 G", storage: "111 G", uptime: "23 Days", cpu: 14, ramUsed: 40, diskUsed: 52, os: "Ubuntu 22.04 LTS", ip: "10.0.0.11/24", cpuSamples: [4, 22, 9, 31, 6, 18, 11, 12],
-    netDown: "151", netDownUnit: "K/s", netUp: "11.1", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h2", name: "Ariyapanel Bot", status: "error", cores: 8, ram: "0 B", storage: "0 B", uptime: "0 Minutes", cpu: 0, ramUsed: 0, diskUsed: 0, os: "Debian 11", ip: "—", cpuSamples: [0, 0, 0, 0, 0, 0, 0, 0],
-    netDown: "0", netDownUnit: "B/s", netUp: "0", netUpUnit: "B/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h3", name: "AriyaPanel Monitoring", status: "online", cores: 8, ram: "2.90 G", storage: "26.2 G", uptime: "134 Days", cpu: 68, ramUsed: 95, diskUsed: 60, os: "Debian 11", ip: "192.168.90.198/24", cpuSamples: [82, 47, 91, 55, 73, 38, 88, 70],
-    netDown: "31.6", netDownUnit: "K/s", netUp: "9.99", netUpUnit: "K/s", diskRead: "1.30", diskReadUnit: "M/s", diskWrite: "0", diskWriteUnit: "B/s" },
-  { id: "h4", name: "AriyaPanel DB", status: "online", cores: 8, ram: "19.6 G", storage: "299 G", uptime: "167 Days", cpu: 23, ramUsed: 82, diskUsed: 71, os: "Ubuntu 20.04", ip: "192.168.90.200/24", cpuSamples: [12, 34, 8, 41, 18, 27, 15, 29],
-    netDown: "401", netDownUnit: "K/s", netUp: "165", netUpUnit: "K/s", diskRead: "188", diskReadUnit: "K/s", diskWrite: "380", diskWriteUnit: "K/s" },
-  { id: "h5", name: "AriyaPanel Elastic", status: "online", cores: 8, ram: "15.6 G", storage: "92.0 G", uptime: "210 Days", cpu: 53, ramUsed: 63, diskUsed: 86, os: "Debian GNU/Linux 11 (bullseye)", ip: "192.168.90.199/24", cpuSamples: [94, 96, 10, 19, 48, 99, 95, 5],
-    netDown: "10.9", netDownUnit: "K/s", netUp: "10.8", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "192", diskWriteUnit: "K/s" },
-  { id: "h6", name: "AriyaPanel", status: "online", cores: 8, ram: "17.5 G", storage: "44.5 G", uptime: "210 Days", cpu: 37, ramUsed: 21, diskUsed: 44, os: "Ubuntu 22.04", ip: "192.168.90.201/24", cpuSamples: [21, 64, 18, 52, 33, 47, 25, 39],
-    netDown: "25", netDownUnit: "K/s", netUp: "07", netUpUnit: "K/s", diskRead: "0", diskReadUnit: "B/s", diskWrite: "8.0", diskWriteUnit: "K/s" },
-];
+function latencyColor(ms: number): string {
+  if (ms < 100) return "text-[oklch(0.65_0.18_145)]";
+  if (ms < 300) return "text-[var(--color-brand-yellow)]";
+  return "text-[var(--color-brand-orange)]";
+}
+
+function statusLabel(phase: HostPhase, hostStatus?: HostStatusEntry): string {
+  switch (phase) {
+    case "online":
+      return hostStatus?.latencyMs != null ? `${Math.round(hostStatus.latencyMs)} ms` : "Online";
+    case "offline":
+      return "Offline";
+    case "reconnecting":
+      return "Reconnecting…";
+    default:
+      return "Connecting…";
+  }
+}
 
 export function DashboardView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [hosts, setHosts] = useState<Host[]>([]);
   const [groups, setGroups] = useState<HostGroup[]>([]);
-  // Cache the last full detail result (including processes) per host.
-  // Stored in a ref so re-entering a host shows data instantly without re-fetching.
-  const detailCacheRef = useRef<Record<string, HostPollResult>>({});
+  const [hostsLoaded, setHostsLoaded] = useState(false);
 
   // Load hosts that have showStatusInDashboard enabled
   useEffect(() => {
@@ -241,12 +236,15 @@ export function DashboardView() {
       .then((v) => {
         setHosts(v.hosts.filter((h) => h.showStatusInDashboard !== false));
         setGroups(v.groups || []);
+        setHostsLoaded(true);
       })
       .catch(console.error);
   }, []);
 
   const hostIds = hosts.map((h) => h.id);
-  const { stats, loading } = useDashboard(hostIds);
+  // Pass null until the host list has actually loaded — an empty array during that
+  // window would otherwise look like "all hosts were removed" to the store.
+  const { stats, status } = useDashboard(hostsLoaded ? hostIds : null);
 
   if (selectedId) {
     const selectedHost = hosts.find((h) => h.id === selectedId);
@@ -254,8 +252,7 @@ export function DashboardView() {
       return (
         <HostDashboardView
           host={selectedHost}
-          initialStats={detailCacheRef.current[selectedId] ?? stats[selectedId] ?? null}
-          onDetailUpdate={(result) => { detailCacheRef.current[selectedId] = result; }}
+          hostStatus={status[selectedId]}
           onBack={() => setSelectedId(null)}
         />
       );
@@ -264,86 +261,66 @@ export function DashboardView() {
 
   const renderHostCard = (host: Host) => {
     const poll = stats[host.id];
-    const isLoading = loading.has(host.id);
-    const sys = poll?.system;
+    const hostStatus = status[host.id];
+    const phase: HostPhase = hostStatus?.phase ?? "connecting";
+    const sys = poll?.system ?? null;
 
     return (
       <button
         key={host.id}
         type="button"
         onClick={() => setSelectedId(host.id)}
+        title={phase === "offline" ? (hostStatus?.error ?? undefined) : undefined}
         className="rounded-xl border border-border bg-[var(--color-surface)] p-4 text-left transition hover:border-primary/60 hover:bg-[var(--color-surface)]/80 focus:outline-none focus:ring-2 focus:ring-primary/40"
       >
         {/* Header */}
         <div className="flex items-center justify-between">
           <span className="text-sm font-semibold text-foreground">{host.name}</span>
           <div className="flex items-center gap-1.5">
-            {isLoading ? (
-              <span className="h-2 w-2 rounded-full bg-muted-foreground/40 animate-pulse" />
-            ) : (
-              <span className={`h-2 w-2 rounded-full ${poll?.ok ? "bg-[oklch(0.65_0.18_145)]" : "bg-[oklch(0.65_0.2_25)]"}`} />
-            )}
-            <span className="text-xs text-muted-foreground">
-              {isLoading ? "Connecting…" : poll?.ok ? "Online" : poll?.error ? "Error" : "—"}
+            <span className={`h-2 w-2 rounded-full ${statusDotClass(phase)}`} />
+            <span
+              className={`text-xs font-mono tabular-nums ${
+                phase === "online" && hostStatus?.latencyMs != null
+                  ? latencyColor(hostStatus.latencyMs)
+                  : "text-muted-foreground"
+              }`}
+            >
+              {statusLabel(phase, hostStatus)}
             </span>
           </div>
         </div>
 
-        {/* Specs from real system data */}
+        {/* Specs from real system data — zeroed placeholders before the first poll */}
         <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
-          {sys && (
-            <>
-              <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys.cores} Cores</span>
-              <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes(sys.memTotalKb * 1024)}</span>
-              <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes(sys.diskTotalKb * 1024)}</span>
-              <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {fmtUptime(sys.uptimeSecs)}</span>
-            </>
-          )}
-          {isLoading && !sys && (
-            <span className="h-3 w-48 rounded animate-shimmer inline-block" />
-          )}
+          <span className="flex items-center gap-1"><Cpu className="h-3 w-3" /> {sys?.cores ?? 0} Cores</span>
+          <span className="flex items-center gap-1"><Activity className="h-3 w-3" /> {fmtBytes((sys?.memTotalKb ?? 0) * 1024)}</span>
+          <span className="flex items-center gap-1"><HardDrive className="h-3 w-3" /> {fmtBytes((sys?.diskTotalKb ?? 0) * 1024)}</span>
+          <span className="flex items-center gap-1"><Clock className="h-3 w-3" /> {sys ? fmtUptime(sys.uptimeSecs) : "0m"}</span>
         </div>
 
-        {/* Gauges */}
-        {sys ? (
-          <div className="mt-4 flex items-start gap-4">
-            <RingGauge value={sys.cpuPct} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
-            <RingGauge
-              value={sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
-              label="RAM"
-              gradientId={`g-dash-ram-${host.id}`}
-              size={52}
-            />
-            <RingGauge
-              value={sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
-              label="Disk"
-              gradientId={`g-dash-disk-${host.id}`}
-              size={52}
-            />
-            <IoStat
-              label="Network"
-              rows={[
-                { icon: ArrowDownToLine, value: fmtBytes(sys.netRxRate), unit: "/s" },
-                { icon: ArrowUpFromLine, value: fmtBytes(sys.netTxRate), unit: "/s" },
-              ]}
-            />
-          </div>
-        ) : (
-          <div className="mt-4 flex items-start gap-4">
-            {/* Gauge placeholders */}
-            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-            <div className="h-[52px] w-[52px] flex-shrink-0 rounded-full animate-shimmer" />
-            {/* Network placeholder */}
-            <div className="flex flex-1 flex-col justify-center gap-2 pt-1">
-              <div className="h-2.5 w-14 rounded animate-shimmer" />
-              <div className="flex flex-col gap-1">
-                <div className="h-2.5 w-16 rounded animate-shimmer" />
-                <div className="h-2.5 w-16 rounded animate-shimmer" />
-              </div>
-            </div>
-          </div>
-        )}
+        {/* Gauges — always rendered at full structure, zeroed until the first poll lands */}
+        <div className="mt-4 flex items-start gap-4">
+          <RingGauge value={sys?.cpuPct ?? 0} label="CPU" gradientId={`g-dash-cpu-${host.id}`} size={52} />
+          <RingGauge
+            value={sys && sys.memTotalKb > 0 ? (sys.memUsedKb / sys.memTotalKb) * 100 : 0}
+            label="RAM"
+            gradientId={`g-dash-ram-${host.id}`}
+            size={52}
+          />
+          <RingGauge
+            value={sys && sys.diskTotalKb > 0 ? (sys.diskUsedKb / sys.diskTotalKb) * 100 : 0}
+            label="Disk"
+            gradientId={`g-dash-disk-${host.id}`}
+            size={52}
+          />
+          <IoStat
+            label="Network"
+            rows={[
+              { icon: ArrowDownToLine, value: fmtBytes(sys?.netRxRate ?? 0), unit: "/s" },
+              { icon: ArrowUpFromLine, value: fmtBytes(sys?.netTxRate ?? 0), unit: "/s" },
+            ]}
+          />
+        </div>
       </button>
     );
   };
@@ -390,8 +367,8 @@ export function DashboardView() {
   };
 
   const total = hosts.length;
-  const online = hosts.filter((h) => stats[h.id]?.ok).length;
-  const offline = hosts.filter((h) => stats[h.id] && !stats[h.id].ok).length;
+  const online = hosts.filter((h) => status[h.id]?.phase === "online").length;
+  const offline = hosts.filter((h) => status[h.id]?.phase === "offline").length;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-y-auto p-5">
@@ -711,13 +688,6 @@ function PanelHeader({
   );
 }
 
-const loadSeries = Array.from({ length: 32 }).map((_, i) => ({
-  t: i,
-  m1: 5.4 + Math.sin(i / 3) * 0.6 + Math.random() * 0.2,
-  m5: 5.6 + Math.sin(i / 5) * 0.4,
-  m15: 5.5 + Math.cos(i / 6) * 0.3,
-}));
-
 function MiniGauge({
   value,
   label,
@@ -791,27 +761,21 @@ function SectionLabel({
 
 function HostDashboardView({
   host,
-  initialStats,
-  onDetailUpdate,
+  hostStatus,
   onBack,
 }: {
   host: Host;
-  initialStats: HostPollResult | null;
-  onDetailUpdate?: (result: HostPollResult) => void;
+  hostStatus?: HostStatusEntry;
   onBack: () => void;
 }) {
-  const { detail } = useHostDetail(host.id);
-  const poll = detail ?? initialStats;
+  // detail comes straight from the shared dashboardStore — already seeded from the
+  // overview poll, so it's non-null the moment any poll for this host has landed,
+  // even before this view mounts.
+  const { detail: poll } = useHostDetail(host.id);
   const sys = poll?.system ?? null;
   const pollProcesses = poll?.processes ?? null;
   const pollContainers = poll?.containers ?? null; // null = docker not installed
-
-  // Persist detail (with processes) to parent cache so re-entry is instant
-  useEffect(() => {
-    if (detail?.ok && detail.processes !== null) {
-      onDetailUpdate?.(detail);
-    }
-  }, [detail]);
+  const phase: HostPhase = hostStatus?.phase ?? "connecting";
 
   const [procSearch, setProcSearch] = useState("");
 
@@ -891,10 +855,12 @@ function HostDashboardView({
                   </Badge>
                   <span className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
                     <span className="relative flex h-1.5 w-1.5">
-                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--color-brand-green)] opacity-60" />
-                      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-[var(--color-brand-green)]" />
+                      {phase === "online" && (
+                        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-[var(--color-brand-green)] opacity-60" />
+                      )}
+                      <span className={`relative inline-flex h-1.5 w-1.5 rounded-full ${statusDotClass(phase)}`} />
                     </span>
-                    Online
+                    {statusLabel(phase, hostStatus)}
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
@@ -967,7 +933,7 @@ function HostDashboardView({
             />
             <div className="flex-1 min-h-0 w-full">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={loadHistory.length > 0 ? loadHistory : loadSeries} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
+                <AreaChart data={loadHistory} margin={{ top: 6, right: 8, left: 0, bottom: 0 }}>
                   <defs>
                     <linearGradient id="g1m" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="var(--color-brand-red)" stopOpacity={0.45} />
