@@ -166,6 +166,20 @@ export interface TransferProgress {
   total_bytes: number;
 }
 
+export type SftpTransferStatusKind =
+  | "idle"
+  | "transferring"
+  | "reconnecting"
+  | "resuming"
+  | "paused";
+
+export interface SftpTransferStatus {
+  status: SftpTransferStatusKind;
+  message: string;
+  attempt?: number | null;
+  max_attempts?: number | null;
+}
+
 export interface SftpConflictInfo {
   session_id: string;
   file_name: string;
