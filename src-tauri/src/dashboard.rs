@@ -70,8 +70,8 @@ pub struct ContainerMetric {
     pub id: String,
     pub name: String,
     pub state: String,
-    pub status_text: String,               // e.g. "Up 3 hours", "Exited (137) 2 minutes ago"
-    pub health: Option<String>,             // "healthy" | "unhealthy" | "starting", from the status suffix
+    pub status_text: String, // e.g. "Up 3 hours", "Exited (137) 2 minutes ago"
+    pub health: Option<String>, // "healthy" | "unhealthy" | "starting", from the status suffix
     pub restart_count: u32,
     pub cpu_pct: f32,
     pub mem_used_bytes: u64,
@@ -615,7 +615,13 @@ pub(crate) fn parse_container_stats_batch(
             prev_io.get(&id).copied(),
             poll_secs,
         );
-        out.insert(id, ContainerStatsEntry { restart_count, sample });
+        out.insert(
+            id,
+            ContainerStatsEntry {
+                restart_count,
+                sample,
+            },
+        );
     }
     out
 }
@@ -670,7 +676,9 @@ pub(crate) fn parse_container_cgroup(
     prev_io: Option<(u64, u64)>,
     poll_secs: f64,
 ) -> ContainerCgroupSample {
-    let (mem_cpu_part, rest) = cgroup_raw.split_once("===IO===\n").unwrap_or((cgroup_raw, ""));
+    let (mem_cpu_part, rest) = cgroup_raw
+        .split_once("===IO===\n")
+        .unwrap_or((cgroup_raw, ""));
     let (io_part, net_part) = rest.split_once("===NET===\n").unwrap_or((rest, ""));
 
     let mut mem_used: u64 = 0;
@@ -750,8 +758,16 @@ pub(crate) fn parse_container_cgroup(
         _ => (0.0, 0.0),
     };
 
-    let next_cpu_ns = if cpu_usage_ns > 0 { Some(cpu_usage_ns) } else { None };
-    let next_net = if net_rx > 0 || net_tx > 0 { Some((net_rx, net_tx)) } else { None };
+    let next_cpu_ns = if cpu_usage_ns > 0 {
+        Some(cpu_usage_ns)
+    } else {
+        None
+    };
+    let next_net = if net_rx > 0 || net_tx > 0 {
+        Some((net_rx, net_tx))
+    } else {
+        None
+    };
     let next_io = if read_bytes > 0 || write_bytes > 0 {
         Some((read_bytes, write_bytes))
     } else {
@@ -1056,7 +1072,13 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
                     .unwrap_or(30.0);
                 state.last_poll = Some(now);
 
-                let result = do_poll(&mut state, &host_id, want_processes, want_containers, poll_secs);
+                let result = do_poll(
+                    &mut state,
+                    &host_id,
+                    want_processes,
+                    want_containers,
+                    poll_secs,
+                );
 
                 // If the session died, retry with backoff and re-poll once reconnected.
                 let result = if result.is_err() {
@@ -1079,7 +1101,13 @@ fn run_actor(app: AppHandle, cfg: ActorConfig, rx: std::sync::mpsc::Receiver<Act
                             state.prev_container_cpu.clear();
                             state.prev_container_net.clear();
                             state.prev_container_io.clear();
-                            do_poll(&mut state, &host_id, want_processes, want_containers, poll_secs)
+                            do_poll(
+                                &mut state,
+                                &host_id,
+                                want_processes,
+                                want_containers,
+                                poll_secs,
+                            )
                         }
                         None => {
                             // Disconnect received while retrying
@@ -1142,7 +1170,13 @@ fn run_events_watcher(cfg: EventsWatcherConfig) {
         stop,
     } = cfg;
 
-    let session = match ssh_connect(&hostname, port, &user, password.as_deref(), key_path.as_deref()) {
+    let session = match ssh_connect(
+        &hostname,
+        port,
+        &user,
+        password.as_deref(),
+        key_path.as_deref(),
+    ) {
         Ok(s) => s,
         Err(_) => return, // best-effort — container state still refreshes via the 5s poll
     };
@@ -1157,7 +1191,9 @@ fn run_events_watcher(cfg: EventsWatcherConfig) {
             "timeout 2 docker events --filter type=container --format '{{.Status}}' 2>/dev/null",
         );
         match raw {
-            Ok(out) if !out.trim().is_empty() && last_poke.elapsed() >= Duration::from_millis(500) => {
+            Ok(out)
+                if !out.trim().is_empty() && last_poke.elapsed() >= Duration::from_millis(500) =>
+            {
                 last_poke = Instant::now();
                 let _ = self_tx.try_send(ActorCmd::PokeContainers);
             }
@@ -1728,9 +1764,18 @@ eth0: 5100000 0 0 0 0 0 0 0 2100000 0
 
     #[test]
     fn test_parse_health() {
-        assert_eq!(parse_health("Up 3 hours (healthy)"), Some("healthy".to_string()));
-        assert_eq!(parse_health("Up 2 seconds (health: starting)"), Some("starting".to_string()));
-        assert_eq!(parse_health("Up 3 hours (unhealthy)"), Some("unhealthy".to_string()));
+        assert_eq!(
+            parse_health("Up 3 hours (healthy)"),
+            Some("healthy".to_string())
+        );
+        assert_eq!(
+            parse_health("Up 2 seconds (health: starting)"),
+            Some("starting".to_string())
+        );
+        assert_eq!(
+            parse_health("Up 3 hours (unhealthy)"),
+            Some("unhealthy".to_string())
+        );
         assert_eq!(parse_health("Up 3 hours"), None);
         assert_eq!(parse_health("Exited (137) 2 minutes ago"), None);
     }
@@ -1776,7 +1821,10 @@ eth0: 5100000 0 0 0 0 0 0 0 2100000 0
         let raw = "8:0 Read 1048576\n8:0 Write 524288\n8:0 Sync 0\n8:0 Async 1572864\n8:0 Discard 0\n8:0 Total 1572864\nTotal 1572864\n";
         let (read, write) = parse_container_io_bytes(raw);
         assert_eq!(read, 1048576);
-        assert_eq!(write, 524288, "Total/Sync/Async footer lines are not double-counted");
+        assert_eq!(
+            write, 524288,
+            "Total/Sync/Async footer lines are not double-counted"
+        );
     }
 
     #[test]
