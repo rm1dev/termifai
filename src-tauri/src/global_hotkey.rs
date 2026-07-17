@@ -110,10 +110,12 @@ fn toggle_main_window(app: &AppHandle) {
 pub fn dispatch(app: &AppHandle, action: &str) {
     let app = app.clone();
     let action = action.to_string();
-    let _ = app.clone().run_on_main_thread(move || match action.as_str() {
-        ACTION_QUICK_TERMINAL => crate::quick_terminal::toggle(&app),
-        _ => toggle_main_window(&app),
-    });
+    let _ = app
+        .clone()
+        .run_on_main_thread(move || match action.as_str() {
+            ACTION_QUICK_TERMINAL => crate::quick_terminal::toggle(&app),
+            _ => toggle_main_window(&app),
+        });
 }
 
 /// Extracts the action from a `--hotkey=<action>` argument list.
