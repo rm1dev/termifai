@@ -17,7 +17,7 @@ import {
 import { toast } from "sonner";
 import * as AlertDialog from "@radix-ui/react-alert-dialog";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import type { AppTab, Host, HostGroup, LocalFileEntry, RemoteFileEntry, TransferProgress, SftpConflictInfo } from "@/components/app/types";
+import type { AppTab, Host, HostGroup, LocalFileEntry, RemoteFileEntry, TransferProgress, SftpConflictInfo, SftpTransferStatus } from "@/components/app/types";
 import { SftpContextMenu } from "@/components/app/SftpContextMenu";
 import { SftpRenameDialog } from "@/components/app/SftpRenameDialog";
 import { SftpPermissionsDialog } from "@/components/app/SftpPermissionsDialog";
@@ -217,6 +217,21 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+/** سرعت انتقال — همون واحدهای formatBytes با پسوند /s */
+function formatSpeed(bytesPerSec: number): string {
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return "0 B/s";
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
+const SPEED_EMA_ALPHA = 0.3;
+
+type SpeedSample = {
+  t: number;
+  bytes: number;
+  fileName: string;
+  ema: number;
+};
+
 // Windows local paths look like "C:\Users\admin\Desktop"; everything else (macOS/Linux) uses "/".
 function isWindowsLocalPath(path: string): boolean {
   return /^[A-Za-z]:/.test(path);
@@ -321,6 +336,9 @@ export function SftpView({ tab }: { tab: AppTab }) {
   const [transferProgress, setTransferProgress] = useState<TransferProgress | null>(null);
   const [transferOverall, setTransferOverall] = useState<{ current: number; total: number; fileName: string } | null>(null);
   const [transferError, setTransferError] = useState<string | null>(null);
+  const [transferStatus, setTransferStatus] = useState<SftpTransferStatus | null>(null);
+  const [transferSpeed, setTransferSpeed] = useState<number | null>(null);
+  const speedSampleRef = useRef<SpeedSample | null>(null);
   // remoteDragOver: highlight while an OS drag (Finder/Explorer) hovers the remote pane.
   const [remoteDragOver, setRemoteDragOver] = useState(false);
   // paneDrag: pointer-based drag between panes. HTML5 drag & drop is unusable
@@ -379,11 +397,64 @@ export function SftpView({ tab }: { tab: AppTab }) {
     document.addEventListener("mouseup", onUp);
   }, [localWidthPct]);
 
-  // Listen for progress events
+  // Listen for progress events — سرعت از دلتای bytes با EMA
   useEffect(() => {
     if (!isConnected) return;
     const unlisten = subscribe<TransferProgress>(`sftp:${sftpSessionId}:progress`, (event) => {
-      setTransferProgress(event.payload);
+      const p = event.payload;
+      setTransferProgress(p);
+      const now = performance.now();
+      const prev = speedSampleRef.current;
+      const reset =
+        !prev ||
+        prev.fileName !== p.file_name ||
+        p.bytes_transferred < prev.bytes;
+      if (reset) {
+        speedSampleRef.current = {
+          t: now,
+          bytes: p.bytes_transferred,
+          fileName: p.file_name,
+          ema: 0,
+        };
+        setTransferSpeed(null);
+        return;
+      }
+      const dt = (now - prev.t) / 1000;
+      if (dt <= 0) return;
+      const rate = (p.bytes_transferred - prev.bytes) / dt;
+      const ema =
+        prev.ema <= 0
+          ? rate
+          : SPEED_EMA_ALPHA * rate + (1 - SPEED_EMA_ALPHA) * prev.ema;
+      speedSampleRef.current = {
+        t: now,
+        bytes: p.bytes_transferred,
+        fileName: p.file_name,
+        ema,
+      };
+      setTransferSpeed(ema > 0 ? ema : null);
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [isConnected, sftpSessionId]);
+
+  // وضعیت reconnect / pause از موتور انتقال
+  useEffect(() => {
+    if (!isConnected) return;
+    const unlisten = subscribe<SftpTransferStatus>(`sftp:${sftpSessionId}:transfer_status`, (event) => {
+      const st = event.payload;
+      setTransferStatus(st.status === "idle" ? null : st);
+      if (st.status === "paused" || st.status === "reconnecting" || st.status === "idle") {
+        speedSampleRef.current = null;
+        setTransferSpeed(null);
+      }
+      if (st.status === "resuming") {
+        // بعد از resume baseline رو ریست کن تا spike اشتباه نده
+        speedSampleRef.current = null;
+        setTransferSpeed(null);
+        toast.message(st.message || "Connection restored, resuming…");
+      }
     });
     return () => {
       void unlisten.then((fn) => fn());
@@ -717,16 +788,24 @@ export function SftpView({ tab }: { tab: AppTab }) {
     setLastRemoteClick(path);
   };
 
+  const clearTransferSpeed = () => {
+    speedSampleRef.current = null;
+    setTransferSpeed(null);
+  };
+
   const handleDownload = async (paths?: string[]) => {
     const targets = paths ?? [...selectedRemote];
     if (targets.length === 0 || !isConnected) return;
     setTransferError(null);
     setTransferProgress(null);
+    setTransferStatus(null);
+    clearTransferSpeed();
     try {
       for (let i = 0; i < targets.length; i++) {
         const rp = targets[i];
         const fileName = pathBaseName(rp);
         setTransferOverall({ current: i + 1, total: targets.length, fileName });
+        clearTransferSpeed();
         await sftpTransfer(sftpSessionId, "sftp_download", {
           sessionId: sftpSessionId,
           remotePath: rp,
@@ -744,6 +823,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
     } finally {
       setTransferProgress(null);
       setTransferOverall(null);
+      setTransferStatus(null);
+      clearTransferSpeed();
     }
   };
 
@@ -752,11 +833,14 @@ export function SftpView({ tab }: { tab: AppTab }) {
     if (targets.length === 0 || !isConnected) return;
     setTransferError(null);
     setTransferProgress(null);
+    setTransferStatus(null);
+    clearTransferSpeed();
     try {
       for (let i = 0; i < targets.length; i++) {
         const lp = targets[i];
         const fileName = pathBaseName(lp);
         setTransferOverall({ current: i + 1, total: targets.length, fileName });
+        clearTransferSpeed();
         await sftpTransfer(sftpSessionId, "sftp_upload", {
           sessionId: sftpSessionId,
           localPath: lp,
@@ -774,6 +858,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
     } finally {
       setTransferProgress(null);
       setTransferOverall(null);
+      setTransferStatus(null);
+      clearTransferSpeed();
     }
   };
 
@@ -868,8 +954,10 @@ export function SftpView({ tab }: { tab: AppTab }) {
         connectCleanupRef.current?.();
         connectCleanupRef.current = null;
         if (ev.payload.ok && ev.payload.remote_path) {
-          setIsConnected(true);
+          // تا لیست ریموت کامل نشه isConnected نزن — وگرنه overlay و پنل با هم دو تکه می‌شن
+          setConnectMessage("Loading directory...");
           await loadRemoteDir(ev.payload.remote_path);
+          setIsConnected(true);
         } else {
           setConnectError(ev.payload.error ?? "Connection failed");
         }
@@ -1062,10 +1150,57 @@ export function SftpView({ tab }: { tab: AppTab }) {
         }}
       />
       {/* Transfer progress — fixed bottom sheet, does not affect layout */}
-      {(transferOverall || transferError) && (
+      {(transferOverall || transferError || transferStatus) && (
         <div className="fixed bottom-0 left-0 right-0 z-40 flex h-12 items-center gap-3 border-t border-border bg-[var(--color-surface-2)] px-4 text-xs shadow-[0_-4px_24px_rgba(0,0,0,0.3)]">
-          {transferError ? (
-            <span className="text-red-400">{transferError}</span>
+          {transferStatus?.status === "paused" ? (
+            <>
+              <span className="min-w-0 flex-1 truncate text-red-400">
+                {transferStatus.message || transferError || "Transfer paused"}
+              </span>
+              <button
+                className="shrink-0 rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() =>
+                  void sftpCall("sftp_resume_transfer", { sessionId: sftpSessionId }).catch((e: unknown) =>
+                    toast.error(String(e)),
+                  )
+                }
+              >
+                Resume
+              </button>
+              <button
+                className="shrink-0 rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => void sftpCall("sftp_cancel_transfer", { sessionId: sftpSessionId })}
+              >
+                Cancel
+              </button>
+            </>
+          ) : transferStatus?.status === "reconnecting" || transferStatus?.status === "resuming" ? (
+            <>
+              <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                {transferStatus.message}
+              </span>
+              {transferOverall && (
+                <span className="shrink-0 truncate text-muted-foreground">{transferOverall.fileName}</span>
+              )}
+              <button
+                className="shrink-0 rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => void sftpCall("sftp_cancel_transfer", { sessionId: sftpSessionId })}
+              >
+                Cancel
+              </button>
+            </>
+          ) : transferError ? (
+            <>
+              <span className="min-w-0 flex-1 truncate text-red-400">{transferError}</span>
+              <button
+                type="button"
+                className="shrink-0 rounded p-1 text-muted-foreground hover:text-foreground"
+                aria-label="Dismiss error"
+                onClick={() => setTransferError(null)}
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </>
           ) : transferOverall ? (() => {
             const filePct = transferProgress && transferProgress.total_bytes > 0
               ? transferProgress.bytes_transferred / transferProgress.total_bytes
@@ -1090,6 +1225,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
                 <span className="shrink-0 tabular-nums text-muted-foreground">
                   {Math.round(overallPct)}%
                 </span>
+                {transferSpeed != null && transferSpeed > 0 && (
+                  <span className="shrink-0 tabular-nums text-muted-foreground">
+                    {formatSpeed(transferSpeed)}
+                  </span>
+                )}
                 <button
                   className="shrink-0 rounded px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
                   onClick={() => void sftpCall("sftp_cancel_transfer", { sessionId: sftpSessionId })}
@@ -1364,18 +1504,20 @@ export function SftpView({ tab }: { tab: AppTab }) {
           </div>
         )}
 
-        {/* Connecting — XTerminal-style step indicator */}
-        {(isConnecting || (!isConnected && pickedHostId)) && <SftpConnectingOverlay
-          message={connectMessage}
-          hostTitle={connectHostTitle}
-          hostLabel={connectHostLabel}
-          failed={!isConnecting && !!connectError}
-          error={connectError}
-          onRetry={() => void handleConnect()}
-          onChangeHost={() => { setPickedHostId(undefined); setConnectError(null); setConnectLogs([]); }}
-        />}
+        {/* Connecting — تا isConnected نشه فقط همین نشون داده می‌شه */}
+        {!isConnected && (isConnecting || !!pickedHostId) && (
+          <SftpConnectingOverlay
+            message={connectMessage}
+            hostTitle={connectHostTitle}
+            hostLabel={connectHostLabel}
+            failed={!isConnecting && !!connectError}
+            error={connectError}
+            onRetry={() => void handleConnect()}
+            onChangeHost={() => { setPickedHostId(undefined); setConnectError(null); setConnectLogs([]); }}
+          />
+        )}
 
-        {/* Connected file browser */}
+        {/* Connected file browser — فقط بعد از لود اولیهٔ دایرکتوری */}
         {isConnected && (
           <>
             {/* Breadcrumb + column headers stay pinned above the file list; their scrollLeft is

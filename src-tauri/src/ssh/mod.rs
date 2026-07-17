@@ -111,9 +111,13 @@ pub fn connect(cfg: &SshConfig, on_stage: impl Fn(&str, &str)) -> Result<Session
     // covered separately by the 15s keepalive below.
     tcp.set_read_timeout(Some(Duration::from_secs(120))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(120))).ok();
+    // کم کردن latency برای SFTP کوچک/چندفایله (Phase 2a)
+    tcp.set_nodelay(true).ok();
 
     let mut session = Session::new().map_err(|e| SshError::Handshake(e.to_string()))?;
     session.set_tcp_stream(tcp);
+    // فشرده‌سازی پیش‌فرض خاموش — روی LAN معمولاً ضرر می‌زنه؛ بعداً می‌شه تنظیم کرد
+    session.set_compress(false);
 
     // Nudge libssh2 to negotiate whichever host key type is already recorded
     // for this host in known_hosts (mirroring what the system `ssh` binary
