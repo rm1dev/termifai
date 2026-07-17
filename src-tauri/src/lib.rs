@@ -5,6 +5,7 @@ mod port_forwarding;
 mod pty_manager;
 mod quick_terminal;
 mod sftp;
+mod sftp_transfer;
 mod snippet_exec;
 mod snippets;
 mod ssh;
@@ -23,6 +24,10 @@ use port_forwarding::{PortForwardRule, SavePortForwardRequest, TunnelManagerStat
 use pty_manager::{PtyManager, TabInfo};
 use serde::Serialize;
 use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
+use sftp_transfer::{
+    backoff_delay_secs, is_retryable_network_error, TransferStatusEvent, TransferStatusKind,
+    MAX_RECONNECT_ATTEMPTS,
+};
 
 #[derive(Serialize, Clone)]
 struct SftpConnectEvent {
@@ -41,6 +46,25 @@ struct SftpConnectDone {
 struct SftpTransferDone {
     ok: bool,
     error: Option<String>,
+}
+
+#[derive(Clone)]
+enum SftpTransferOp {
+    Download {
+        remote_path: String,
+        local_path: String,
+    },
+    Upload {
+        local_path: String,
+        remote_path: String,
+        overwrite: Option<bool>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum TransferResumeSignal {
+    Resume,
+    Abort,
 }
 use global_hotkey::{disable_global_hotkey, enable_global_hotkey, get_global_hotkey_status};
 use quick_terminal::{
@@ -71,6 +95,9 @@ struct AppState {
     transfer_cancel_flags: Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>,
     transfer_conflict_tx:
         Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<sftp::ConflictDecision>>>,
+    /// وقتی بعد از ۵ تلاش paused شدیم، Resume/Abort از این کانال می‌آد
+    transfer_resume_tx:
+        Mutex<std::collections::HashMap<String, std::sync::mpsc::Sender<TransferResumeSignal>>>,
     dashboard_manager: Mutex<DashboardManager>,
     hosts_store: store::JsonStore<hosts::HostsVault>,
     port_forward_store: store::JsonStore<port_forwarding::PortForwardVault>,
@@ -82,6 +109,7 @@ struct AppState {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn create_session(
     app: tauri::AppHandle,
     state: State<AppState>,
@@ -208,10 +236,7 @@ const WEBVIEW2_RELEASE_ARGS: &str =
 /// Builds the "main" webview window. Used both at startup and to recreate
 /// the window if a second launch is forwarded after the user fully closed
 /// it (possible when the "run in background" setting is off).
-fn build_main_window(
-    app: &tauri::AppHandle,
-    visible: bool,
-) -> tauri::Result<tauri::WebviewWindow> {
+fn build_main_window(app: &tauri::AppHandle, visible: bool) -> tauri::Result<tauri::WebviewWindow> {
     let mut main_builder =
         WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
             .title("Termifai")
@@ -837,15 +862,218 @@ async fn sftp_list_remote(
     .map_err(|e| format!("Thread panic: {}", e))?
 }
 
-#[tauri::command]
-async fn sftp_download(
+fn emit_sftp_transfer_status(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    status: TransferStatusKind,
+    message: impl Into<String>,
+    attempt: Option<u32>,
+) {
+    let _ = app.emit(
+        &format!("sftp:{}:transfer_status", session_id),
+        TransferStatusEvent {
+            status,
+            message: message.into(),
+            attempt,
+            max_attempts: if attempt.is_some() {
+                Some(MAX_RECONNECT_ATTEMPTS)
+            } else {
+                None
+            },
+        },
+    );
+}
+
+fn make_conflict_prompt(
     app: tauri::AppHandle,
     session_id: String,
-    remote_path: String,
-    local_path: String,
+    cancel: Arc<AtomicBool>,
+) -> impl FnMut(&sftp::ConflictInfo) -> sftp::ConflictDecision {
+    move |info: &sftp::ConflictInfo| -> sftp::ConflictDecision {
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.state::<AppState>()
+            .transfer_conflict_tx
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), tx);
+        let _ = app.emit(&format!("sftp:{}:conflict", session_id), info.clone());
+        let decision = loop {
+            if cancel.load(Ordering::Relaxed) {
+                break sftp::ConflictDecision::Cancel;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(d) => break d,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    break sftp::ConflictDecision::Cancel
+                }
+            }
+        };
+        app.state::<AppState>()
+            .transfer_conflict_tx
+            .lock()
+            .unwrap()
+            .remove(&session_id);
+        decision
+    }
+}
+
+fn run_sftp_transfer_once(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    op: &SftpTransferOp,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let app_bg = app.clone();
-    let sid = session_id.clone();
+    let state = app.state::<AppState>();
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(session_id)?
+    };
+    let app_prog = app.clone();
+    let sid_prog = session_id.to_string();
+    let mut conflicts = sftp::ConflictHandler::new(
+        match op {
+            SftpTransferOp::Upload {
+                overwrite: Some(true),
+                ..
+            } => sftp::ConflictMode::OverwriteAll,
+            _ => sftp::ConflictMode::Ask,
+        },
+        make_conflict_prompt(app.clone(), session_id.to_string(), Arc::clone(&cancel)),
+    );
+    let entry_guard = entry.lock().unwrap();
+    match op {
+        SftpTransferOp::Download {
+            remote_path,
+            local_path,
+        } => entry_guard.download_path(
+            session_id,
+            remote_path,
+            local_path,
+            cancel,
+            &mut conflicts,
+            move |progress| {
+                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+            },
+        ),
+        SftpTransferOp::Upload {
+            local_path,
+            remote_path,
+            ..
+        } => entry_guard.upload_path(
+            session_id,
+            local_path,
+            remote_path,
+            cancel,
+            &mut conflicts,
+            move |progress| {
+                let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
+            },
+        ),
+    }
+}
+
+/// تلاش برای reconnect با backoff؛ Ok یعنی session آمادهٔ resume است.
+fn try_reconnect_with_backoff(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Cancelled".to_string());
+        }
+        emit_sftp_transfer_status(
+            app,
+            session_id,
+            TransferStatusKind::Reconnecting,
+            format!("Reconnecting… ({attempt}/{MAX_RECONNECT_ATTEMPTS})"),
+            Some(attempt),
+        );
+        let delay = backoff_delay_secs(attempt);
+        if delay > 0 {
+            let mut slept = 0u64;
+            while slept < delay {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("Cancelled".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                slept += 1;
+            }
+        }
+        // فقط Arc سشن رو زیر قفل manager بگیر؛ handshake بیرون از قفل
+        let entry = {
+            let state = app.state::<AppState>();
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.take_entry(session_id)?
+        };
+        let reconnect_result = sftp::reconnect_entry(&entry);
+        match reconnect_result {
+            Ok(()) => {
+                emit_sftp_transfer_status(
+                    app,
+                    session_id,
+                    TransferStatusKind::Resuming,
+                    "Connection restored, resuming…",
+                    None,
+                );
+                return Ok(());
+            }
+            Err(e) if attempt == MAX_RECONNECT_ATTEMPTS => {
+                return Err(e);
+            }
+            Err(_) => continue,
+        }
+    }
+    Err("Reconnect failed".to_string())
+}
+
+fn wait_for_manual_resume(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    cancel: &AtomicBool,
+    last_error: &str,
+) -> Result<(), String> {
+    emit_sftp_transfer_status(
+        app,
+        session_id,
+        TransferStatusKind::Paused,
+        format!("Paused after connection loss: {last_error}"),
+        None,
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let state = app.state::<AppState>();
+        state
+            .transfer_resume_tx
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), tx);
+    }
+    let signal = loop {
+        if cancel.load(Ordering::Relaxed) {
+            break TransferResumeSignal::Abort;
+        }
+        match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(s) => break s,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                break TransferResumeSignal::Abort
+            }
+        }
+    };
+    app.state::<AppState>()
+        .transfer_resume_tx
+        .lock()
+        .unwrap()
+        .remove(session_id);
+    match signal {
+        TransferResumeSignal::Resume => Ok(()),
+        TransferResumeSignal::Abort => Err("Cancelled".to_string()),
+    }
+}
+
+fn spawn_sftp_transfer(app: tauri::AppHandle, session_id: String, op: SftpTransferOp) {
     let cancel_flag = {
         let state = app.state::<AppState>();
         let mut flags = state.transfer_cancel_flags.lock().unwrap();
@@ -854,67 +1082,59 @@ async fn sftp_download(
         flag
     };
     tokio::spawn(async move {
+        let app_bg = app.clone();
+        let sid = session_id.clone();
+        let cancel = Arc::clone(&cancel_flag);
+        let op_bg = op.clone();
         let result = tokio::task::spawn_blocking(move || {
-            let app_prog = app_bg.clone();
-            let sid_prog = sid.clone();
-            let state = app_bg.state::<AppState>();
-            let entry = {
-                let manager = state.sftp_manager.lock().unwrap();
-                manager.get_session(&sid)
-            };
-            match entry {
-                Ok(entry_arc) => {
-                    let app_conflict = app_bg.clone();
-                    let sid_conflict = sid.clone();
-                    let cancel_conflict = Arc::clone(&cancel_flag);
-                    let prompt = move |info: &sftp::ConflictInfo| -> sftp::ConflictDecision {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        app_conflict
-                            .state::<AppState>()
-                            .transfer_conflict_tx
-                            .lock()
-                            .unwrap()
-                            .insert(sid_conflict.clone(), tx);
-                        let _ = app_conflict
-                            .emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
-                        let decision = loop {
-                            if cancel_conflict.load(Ordering::Relaxed) {
-                                break sftp::ConflictDecision::Cancel;
+            emit_sftp_transfer_status(
+                &app_bg,
+                &sid,
+                TransferStatusKind::Transferring,
+                "Transferring…",
+                None,
+            );
+            loop {
+                match run_sftp_transfer_once(&app_bg, &sid, &op_bg, Arc::clone(&cancel)) {
+                    Ok(()) => {
+                        emit_sftp_transfer_status(
+                            &app_bg,
+                            &sid,
+                            TransferStatusKind::Idle,
+                            "Done",
+                            None,
+                        );
+                        return Ok(());
+                    }
+                    Err(e) if e == "Cancelled" || cancel.load(Ordering::Relaxed) => {
+                        return Err("Cancelled".to_string());
+                    }
+                    Err(e) if !is_retryable_network_error(&e) => {
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        // شبکه قطع شده — reconnect با backoff، بعد resume از offset
+                        match try_reconnect_with_backoff(&app_bg, &sid, &cancel) {
+                            Ok(()) => continue,
+                            Err(re) if re == "Cancelled" || cancel.load(Ordering::Relaxed) => {
+                                return Err("Cancelled".to_string());
                             }
-                            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                                Ok(d) => break d,
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                    break sftp::ConflictDecision::Cancel
+                            Err(_) => {
+                                // ۵ بار شکست — صبر برای Resume دستی
+                                wait_for_manual_resume(&app_bg, &sid, &cancel, &e)?;
+                                if cancel.load(Ordering::Relaxed) {
+                                    return Err("Cancelled".to_string());
                                 }
+                                try_reconnect_with_backoff(&app_bg, &sid, &cancel)?;
+                                continue;
                             }
-                        };
-                        app_conflict
-                            .state::<AppState>()
-                            .transfer_conflict_tx
-                            .lock()
-                            .unwrap()
-                            .remove(&sid_conflict);
-                        decision
-                    };
-                    let mut conflicts = sftp::ConflictHandler::new(sftp::ConflictMode::Ask, prompt);
-
-                    let entry_guard = entry_arc.lock().unwrap();
-                    entry_guard.download_path(
-                        &sid,
-                        &remote_path,
-                        &local_path,
-                        Arc::clone(&cancel_flag),
-                        &mut conflicts,
-                        move |progress| {
-                            let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-                        },
-                    )
+                        }
+                    }
                 }
-                Err(e) => Err(e),
             }
         })
         .await;
+
         let state = app.state::<AppState>();
         state
             .transfer_cancel_flags
@@ -926,6 +1146,8 @@ async fn sftp_download(
             .lock()
             .unwrap()
             .remove(&session_id);
+        state.transfer_resume_tx.lock().unwrap().remove(&session_id);
+
         let done = match result {
             Ok(Ok(())) => SftpTransferDone {
                 ok: true,
@@ -940,8 +1162,34 @@ async fn sftp_download(
                 error: Some(format!("Task panic: {e}")),
             },
         };
+        if !done.ok {
+            emit_sftp_transfer_status(
+                &app,
+                &session_id,
+                TransferStatusKind::Idle,
+                done.error.clone().unwrap_or_default(),
+                None,
+            );
+        }
         let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
     });
+}
+
+#[tauri::command]
+async fn sftp_download(
+    app: tauri::AppHandle,
+    session_id: String,
+    remote_path: String,
+    local_path: String,
+) -> Result<(), String> {
+    spawn_sftp_transfer(
+        app,
+        session_id,
+        SftpTransferOp::Download {
+            remote_path,
+            local_path,
+        },
+    );
     Ok(())
 }
 
@@ -953,109 +1201,15 @@ async fn sftp_upload(
     remote_path: String,
     overwrite: Option<bool>,
 ) -> Result<(), String> {
-    let app_bg = app.clone();
-    let sid = session_id.clone();
-    let cancel_flag = {
-        let state = app.state::<AppState>();
-        let mut flags = state.transfer_cancel_flags.lock().unwrap();
-        let flag = Arc::new(AtomicBool::new(false));
-        flags.insert(session_id.clone(), Arc::clone(&flag));
-        flag
-    };
-    tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let app_prog = app_bg.clone();
-            let sid_prog = sid.clone();
-            let state = app_bg.state::<AppState>();
-            let entry = {
-                let manager = state.sftp_manager.lock().unwrap();
-                manager.get_session(&sid)
-            };
-            match entry {
-                Ok(entry_arc) => {
-                    let app_conflict = app_bg.clone();
-                    let sid_conflict = sid.clone();
-                    let cancel_conflict = Arc::clone(&cancel_flag);
-                    let prompt = move |info: &sftp::ConflictInfo| -> sftp::ConflictDecision {
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        app_conflict
-                            .state::<AppState>()
-                            .transfer_conflict_tx
-                            .lock()
-                            .unwrap()
-                            .insert(sid_conflict.clone(), tx);
-                        let _ = app_conflict
-                            .emit(&format!("sftp:{}:conflict", sid_conflict), info.clone());
-                        let decision = loop {
-                            if cancel_conflict.load(Ordering::Relaxed) {
-                                break sftp::ConflictDecision::Cancel;
-                            }
-                            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                                Ok(d) => break d,
-                                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                    break sftp::ConflictDecision::Cancel
-                                }
-                            }
-                        };
-                        app_conflict
-                            .state::<AppState>()
-                            .transfer_conflict_tx
-                            .lock()
-                            .unwrap()
-                            .remove(&sid_conflict);
-                        decision
-                    };
-                    let initial_mode = if overwrite.unwrap_or(false) {
-                        sftp::ConflictMode::OverwriteAll
-                    } else {
-                        sftp::ConflictMode::Ask
-                    };
-                    let mut conflicts = sftp::ConflictHandler::new(initial_mode, prompt);
-
-                    let entry_guard = entry_arc.lock().unwrap();
-                    entry_guard.upload_path(
-                        &sid,
-                        &local_path,
-                        &remote_path,
-                        Arc::clone(&cancel_flag),
-                        &mut conflicts,
-                        move |progress| {
-                            let _ = app_prog.emit(&format!("sftp:{}:progress", sid_prog), progress);
-                        },
-                    )
-                }
-                Err(e) => Err(e),
-            }
-        })
-        .await;
-        let state = app.state::<AppState>();
-        state
-            .transfer_cancel_flags
-            .lock()
-            .unwrap()
-            .remove(&session_id);
-        state
-            .transfer_conflict_tx
-            .lock()
-            .unwrap()
-            .remove(&session_id);
-        let done = match result {
-            Ok(Ok(())) => SftpTransferDone {
-                ok: true,
-                error: None,
-            },
-            Ok(Err(e)) => SftpTransferDone {
-                ok: false,
-                error: Some(e),
-            },
-            Err(e) => SftpTransferDone {
-                ok: false,
-                error: Some(format!("Task panic: {e}")),
-            },
-        };
-        let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
-    });
+    spawn_sftp_transfer(
+        app,
+        session_id,
+        SftpTransferOp::Upload {
+            local_path,
+            remote_path,
+            overwrite,
+        },
+    );
     Ok(())
 }
 
@@ -1153,11 +1307,25 @@ fn sftp_disconnect(state: State<AppState>, session_id: String) -> Result<(), Str
 
 #[tauri::command]
 fn sftp_cancel_transfer(state: State<AppState>, session_id: String) -> Result<(), String> {
-    let flags = state.transfer_cancel_flags.lock().unwrap();
-    if let Some(flag) = flags.get(&session_id) {
+    if let Some(flag) = state.transfer_cancel_flags.lock().unwrap().get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
+    if let Some(tx) = state.transfer_resume_tx.lock().unwrap().remove(&session_id) {
+        let _ = tx.send(TransferResumeSignal::Abort);
+    }
     Ok(())
+}
+
+#[tauri::command]
+fn sftp_resume_transfer(state: State<AppState>, session_id: String) -> Result<(), String> {
+    let tx = state.transfer_resume_tx.lock().unwrap().remove(&session_id);
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(TransferResumeSignal::Resume);
+            Ok(())
+        }
+        None => Err("No paused transfer for this session".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -1642,7 +1810,9 @@ fn take_pending_open_folders(state: State<PendingOpenFolders>) -> Vec<String> {
 /// Every show path consults this map via `revive_webview_if_stuck` first.
 enum WebviewLoadState {
     /// Navigation started at `since` and has not reported Finished yet.
-    Loading { since: std::time::Instant },
+    Loading {
+        since: std::time::Instant,
+    },
     Finished,
 }
 
@@ -1761,9 +1931,8 @@ fn panic_log_dir() -> Option<std::path::PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        std::env::var_os("HOME").map(|h| {
-            std::path::PathBuf::from(h).join("Library/Application Support/com.termifai")
-        })
+        std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join("Library/Application Support/com.termifai"))
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -2013,16 +2182,27 @@ fn update_os_context_menu(_app: &tauri::AppHandle, _enabled: bool) -> Result<(),
         }
         if let Some(ref h) = home {
             let _ = std::fs::remove_file(h.join(".local/share/nautilus/scripts/Open in Termifai"));
-            let _ = std::fs::remove_file(h.join(".local/share/nautilus-python/extensions/termifai.py"));
+            let _ =
+                std::fs::remove_file(h.join(".local/share/nautilus-python/extensions/termifai.py"));
             let _ = std::fs::remove_file(h.join(".local/share/nemo/scripts/Open in Termifai"));
             let _ = std::fs::remove_file(h.join(".local/share/nemo/actions/termifai.nemo_action"));
             let _ = std::fs::remove_file(h.join(".local/share/caja/scripts/Open in Termifai"));
-            let _ = std::fs::remove_file(h.join(".local/share/kservices5/ServiceMenus/termifai.desktop"));
-            let _ = std::fs::remove_file(h.join(".local/share/kservices6/ServiceMenus/termifai.desktop"));
+            let _ = std::fs::remove_file(
+                h.join(".local/share/kservices5/ServiceMenus/termifai.desktop"),
+            );
+            let _ = std::fs::remove_file(
+                h.join(".local/share/kservices6/ServiceMenus/termifai.desktop"),
+            );
             // Gracefully restart any file managers to apply cleanup
-            let _ = std::process::Command::new("pkill").args(["-f", "nautilus"]).status();
-            let _ = std::process::Command::new("pkill").args(["-f", "nemo"]).status();
-            let _ = std::process::Command::new("pkill").args(["-f", "caja"]).status();
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "nautilus"])
+                .status();
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "nemo"])
+                .status();
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", "caja"])
+                .status();
         }
     }
 
@@ -2251,10 +2431,9 @@ pub fn run() {
                     // Nap exemption.
                     #[cfg(target_os = "macos")]
                     {
-                        let all_finished = app
-                            .webview_windows()
-                            .keys()
-                            .all(|label| matches!(map.get(label), Some(WebviewLoadState::Finished)));
+                        let all_finished = app.webview_windows().keys().all(|label| {
+                            matches!(map.get(label), Some(WebviewLoadState::Finished))
+                        });
                         if all_finished {
                             launch_activity::end();
                         }
@@ -2277,11 +2456,10 @@ pub fn run() {
                 let path = std::path::Path::new(&clean_arg);
                 if path.is_dir() {
                     let path_str = path.to_string_lossy().into_owned();
-                    let clean_path = if path_str.starts_with(r"\\?\") {
-                        path_str[4..].to_string()
-                    } else {
-                        path_str
-                    };
+                    let clean_path = path_str
+                        .strip_prefix(r"\\?\")
+                        .map(|s| s.to_string())
+                        .unwrap_or(path_str);
                     app.state::<PendingOpenFolders>()
                         .0
                         .lock()
@@ -2390,6 +2568,7 @@ pub fn run() {
             sftp_connect_from_host,
             sftp_disconnect,
             sftp_cancel_transfer,
+            sftp_resume_transfer,
             sftp_resolve_conflict,
             sftp_download,
             sftp_upload,
@@ -2524,6 +2703,7 @@ pub fn run() {
                 watch_handles: Mutex::new(std::collections::HashMap::new()),
                 transfer_cancel_flags: Mutex::new(std::collections::HashMap::new()),
                 transfer_conflict_tx: Mutex::new(std::collections::HashMap::new()),
+                transfer_resume_tx: Mutex::new(std::collections::HashMap::new()),
                 dashboard_manager: Mutex::new(DashboardManager::new()),
                 hosts_store: store::JsonStore::new(vault_dir.join("hosts.json")),
                 port_forward_store: store::JsonStore::new(vault_dir.join("port_forwards.json")),
@@ -2570,11 +2750,10 @@ pub fn run() {
                 let path = std::path::Path::new(&clean_arg);
                 if path.is_dir() {
                     let path_str = path.to_string_lossy().into_owned();
-                    let clean_path = if path_str.starts_with(r"\\?\") {
-                        path_str[4..].to_string()
-                    } else {
-                        path_str
-                    };
+                    let clean_path = path_str
+                        .strip_prefix(r"\\?\")
+                        .map(|s| s.to_string())
+                        .unwrap_or(path_str);
                     app.state::<PendingOpenFolders>()
                         .0
                         .lock()
@@ -2582,8 +2761,6 @@ pub fn run() {
                         .push(clean_path);
                 }
             }
-
-
 
             let _main_win = build_main_window(app.handle(), !background_launch)?;
 
