@@ -1,11 +1,36 @@
+use crate::sftp_transfer::{
+    clear_download_resume_files, clear_upload_marker, download_marker_matches,
+    download_resume_offset_verified, download_tmp_path, same_file_identity,
+    upload_marker_matches, upload_resume_offset_verified, write_download_marker,
+    write_upload_marker, DownloadMarker, UploadMarker,
+};
 use crate::ssh;
 use serde::{Deserialize, Serialize};
-use ssh2::Session;
+use ssh2::{OpenFlags, OpenType, Session};
 use std::collections::HashMap;
+use std::io::{Seek, SeekFrom};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+/// Buffer size for SFTP read/write loops (Phase 2a).
+const TRANSFER_BUF_SIZE: usize = 256 * 1024;
+/// Minimum interval between progress emits (Phase 2a throttle).
+const PROGRESS_THROTTLE: Duration = Duration::from_millis(100);
+
+/// Credentials needed to rebuild an SFTP session after a network drop.
+#[derive(Debug, Clone)]
+pub struct SftpReconnectCreds {
+    pub hostname: String,
+    pub port: u16,
+    pub username: String,
+    pub password: Option<String>,
+    pub private_key_path: Option<String>,
+    #[allow(dead_code)] // برای reconnect آینده به default path نگه داشته می‌شه
+    pub default_remote_path: Option<String>,
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SftpConnectRequest {
@@ -103,6 +128,11 @@ impl<'a> ConflictHandler<'a> {
         }
     }
 
+    /// OverwriteAll یعنی skip بی‌صدای هم‌اندازه ممنوعه — باید دوباره بنویسیم.
+    pub fn forces_overwrite(&self) -> bool {
+        self.mode == ConflictMode::OverwriteAll
+    }
+
     /// Ok(true) = overwrite/merge, Ok(false) = skip this item, Err = abort transfer.
     pub fn resolve(&mut self, info: &ConflictInfo) -> Result<bool, String> {
         match self.mode {
@@ -124,6 +154,14 @@ impl<'a> ConflictHandler<'a> {
             ConflictDecision::Cancel => Err("Cancelled".to_string()),
         }
     }
+}
+
+fn local_mtime_secs(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub fn list_local(path: &str) -> Result<Vec<LocalFileEntry>, String> {
@@ -205,12 +243,54 @@ pub struct UsersGroups {
 
 pub struct SftpEntry {
     pub session: Session,
+    pub reconnect: SftpReconnectCreds,
+    /// وقتی true بشه thread کیپ‌الایو تموم می‌شه (disconnect / clear_all)
+    keepalive_stop: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SftpEntry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SftpEntry").finish()
+        f.debug_struct("SftpEntry")
+            .field("hostname", &self.reconnect.hostname)
+            .finish()
     }
+}
+
+impl SftpEntry {
+    /// Replace the live SSH session after a successful reconnect (creds stay).
+    pub fn replace_session(&mut self, session: Session) {
+        self.session = session;
+    }
+
+    pub fn stop_keepalive(&self) {
+        self.keepalive_stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// `set_keepalive` فقط config می‌کنه؛ باید دوره‌ای `keepalive_send` بزنیم وگرنه
+/// بعد از idle سرور/NAT کانال رو می‌کشه → «Unable to startup channel».
+fn spawn_sftp_keepalive(entry: Arc<Mutex<SftpEntry>>, stop: Arc<AtomicBool>, session_id: &str) {
+    let name = format!("sftp-ka-{}", &session_id[..session_id.len().min(12)]);
+    let _ = std::thread::Builder::new().name(name).spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            for _ in 0..10 {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            // اگه transfer قفل گرفته، رد شو — ترافیک فعال خودش سشن رو زنده نگه می‌داره
+            let Ok(guard) = entry.try_lock() else {
+                continue;
+            };
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            if guard.session.keepalive_send().is_err() {
+                return;
+            }
+        }
+    });
 }
 
 impl SftpEntry {
@@ -265,6 +345,8 @@ impl SftpEntry {
     where
         F: Fn(TransferProgress),
     {
+        use std::io::{Read, Write};
+
         let sftp = self
             .session
             .sftp()
@@ -275,28 +357,83 @@ impl SftpEntry {
             .stat(remote_p)
             .map_err(|e| format!("stat '{}': {}", remote_path, e))?;
         let total_bytes = stat.size.unwrap_or(0);
+        let remote_mtime = stat.mtime.unwrap_or(0);
+
+        let tmp_path = download_tmp_path(local_path);
+        let identity_ok =
+            download_marker_matches(local_path, remote_path, total_bytes, remote_mtime);
+        let tmp_len = std::fs::metadata(&tmp_path).ok().map(|m| m.len());
+        let resume_at =
+            download_resume_offset_verified(tmp_len, total_bytes, identity_ok).unwrap_or(0);
+
+        if !identity_ok {
+            // tmp کهنه از فایل/خطای دیگه — دور بریز
+            clear_download_resume_files(local_path);
+        }
+
+        // فایل کامل از قبل تو tmp هست — فقط rename کن
+        if resume_at == total_bytes && total_bytes > 0 {
+            std::fs::rename(&tmp_path, local_path)
+                .map_err(|e| format!("rename tmp to '{}': {}", local_path, e))?;
+            let _ = std::fs::remove_file(crate::sftp_transfer::download_marker_path(local_path));
+            on_progress(TransferProgress {
+                session_id: session_id.to_string(),
+                file_name: pathbase(remote_path),
+                bytes_transferred: total_bytes,
+                total_bytes,
+            });
+            return Ok(());
+        }
 
         let mut remote_file = sftp
             .open(remote_p)
             .map_err(|e| format!("open remote: {}", e))?;
 
-        let tmp_path = format!("{}.termifai_dl_tmp", local_path);
-        let mut local_file = std::fs::File::create(&tmp_path)
-            .map_err(|e| format!("create tmp file '{}': {}", tmp_path, e))?;
+        let mut local_file = if resume_at > 0 {
+            remote_file
+                .seek(SeekFrom::Start(resume_at))
+                .map_err(|e| format!("seek remote: {}", e))?;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tmp_path)
+                .map_err(|e| format!("open tmp for resume '{}': {}", tmp_path, e))?
+        } else {
+            clear_download_resume_files(local_path);
+            std::fs::File::create(&tmp_path)
+                .map_err(|e| format!("create tmp file '{}': {}", tmp_path, e))?
+        };
+
+        write_download_marker(
+            local_path,
+            &DownloadMarker {
+                remote_path: remote_path.to_string(),
+                remote_size: total_bytes,
+                remote_mtime,
+            },
+        )?;
 
         let file_name = remote_p
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| remote_path.to_string());
 
-        let mut buf = vec![0u8; 32 * 1024];
-        let mut bytes_transferred = 0u64;
+        let mut buf = vec![0u8; TRANSFER_BUF_SIZE];
+        let mut bytes_transferred = resume_at;
+        let mut last_progress = Instant::now()
+            .checked_sub(PROGRESS_THROTTLE)
+            .unwrap_or_else(Instant::now);
+
+        on_progress(TransferProgress {
+            session_id: session_id.to_string(),
+            file_name: file_name.clone(),
+            bytes_transferred,
+            total_bytes,
+        });
 
         let result = (|| {
             loop {
-                use std::io::{Read, Write};
                 if cancel.load(Ordering::Relaxed) {
-                    let _ = std::fs::remove_file(&tmp_path);
+                    // Cancel عمدی: tmp+marker می‌مونن تا بعداً بشه resume کرد؛ پاک نمی‌کنیم
                     return Err("Cancelled".to_string());
                 }
                 let n = remote_file
@@ -309,29 +446,31 @@ impl SftpEntry {
                     .write_all(&buf[..n])
                     .map_err(|e| format!("write tmp: {}", e))?;
                 bytes_transferred += n as u64;
-                on_progress(TransferProgress {
-                    session_id: session_id.to_string(),
-                    file_name: file_name.clone(),
-                    bytes_transferred,
-                    total_bytes,
-                });
+                if last_progress.elapsed() >= PROGRESS_THROTTLE || bytes_transferred >= total_bytes
+                {
+                    last_progress = Instant::now();
+                    on_progress(TransferProgress {
+                        session_id: session_id.to_string(),
+                        file_name: file_name.clone(),
+                        bytes_transferred,
+                        total_bytes,
+                    });
+                }
             }
-            use std::io::Write;
             local_file
                 .flush()
                 .map_err(|e| format!("flush tmp: {}", e))?;
             Ok::<(), String>(())
         })();
 
-        if let Err(e) = result {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
+        // خطای شبکه/Cancel: tmp+marker برای resume می‌مونن
+        result?;
 
         std::fs::rename(&tmp_path, local_path).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
             format!("rename tmp to '{}': {}", local_path, e)
-        })
+        })?;
+        let _ = std::fs::remove_file(crate::sftp_transfer::download_marker_path(local_path));
+        Ok(())
     }
 
     pub fn upload_file<F>(
@@ -345,6 +484,8 @@ impl SftpEntry {
     where
         F: Fn(TransferProgress),
     {
+        use std::io::{Read, Write};
+
         let sftp = self
             .session
             .sftp()
@@ -353,26 +494,88 @@ impl SftpEntry {
         let local_meta = std::fs::metadata(local_path)
             .map_err(|e| format!("stat local '{}': {}", local_path, e))?;
         let total_bytes = local_meta.len();
+        let local_mtime = local_mtime_secs(&local_meta);
+
+        let remote_len = sftp
+            .stat(std::path::Path::new(remote_path))
+            .ok()
+            .and_then(|s| s.size);
+
+        let identity_ok =
+            upload_marker_matches(local_path, remote_path, total_bytes, local_mtime);
+        let resume_at =
+            upload_resume_offset_verified(remote_len, total_bytes, identity_ok).unwrap_or(0);
+
+        if resume_at == total_bytes && total_bytes > 0 {
+            clear_upload_marker(local_path);
+            on_progress(TransferProgress {
+                session_id: session_id.to_string(),
+                file_name: pathbase(local_path),
+                bytes_transferred: total_bytes,
+                total_bytes,
+            });
+            return Ok(());
+        }
 
         let mut local_file =
             std::fs::File::open(local_path).map_err(|e| format!("open local: {}", e))?;
 
-        let mut remote_file = sftp
-            .create(std::path::Path::new(remote_path))
-            .map_err(|e| format!("create remote '{}': {}", remote_path, e))?;
+        let mut remote_file = if resume_at > 0 {
+            // فقط WRITE + seek — APPEND روی OpenSSH با O_APPEND ممکنه seek رو نادیده بگیره
+            let mut f = sftp
+                .open_mode(
+                    std::path::Path::new(remote_path),
+                    OpenFlags::WRITE,
+                    0o644,
+                    OpenType::File,
+                )
+                .map_err(|e| format!("open remote for resume '{}': {}", remote_path, e))?;
+            f.seek(SeekFrom::Start(resume_at))
+                .map_err(|e| format!("seek remote: {}", e))?;
+            local_file
+                .seek(SeekFrom::Start(resume_at))
+                .map_err(|e| format!("seek local: {}", e))?;
+            f
+        } else {
+            // فایل غریبه/کهنه رو ننویس روش — از صفر بساز
+            if remote_len.is_some() {
+                let _ = sftp.unlink(std::path::Path::new(remote_path));
+            }
+            clear_upload_marker(local_path);
+            sftp.create(std::path::Path::new(remote_path))
+                .map_err(|e| format!("create remote '{}': {}", remote_path, e))?
+        };
+
+        write_upload_marker(
+            local_path,
+            &UploadMarker {
+                remote_path: remote_path.to_string(),
+                local_size: total_bytes,
+                local_mtime,
+            },
+        )?;
 
         let file_name = std::path::Path::new(local_path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| local_path.to_string());
 
-        let mut buf = vec![0u8; 32 * 1024];
-        let mut bytes_transferred = 0u64;
+        let mut buf = vec![0u8; TRANSFER_BUF_SIZE];
+        let mut bytes_transferred = resume_at;
+        let mut last_progress = Instant::now()
+            .checked_sub(PROGRESS_THROTTLE)
+            .unwrap_or_else(Instant::now);
+
+        on_progress(TransferProgress {
+            session_id: session_id.to_string(),
+            file_name: file_name.clone(),
+            bytes_transferred,
+            total_bytes,
+        });
 
         loop {
-            use std::io::{Read, Write};
             if cancel.load(Ordering::Relaxed) {
-                let _ = sftp.unlink(std::path::Path::new(remote_path));
+                // فایل resumed رو unlink نکن — گیگابایت منتقل‌شده رو نگه دار
                 return Err("Cancelled".to_string());
             }
             let n = local_file
@@ -385,14 +588,18 @@ impl SftpEntry {
                 .write_all(&buf[..n])
                 .map_err(|e| format!("write remote: {}", e))?;
             bytes_transferred += n as u64;
-            on_progress(TransferProgress {
-                session_id: session_id.to_string(),
-                file_name: file_name.clone(),
-                bytes_transferred,
-                total_bytes,
-            });
+            if last_progress.elapsed() >= PROGRESS_THROTTLE || bytes_transferred >= total_bytes {
+                last_progress = Instant::now();
+                on_progress(TransferProgress {
+                    session_id: session_id.to_string(),
+                    file_name: file_name.clone(),
+                    bytes_transferred,
+                    total_bytes,
+                });
+            }
         }
 
+        clear_upload_marker(local_path);
         Ok(())
     }
 
@@ -595,6 +802,7 @@ impl SftpEntry {
         let meta = std::fs::metadata(local_path)
             .map_err(|e| format!("stat local '{}': {}", local_path, e))?;
 
+        let local_mtime = local_mtime_secs(&meta);
         let (local_is_dir, local_size, local_modified) = (
             meta.is_dir(),
             if meta.is_dir() {
@@ -602,36 +810,59 @@ impl SftpEntry {
             } else {
                 Some(meta.len())
             },
-            meta.modified().ok().map(|t| {
-                format_unix_timestamp(
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                )
-            }),
+            Some(format_unix_timestamp(local_mtime)),
         );
         {
             let sftp = self
                 .session
                 .sftp()
                 .map_err(|e| format!("SFTP subsystem: {}", e))?;
-            if let Some((dest_is_dir, dest_size, dest_modified)) =
+            if let Some((dest_is_dir, dest_size, dest_mtime)) =
                 stat_remote_brief(&sftp, remote_path)
             {
                 if dest_is_dir == local_is_dir {
-                    let proceed = conflicts.resolve(&ConflictInfo {
-                        session_id: session_id.to_string(),
-                        file_name: pathbase(remote_path),
-                        dest_path: remote_path.to_string(),
-                        kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
-                        direction: "upload".to_string(),
-                        existing_size: dest_size,
-                        existing_modified: dest_modified,
-                        incoming_size: local_size,
-                        incoming_modified: local_modified,
-                    })?;
-                    if !proceed {
+                    // هم‌اندازه + هم‌mtime → skip بی‌صدا؛ مگر OverwriteAll
+                    let identical = !local_is_dir
+                        && same_file_identity(
+                            dest_size.unwrap_or(0),
+                            dest_mtime,
+                            local_size.unwrap_or(0),
+                            Some(local_mtime),
+                        );
+                    if identical && !conflicts.forces_overwrite() {
                         return Ok(());
+                    }
+                    // partial مال همین transfer (marker) → بدون unlink برو تو resume
+                    let our_partial = !local_is_dir
+                        && dest_size
+                            .map(|d| d > 0 && d < local_size.unwrap_or(0))
+                            .unwrap_or(false)
+                        && upload_marker_matches(
+                            local_path,
+                            remote_path,
+                            local_size.unwrap_or(0),
+                            local_mtime,
+                        );
+                    if !our_partial {
+                        let proceed = conflicts.resolve(&ConflictInfo {
+                            session_id: session_id.to_string(),
+                            file_name: pathbase(remote_path),
+                            dest_path: remote_path.to_string(),
+                            kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
+                            direction: "upload".to_string(),
+                            existing_size: dest_size,
+                            existing_modified: dest_mtime.map(format_unix_timestamp),
+                            incoming_size: local_size,
+                            incoming_modified: local_modified,
+                        })?;
+                        if !proceed {
+                            return Ok(());
+                        }
+                        // overwrite تأیید شد — marker/ریموت غریبه رو پاک کن
+                        if !local_is_dir {
+                            clear_upload_marker(local_path);
+                            let _ = sftp.unlink(std::path::Path::new(remote_path));
+                        }
                     }
                 }
             }
@@ -675,20 +906,18 @@ impl SftpEntry {
                 return Err("Cancelled".to_string());
             }
 
-            if let Some((dest_is_dir, dest_size, dest_modified)) = stat_remote_brief(&sftp, rp) {
-                let incoming = stat_local_brief(lp);
-                let proceed = conflicts.resolve(&ConflictInfo {
-                    session_id: session_id.to_string(),
-                    file_name: pathbase(rp),
-                    dest_path: rp.clone(),
-                    kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
-                    direction: "upload".to_string(),
-                    existing_size: dest_size,
-                    existing_modified: dest_modified,
-                    incoming_size: incoming.as_ref().and_then(|(_, s, _)| *s),
-                    incoming_modified: incoming.and_then(|(_, _, m)| m),
-                })?;
-                if !proceed {
+            // کامل+mtime → skip (مگر OverwriteAll)؛ ناقص با marker → resume؛ سایر → conflict
+            let remote_brief = stat_remote_brief(&sftp, rp);
+            let local_brief = stat_local_brief(lp);
+            if let Some((_, dest_size, dest_mtime)) = &remote_brief {
+                let local_mtime = local_brief.as_ref().and_then(|(_, _, m)| *m);
+                let identical = same_file_identity(
+                    dest_size.unwrap_or(0),
+                    *dest_mtime,
+                    *size,
+                    local_mtime,
+                );
+                if identical && !conflicts.forces_overwrite() {
                     offset += size;
                     on_progress(TransferProgress {
                         session_id: session_id.to_string(),
@@ -697,6 +926,42 @@ impl SftpEntry {
                         total_bytes: grand_total,
                     });
                     continue;
+                }
+                let lp_str = lp.to_string_lossy();
+                let is_our_partial = dest_size.map(|d| d > 0 && d < *size).unwrap_or(false)
+                    && upload_marker_matches(
+                        &lp_str,
+                        rp,
+                        *size,
+                        local_mtime.unwrap_or(0),
+                    );
+                if !is_our_partial {
+                    if let Some((dest_is_dir, dest_size, dest_mtime)) = remote_brief {
+                        // هم‌اندازه با محتوای متفاوت، یا فایل غریبه — از کاربر بپرس / OverwriteAll
+                        let proceed = conflicts.resolve(&ConflictInfo {
+                            session_id: session_id.to_string(),
+                            file_name: pathbase(rp),
+                            dest_path: rp.clone(),
+                            kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
+                            direction: "upload".to_string(),
+                            existing_size: dest_size,
+                            existing_modified: dest_mtime.map(format_unix_timestamp),
+                            incoming_size: Some(*size),
+                            incoming_modified: local_mtime.map(format_unix_timestamp),
+                        })?;
+                        if !proceed {
+                            offset += size;
+                            on_progress(TransferProgress {
+                                session_id: session_id.to_string(),
+                                file_name: pathbase(rp),
+                                bytes_transferred: offset,
+                                total_bytes: grand_total,
+                            });
+                            continue;
+                        }
+                        clear_upload_marker(&lp_str);
+                        let _ = sftp.unlink(std::path::Path::new(rp));
+                    }
                 }
             }
 
@@ -733,7 +998,7 @@ impl SftpEntry {
     where
         F: Fn(TransferProgress),
     {
-        let (is_dir, remote_size, remote_modified) = {
+        let (is_dir, remote_size, remote_mtime_secs) = {
             let sftp = self
                 .session
                 .sftp()
@@ -743,27 +1008,43 @@ impl SftpEntry {
                 .map_err(|e| format!("stat '{}': {}", remote_path, e))?;
             let is_dir = stat.file_type().is_dir();
             let remote_size = if is_dir { None } else { stat.size };
-            let remote_modified = stat.mtime.map(format_unix_timestamp);
-            (is_dir, remote_size, remote_modified)
+            (is_dir, remote_size, stat.mtime)
         };
+        let remote_modified = remote_mtime_secs.map(format_unix_timestamp);
 
-        if let Some((dest_is_dir, dest_size, dest_modified)) =
+        if let Some((dest_is_dir, dest_size, dest_mtime)) =
             stat_local_brief(std::path::Path::new(local_path))
         {
             if dest_is_dir == is_dir {
-                let proceed = conflicts.resolve(&ConflictInfo {
-                    session_id: session_id.to_string(),
-                    file_name: pathbase(remote_path),
-                    dest_path: local_path.to_string(),
-                    kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
-                    direction: "download".to_string(),
-                    existing_size: dest_size,
-                    existing_modified: dest_modified,
-                    incoming_size: remote_size,
-                    incoming_modified: remote_modified,
-                })?;
-                if !proceed {
+                let identical = !is_dir
+                    && same_file_identity(
+                        dest_size.unwrap_or(0),
+                        dest_mtime,
+                        remote_size.unwrap_or(0),
+                        remote_mtime_secs,
+                    );
+                if identical && !conflicts.forces_overwrite() {
                     return Ok(());
+                }
+                if !identical || conflicts.forces_overwrite() {
+                    let proceed = conflicts.resolve(&ConflictInfo {
+                        session_id: session_id.to_string(),
+                        file_name: pathbase(remote_path),
+                        dest_path: local_path.to_string(),
+                        kind: if dest_is_dir { "dir" } else { "file" }.to_string(),
+                        direction: "download".to_string(),
+                        existing_size: dest_size,
+                        existing_modified: dest_mtime.map(format_unix_timestamp),
+                        incoming_size: remote_size,
+                        incoming_modified: remote_modified,
+                    })?;
+                    if !proceed {
+                        return Ok(());
+                    }
+                    if !is_dir {
+                        let _ = std::fs::remove_file(local_path);
+                        clear_download_resume_files(local_path);
+                    }
                 }
             }
         }
@@ -803,19 +1084,21 @@ impl SftpEntry {
                 return Err("Cancelled".to_string());
             }
 
-            if let Some((_, dest_size, dest_modified)) = stat_local_brief(lp) {
-                let proceed = conflicts.resolve(&ConflictInfo {
-                    session_id: session_id.to_string(),
-                    file_name: pathbase(rp),
-                    dest_path: lp.to_string_lossy().to_string(),
-                    kind: "file".to_string(),
-                    direction: "download".to_string(),
-                    existing_size: dest_size,
-                    existing_modified: dest_modified,
-                    incoming_size: Some(*size),
-                    incoming_modified: None,
-                })?;
-                if !proceed {
+            // کامل+mtime → skip؛ tmp ناقص با marker رو download_file خودش resume می‌کنه
+            let lp_str = lp.to_string_lossy().to_string();
+            let remote_mtime = {
+                let sftp = self
+                    .session
+                    .sftp()
+                    .map_err(|e| format!("SFTP subsystem: {}", e))?;
+                sftp.stat(std::path::Path::new(rp))
+                    .ok()
+                    .and_then(|s| s.mtime)
+            };
+            if let Some((_, dest_size, dest_mtime)) = stat_local_brief(lp) {
+                let identical =
+                    same_file_identity(dest_size.unwrap_or(0), dest_mtime, *size, remote_mtime);
+                if identical && !conflicts.forces_overwrite() {
                     offset += size;
                     on_progress(TransferProgress {
                         session_id: session_id.to_string(),
@@ -824,6 +1107,44 @@ impl SftpEntry {
                         total_bytes: grand_total,
                     });
                     continue;
+                }
+
+                let has_our_tmp = download_marker_matches(
+                    &lp_str,
+                    rp,
+                    *size,
+                    remote_mtime.unwrap_or(0),
+                ) && std::fs::metadata(download_tmp_path(&lp_str))
+                    .map(|m| {
+                        let n = m.len();
+                        n > 0 && n < *size
+                    })
+                    .unwrap_or(false);
+
+                if !has_our_tmp {
+                    let proceed = conflicts.resolve(&ConflictInfo {
+                        session_id: session_id.to_string(),
+                        file_name: pathbase(rp),
+                        dest_path: lp_str.clone(),
+                        kind: "file".to_string(),
+                        direction: "download".to_string(),
+                        existing_size: dest_size,
+                        existing_modified: dest_mtime.map(format_unix_timestamp),
+                        incoming_size: Some(*size),
+                        incoming_modified: remote_mtime.map(format_unix_timestamp),
+                    })?;
+                    if !proceed {
+                        offset += size;
+                        on_progress(TransferProgress {
+                            session_id: session_id.to_string(),
+                            file_name: pathbase(rp),
+                            bytes_transferred: offset,
+                            total_bytes: grand_total,
+                        });
+                        continue;
+                    }
+                    let _ = std::fs::remove_file(lp);
+                    clear_download_resume_files(&lp_str);
                 }
             }
 
@@ -848,32 +1169,26 @@ impl SftpEntry {
     }
 }
 
-/// (is_dir, size, modified) of a remote path, or None if it doesn't exist.
-fn stat_remote_brief(sftp: &ssh2::Sftp, path: &str) -> Option<(bool, Option<u64>, Option<String>)> {
+/// (is_dir, size, mtime_secs) of a remote path, or None if it doesn't exist.
+fn stat_remote_brief(sftp: &ssh2::Sftp, path: &str) -> Option<(bool, Option<u64>, Option<u64>)> {
     let stat = sftp.stat(std::path::Path::new(path)).ok()?;
-    Some((
-        stat.file_type().is_dir(),
-        stat.size,
-        stat.mtime.map(format_unix_timestamp),
-    ))
+    Some((stat.file_type().is_dir(), stat.size, stat.mtime))
 }
 
-/// (is_dir, size, modified) of a local path, or None if it doesn't exist.
-fn stat_local_brief(path: &std::path::Path) -> Option<(bool, Option<u64>, Option<String>)> {
+/// (is_dir, size, mtime_secs) of a local path, or None if it doesn't exist.
+fn stat_local_brief(path: &std::path::Path) -> Option<(bool, Option<u64>, Option<u64>)> {
     let meta = std::fs::metadata(path).ok()?;
-    let modified = meta.modified().ok().map(|t| {
-        format_unix_timestamp(
-            t.duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
-        )
+    let mtime = meta.modified().ok().and_then(|t| {
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
     });
     let size = if meta.is_dir() {
         None
     } else {
         Some(meta.len())
     };
-    Some((meta.is_dir(), size, modified))
+    Some((meta.is_dir(), size, mtime))
 }
 
 fn pathbase(path: &str) -> String {
@@ -983,6 +1298,11 @@ impl SftpManager {
 
     /// Drops every SFTP session — used by quit-to-background reset.
     pub fn clear_all(&mut self) {
+        for entry in self.sessions.values() {
+            if let Ok(guard) = entry.lock() {
+                guard.stop_keepalive();
+            }
+        }
         self.sessions.clear();
     }
 
@@ -1012,10 +1332,29 @@ impl SftpManager {
             .default_remote_path
             .clone()
             .unwrap_or_else(|| "/".to_string());
-        self.sessions.insert(
-            req.session_id.clone(),
-            Arc::new(Mutex::new(SftpEntry { session })),
-        );
+
+        // اگه سشن قبلی با همین id هست، keepaliveش رو قطع کن
+        if let Some(old) = self.sessions.remove(&req.session_id) {
+            if let Ok(guard) = old.lock() {
+                guard.stop_keepalive();
+            }
+        }
+
+        let keepalive_stop = Arc::new(AtomicBool::new(false));
+        let entry = Arc::new(Mutex::new(SftpEntry {
+            session,
+            reconnect: SftpReconnectCreds {
+                hostname: req.hostname.clone(),
+                port: req.port,
+                username: req.username.clone(),
+                password: req.password.clone(),
+                private_key_path: req.private_key_path.clone(),
+                default_remote_path: req.default_remote_path.clone(),
+            },
+            keepalive_stop: Arc::clone(&keepalive_stop),
+        }));
+        spawn_sftp_keepalive(Arc::clone(&entry), keepalive_stop, &req.session_id);
+        self.sessions.insert(req.session_id.clone(), entry);
 
         log(
             "ready",
@@ -1028,11 +1367,41 @@ impl SftpManager {
     }
 
     pub fn disconnect(&mut self, session_id: &str) -> Result<(), String> {
-        self.sessions
+        let entry = self
+            .sessions
             .remove(session_id)
             .ok_or_else(|| format!("SFTP session '{}' not found", session_id))?;
+        if let Ok(guard) = entry.lock() {
+            guard.stop_keepalive();
+        }
         Ok(())
     }
+
+    /// Clone the session Arc under a brief manager lock — caller must drop the
+    /// manager lock before calling [`reconnect_entry`] (SSH handshake can take minutes).
+    pub fn take_entry(&self, session_id: &str) -> Result<Arc<Mutex<SftpEntry>>, String> {
+        self.get_session(session_id)
+    }
+}
+
+/// Handshake مجدد بیرون از قفل `SftpManager` — فقط قفل خود سشن موقع replace گرفته می‌شه.
+pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>) -> Result<(), String> {
+    let creds = {
+        let guard = entry.lock().unwrap();
+        guard.reconnect.clone()
+    };
+    let key_path = creds.private_key_path.as_deref().map(std::path::Path::new);
+    let cfg = ssh::SshConfig {
+        hostname: &creds.hostname,
+        port: creds.port,
+        username: &creds.username,
+        password: creds.password.as_deref(),
+        key_path,
+    };
+    fn silent_log(_stage: &str, _msg: &str) {}
+    let session = ssh::connect(&cfg, silent_log)?;
+    entry.lock().unwrap().replace_session(session);
+    Ok(())
 }
 
 #[cfg(test)]
