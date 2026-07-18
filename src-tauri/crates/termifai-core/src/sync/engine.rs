@@ -4,11 +4,17 @@ use crate::model::snippets::{Snippet, SnippetGroup};
 use crate::model::ssh_keys::SshKey;
 use crate::model::tombstones::{EntityKind, Tombstone};
 use crate::sync::backend::{SyncBackend, SyncError};
+use crate::sync::collections::{
+    assemble_payload, build_collection_hashes, decrypt_collection, encrypt_collection,
+    index_integrity_hash, CollectionKind, CollectionMeta, MANIFEST_FORMAT_V2,
+};
 use crate::sync::merge::{merge_entities, merge_settings, union_tombstones};
 use crate::sync::payload::{
-    b64_decode, b64_encode, decrypt_payload, default_kdf_params, derive_sync_key, encrypt_payload,
-    random_sync_salt, sha256_hex, Manifest, SettingsPayload, SyncPayload, PAYLOAD_FORMAT_VERSION,
+    b64_decode, b64_encode, decrypt_payload, default_kdf_params, derive_sync_key,
+    payload_content_hash, random_sync_salt, sha256_hex, Manifest, SettingsPayload, SyncPayload,
+    PAYLOAD_FORMAT_VERSION,
 };
+use std::collections::BTreeMap;
 
 const MAX_CONFLICT_RETRIES: u32 = 3;
 
@@ -40,6 +46,15 @@ pub struct SyncOutcome {
     pub settings: SettingsPayload,
     pub tombstones: Vec<Tombstone>,
     pub blob_version: u64,
+    /// True when a new ciphertext was uploaded (version bumped).
+    pub uploaded: bool,
+    /// True when merged state differs from the local snapshot that went in —
+    /// callers should rewrite local stores only when this is set.
+    pub local_changed: bool,
+    /// Collection names downloaded this cycle (Phase C diagnostics).
+    pub collections_downloaded: Vec<String>,
+    /// Collection names uploaded this cycle (Phase C diagnostics).
+    pub collections_uploaded: Vec<String>,
 }
 
 /// Pure merge step, exposed for the foreign-vault-merge flow (1.7-B) which
@@ -120,6 +135,10 @@ pub fn merge_snapshot(local: &LocalSnapshot, remote: Option<SyncPayload>) -> Syn
         settings,
         tombstones,
         blob_version: 0, // filled in by run_sync once the store succeeds
+        uploaded: false,
+        local_changed: false,
+        collections_downloaded: vec![],
+        collections_uploaded: vec![],
     }
 }
 
@@ -129,16 +148,92 @@ fn now_iso() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
-/// Runs one full sync cycle against `backend`: fetch → decrypt → merge →
-/// encrypt → store, retrying on a lost compare-and-swap race up to
-/// `MAX_CONFLICT_RETRIES` times (merge is commutative/idempotent, so a retry
-/// after a fresh fetch always converges).
+fn snapshot_as_payload(local: &LocalSnapshot) -> SyncPayload {
+    SyncPayload {
+        format_version: PAYLOAD_FORMAT_VERSION,
+        exported_at: String::new(),
+        device_id: String::new(),
+        hosts: local.hosts.clone(),
+        groups: local.groups.clone(),
+        snippets: local.snippets.clone(),
+        snippet_groups: local.snippet_groups.clone(),
+        port_forwards: local.port_forwards.clone(),
+        ssh_keys: local.ssh_keys.clone(),
+        settings: local.settings.clone(),
+        tombstones: local.tombstones.clone(),
+    }
+}
+
+fn outcome_as_payload(outcome: &SyncOutcome) -> SyncPayload {
+    SyncPayload {
+        format_version: PAYLOAD_FORMAT_VERSION,
+        exported_at: String::new(),
+        device_id: String::new(),
+        hosts: outcome.hosts.clone(),
+        groups: outcome.groups.clone(),
+        snippets: outcome.snippets.clone(),
+        snippet_groups: outcome.snippet_groups.clone(),
+        port_forwards: outcome.port_forwards.clone(),
+        ssh_keys: outcome.ssh_keys.clone(),
+        settings: outcome.settings.clone(),
+        tombstones: outcome.tombstones.clone(),
+    }
+}
+
+/// Sort entity vectors the same way `merge_entities` does so a local gather
+/// and a post-merge outcome hash the same when content matches.
+fn normalize_payload_for_hash(payload: &mut SyncPayload) {
+    payload.hosts.sort_by(|a, b| a.id.cmp(&b.id));
+    payload.groups.sort_by(|a, b| a.id.cmp(&b.id));
+    payload.snippets.sort_by(|a, b| a.id.cmp(&b.id));
+    payload.snippet_groups.sort_by(|a, b| a.id.cmp(&b.id));
+    payload.port_forwards.sort_by(|a, b| a.id.cmp(&b.id));
+    if let Some(keys) = payload.ssh_keys.as_mut() {
+        keys.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+    payload.tombstones.sort_by(|a, b| a.id.cmp(&b.id));
+}
+
+fn content_hash_of(mut payload: SyncPayload) -> String {
+    normalize_payload_for_hash(&mut payload);
+    payload_content_hash(&payload)
+}
+
+/// Runs one full sync cycle: fetch → delta-download changed collections →
+/// merge → delta-upload only dirty collections. Retries on CAS conflict.
 pub fn run_sync(
     backend: &dyn SyncBackend,
     local: LocalSnapshot,
     master_password: &str,
     vault_id: &str,
 ) -> Result<SyncOutcome, SyncError> {
+    let local_payload = snapshot_as_payload(&local);
+    let local_hash = content_hash_of(local_payload.clone());
+    let local_col_hashes = build_collection_hashes(&local_payload)?;
+
+    // Fast path: whole-vault content hash already matches.
+    if let Some(manifest) = backend.fetch_manifest()? {
+        if manifest
+            .content_hash
+            .as_deref()
+            .is_some_and(|h| h == local_hash)
+        {
+            let mut outcome = merge_snapshot(&local, None);
+            outcome.hosts = local.hosts;
+            outcome.groups = local.groups;
+            outcome.snippets = local.snippets;
+            outcome.snippet_groups = local.snippet_groups;
+            outcome.port_forwards = local.port_forwards;
+            outcome.ssh_keys = local.ssh_keys;
+            outcome.settings = local.settings;
+            outcome.tombstones = local.tombstones;
+            outcome.blob_version = manifest.blob_version;
+            outcome.uploaded = false;
+            outcome.local_changed = false;
+            return Ok(outcome);
+        }
+    }
+
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -151,39 +246,41 @@ pub fn run_sync(
         let sync_salt = b64_decode(&sync_salt_b64)?;
         let key = derive_sync_key(master_password, &sync_salt)?;
 
-        let remote_payload = match &remote_manifest {
-            Some(_) => {
-                let blob = backend.fetch_blob()?;
-                let blob_str = String::from_utf8(blob)
-                    .map_err(|_| SyncError::Backend("blob was not valid UTF-8".to_string()))?;
-                Some(decrypt_payload(&key, &blob_str)?)
-            }
-            None => None,
-        };
+        let (remote_payload, downloaded) =
+            load_remote_payload(backend, &key, remote_manifest.as_ref(), &local_payload, &local_col_hashes)?;
+
+        let remote_hash = remote_payload.as_ref().map(|p| content_hash_of(p.clone()));
 
         let mut outcome = merge_snapshot(&local, remote_payload);
+        outcome.collections_downloaded = downloaded;
+        let merged_payload = outcome_as_payload(&outcome);
+        let merged_hash = content_hash_of(merged_payload.clone());
+        outcome.local_changed = merged_hash != local_hash;
 
-        let merged_payload = SyncPayload {
-            format_version: PAYLOAD_FORMAT_VERSION,
-            exported_at: now_iso(),
-            device_id: local.device_id.clone(),
-            hosts: outcome.hosts.clone(),
-            groups: outcome.groups.clone(),
-            snippets: outcome.snippets.clone(),
-            snippet_groups: outcome.snippet_groups.clone(),
-            port_forwards: outcome.port_forwards.clone(),
-            ssh_keys: outcome.ssh_keys.clone(),
-            settings: outcome.settings.clone(),
-            tombstones: outcome.tombstones.clone(),
-        };
+        if remote_hash.as_deref() == Some(merged_hash.as_str()) {
+            if let Some(m) = &remote_manifest {
+                outcome.blob_version = m.blob_version;
+                outcome.uploaded = false;
+                return Ok(outcome);
+            }
+        }
 
-        let blob_str = encrypt_payload(&key, &merged_payload)?;
-        let blob_bytes = blob_str.into_bytes();
+        let mut upload_payload = merged_payload;
+        upload_payload.format_version = PAYLOAD_FORMAT_VERSION;
+        upload_payload.exported_at = now_iso();
+        upload_payload.device_id = local.device_id.clone();
+
         let expected_version = remote_manifest.as_ref().map(|m| m.blob_version);
         let new_version = expected_version.unwrap_or(0) + 1;
 
+        let (changed, index) = prepare_delta_upload(
+            &key,
+            &upload_payload,
+            remote_manifest.as_ref(),
+        )?;
+
         let manifest = Manifest {
-            format_version: PAYLOAD_FORMAT_VERSION,
+            format_version: MANIFEST_FORMAT_V2,
             vault_id: vault_id.to_string(),
             blob_version: new_version,
             updated_at: now_iso(),
@@ -191,18 +288,137 @@ pub fn run_sync(
             device_name: local.device_name.clone(),
             kdf: default_kdf_params(),
             sync_salt: sync_salt_b64,
-            blob_sha256: sha256_hex(&blob_bytes),
+            blob_sha256: index_integrity_hash(&index),
+            content_hash: Some(merged_hash),
+            collections: index,
         };
 
-        match backend.store(&manifest, &blob_bytes, expected_version) {
+        let uploaded_names: Vec<String> = changed.iter().map(|(n, _)| n.clone()).collect();
+
+        match backend.store_delta(&manifest, &changed, expected_version) {
             Ok(()) => {
                 outcome.blob_version = new_version;
+                outcome.uploaded = !uploaded_names.is_empty();
+                outcome.collections_uploaded = uploaded_names;
                 return Ok(outcome);
             }
             Err(SyncError::Conflict) if attempt < MAX_CONFLICT_RETRIES => continue,
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Load remote state: prefer collection delta; fall back to legacy `vault.blob`.
+fn load_remote_payload(
+    backend: &dyn SyncBackend,
+    key: &crate::crypto::VaultKey,
+    remote_manifest: Option<&Manifest>,
+    local_payload: &SyncPayload,
+    local_col_hashes: &BTreeMap<CollectionKind, String>,
+) -> Result<(Option<SyncPayload>, Vec<String>), SyncError> {
+    let Some(manifest) = remote_manifest else {
+        return Ok((None, vec![]));
+    };
+
+    if !manifest.collections.is_empty() {
+        let mut pieces = BTreeMap::new();
+        let mut downloaded = Vec::new();
+        for kind in CollectionKind::ALL {
+            let name = kind.as_str();
+            let remote_hash = manifest
+                .collections
+                .get(name)
+                .map(|m| m.content_hash.as_str());
+            let local_hash = local_col_hashes.get(&kind).map(|s| s.as_str());
+
+            if kind == CollectionKind::SshKeys && local_payload.ssh_keys.is_none() {
+                // این دستگاه کلیدها رو سینک نمی‌کنه — remote رو هم نادیده بگیر
+                continue;
+            }
+
+            if remote_hash.is_some() && remote_hash == local_hash {
+                // اسلایس یکسانه — از local به‌عنوان remote استفاده کن (دانلود لازم نیست)
+                let mut piece = SyncPayload::default();
+                crate::sync::collections::merge_collection_into(
+                    &mut piece,
+                    kind,
+                    local_payload.clone(),
+                );
+                if kind == CollectionKind::SshKeys {
+                    piece.ssh_keys = local_payload.ssh_keys.clone();
+                }
+                pieces.insert(kind, piece);
+                continue;
+            }
+
+            if remote_hash.is_none() {
+                continue;
+            }
+
+            match backend.fetch_collection(name) {
+                Ok(bytes) => {
+                    let piece = decrypt_collection(key, kind, &bytes)?;
+                    pieces.insert(kind, piece);
+                    downloaded.push(name.to_string());
+                }
+                Err(SyncError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let assembled = assemble_payload(pieces, manifest.device_id.clone());
+        return Ok((Some(assembled), downloaded));
+    }
+
+    // Legacy monolith
+    let blob = backend.fetch_blob()?;
+    let blob_str = String::from_utf8(blob)
+        .map_err(|_| SyncError::Backend("blob was not valid UTF-8".to_string()))?;
+    let payload = decrypt_payload(key, &blob_str)?;
+    Ok((Some(payload), vec!["vault".to_string()]))
+}
+
+fn prepare_delta_upload(
+    key: &crate::crypto::VaultKey,
+    merged: &SyncPayload,
+    remote_manifest: Option<&Manifest>,
+) -> Result<(Vec<(String, Vec<u8>)>, BTreeMap<String, CollectionMeta>), SyncError> {
+    let mut changed = Vec::new();
+    let mut index = BTreeMap::new();
+    let remote_index = remote_manifest.map(|m| &m.collections);
+
+    for kind in CollectionKind::ALL {
+        if kind == CollectionKind::SshKeys && merged.ssh_keys.is_none() {
+            // کلیدها رو دست نزن — ایندکس remote رو حفظ کن
+            if let Some(remote) = remote_index {
+                if let Some(meta) = remote.get(kind.as_str()) {
+                    index.insert(kind.as_str().to_string(), meta.clone());
+                }
+            }
+            continue;
+        }
+
+        let content_hash = crate::sync::collections::collection_content_hash(kind, merged)?;
+        let remote_hash = remote_index
+            .and_then(|idx| idx.get(kind.as_str()))
+            .map(|m| m.content_hash.as_str());
+
+        if remote_hash == Some(content_hash.as_str()) {
+            if let Some(meta) = remote_index.and_then(|idx| idx.get(kind.as_str())) {
+                index.insert(kind.as_str().to_string(), meta.clone());
+            }
+            continue;
+        }
+
+        let bytes = encrypt_collection(key, kind, merged)?;
+        let meta = CollectionMeta {
+            content_hash: content_hash.clone(),
+            blob_sha256: sha256_hex(&bytes),
+        };
+        index.insert(kind.as_str().to_string(), meta);
+        changed.push((kind.as_str().to_string(), bytes));
+    }
+
+    Ok((changed, index))
 }
 
 /// Used by the restore/link flows (1.7): decrypt whatever's on the remote
@@ -216,6 +432,26 @@ pub fn fetch_remote_payload(
     let manifest = backend.fetch_manifest()?.ok_or(SyncError::NotFound)?;
     let sync_salt = b64_decode(&manifest.sync_salt)?;
     let key = derive_sync_key(master_password, &sync_salt)?;
+
+    if !manifest.collections.is_empty() {
+        let mut pieces = BTreeMap::new();
+        for kind in CollectionKind::ALL {
+            let name = kind.as_str();
+            if !manifest.collections.contains_key(name) {
+                continue;
+            }
+            match backend.fetch_collection(name) {
+                Ok(bytes) => {
+                    pieces.insert(kind, decrypt_collection(&key, kind, &bytes)?);
+                }
+                Err(SyncError::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let payload = assemble_payload(pieces, manifest.device_id.clone());
+        return Ok((manifest, payload));
+    }
+
     let blob = backend.fetch_blob()?;
     let blob_str =
         String::from_utf8(blob).map_err(|_| SyncError::Backend("blob was not valid UTF-8".to_string()))?;
@@ -277,8 +513,63 @@ mod tests {
 
         let outcome = run_sync(&backend, local, "hunter2", "default").unwrap();
         assert_eq!(outcome.blob_version, 1);
+        assert!(outcome.uploaded);
         assert_eq!(outcome.hosts.len(), 1);
         assert_eq!(outcome.hosts[0].id, "h1");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn noop_resync_does_not_bump_blob_version() {
+        let dir = tmp_dir("noop");
+        let backend = LocalDirBackend::new(&dir);
+        let local = snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]);
+
+        let first = run_sync(&backend, local.clone(), "hunter2", "default").unwrap();
+        assert_eq!(first.blob_version, 1);
+        assert!(first.uploaded);
+
+        // ده بار پشت سر هم بدون تغییر — نسخه باید همون ۱ بمونه
+        for _ in 0..10 {
+            let again = run_sync(&backend, local.clone(), "hunter2", "default").unwrap();
+            assert_eq!(again.blob_version, 1);
+            assert!(!again.uploaded);
+            assert!(!again.local_changed);
+        }
+
+        let manifest = backend.fetch_manifest().unwrap().unwrap();
+        assert_eq!(manifest.blob_version, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn delta_upload_only_touches_changed_collections() {
+        let dir = tmp_dir("delta-only");
+        let backend = LocalDirBackend::new(&dir);
+
+        let first = run_sync(
+            &backend,
+            snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]),
+            "hunter2",
+            "default",
+        )
+        .unwrap();
+        assert!(first.collections_uploaded.contains(&"hosts".to_string()));
+        let hosts_bytes = backend.fetch_collection("hosts").unwrap();
+
+        // فقط settings عوض شده — hosts نباید دوباره آپلود بشه
+        let mut local = snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]);
+        local.settings.app_theme = crate::sync::payload::SettingsBlob {
+            value: Some(serde_json::json!("dark")),
+            updated_at: Some("2026-07-01T00:00:00Z".into()),
+        };
+        let second = run_sync(&backend, local, "hunter2", "default").unwrap();
+        assert_eq!(second.blob_version, 2);
+        assert!(second.collections_uploaded.contains(&"settings".to_string()));
+        assert!(!second.collections_uploaded.contains(&"hosts".to_string()));
+        assert_eq!(backend.fetch_collection("hosts").unwrap(), hosts_bytes);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -293,12 +584,15 @@ mod tests {
         run_sync(&backend, device_a, "hunter2", "default").unwrap();
 
         // Device B, starting empty, syncs against the same folder and should
-        // adopt device A's host.
+        // adopt device A's host — content matches remote after merge, so no
+        // upload / version bump is needed.
         let device_b = snapshot("dev-b", vec![]);
         let outcome_b = run_sync(&backend, device_b, "hunter2", "default").unwrap();
         assert_eq!(outcome_b.hosts.len(), 1);
         assert_eq!(outcome_b.hosts[0].id, "h1");
-        assert_eq!(outcome_b.blob_version, 2);
+        assert_eq!(outcome_b.blob_version, 1);
+        assert!(!outcome_b.uploaded);
+        assert!(outcome_b.local_changed);
 
         // Device B adds a second host and syncs again.
         let mut device_b_hosts = outcome_b.hosts.clone();
@@ -308,14 +602,19 @@ mod tests {
             device_id: "dev-b".to_string(),
             ..Default::default()
         };
-        run_sync(&backend, device_b_again, "hunter2", "default").unwrap();
+        let upload_b = run_sync(&backend, device_b_again, "hunter2", "default").unwrap();
+        assert_eq!(upload_b.blob_version, 2);
+        assert!(upload_b.uploaded);
 
-        // Device A syncs again and should now see both hosts.
+        // Device A syncs again and should now see both hosts (pull-only).
         let device_a_again = snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]);
         let outcome_a = run_sync(&backend, device_a_again, "hunter2", "default").unwrap();
         let mut ids: Vec<&str> = outcome_a.hosts.iter().map(|h| h.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["h1", "h2"]);
+        assert_eq!(outcome_a.blob_version, 2);
+        assert!(!outcome_a.uploaded);
+        assert!(outcome_a.local_changed);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -327,7 +626,8 @@ mod tests {
         let device_a = snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]);
         run_sync(&backend, device_a, "correct-horse", "default").unwrap();
 
-        let device_b = snapshot("dev-b", vec![]);
+        // Different local content forces the decrypt path (fast-path hash miss).
+        let device_b = snapshot("dev-b", vec![host("h2", "other", "2026-01-02T00:00:00Z")]);
         let result = run_sync(&backend, device_b, "wrong-password", "default");
         assert!(matches!(result, Err(SyncError::Crypto(_))));
 

@@ -209,6 +209,8 @@ export function saveShortcuts(shortcuts: ShortcutMap) {
   void publish(shortcutsChangedEvent, shortcuts).catch(() => {
     /* Non-Tauri environments fall back to localStorage + storage events. */
   });
+
+  void import("@/lib/sync-settings-cache").then((m) => m.pushSyncSettingsCache());
 }
 
 export function resetShortcut(shortcuts: ShortcutMap, actionId: ShortcutActionId) {

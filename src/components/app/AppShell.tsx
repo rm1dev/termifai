@@ -5,6 +5,7 @@ import { posixShellQuote } from "@/lib/shell-quote";
 import { subscribe } from "@/lib/api/transport";
 import { forceQuitApp, openSettingsWindow, quitApp, takePendingOpenFolders } from "@/lib/api/terminal";
 import { listSshKeys } from "@/lib/api/ssh-keys";
+import { pushSyncSettingsCache } from "@/lib/sync-settings-cache";
 import {
   Server,
   Network,
@@ -293,6 +294,9 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
       vaultStatus()
         .then((status: VaultStatus) => {
           setVaultInfo({ initialized: status.initialized, unlocked: status.unlocked });
+          if (status.unlocked) {
+            pushSyncSettingsCache();
+          }
         })
         .catch(console.error);
 

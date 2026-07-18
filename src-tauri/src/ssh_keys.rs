@@ -107,6 +107,7 @@ pub fn generate_ssh_key(app: &AppHandle, request: GenerateSshKeyRequest) -> Resu
         public_key_path,
     })?;
     save_metadata(app, &key)?;
+    crate::sync::mark_dirty(app);
     Ok(key)
 }
 
@@ -164,6 +165,7 @@ pub fn import_ssh_key(app: &AppHandle, request: ImportSshKeyRequest) -> Result<S
         public_key_path,
     })?;
     save_metadata(app, &key)?;
+    crate::sync::mark_dirty(app);
     Ok(key)
 }
 
@@ -184,6 +186,7 @@ pub fn remove_ssh_keys(app: &AppHandle, ids: Vec<String>) -> Result<(), String> 
     }
 
     crate::tombstones::record(app, crate::tombstones::EntityKind::SshKey, &ids)?;
+    crate::sync::mark_dirty(app);
     Ok(())
 }
 
