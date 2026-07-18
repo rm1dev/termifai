@@ -74,7 +74,11 @@ pub trait SyncBackend: Send {
     /// `Ok(None)` means no sync has ever happened against this target.
     fn fetch_manifest(&self) -> Result<Option<Manifest>, SyncError>;
     /// Must only be called after `fetch_manifest` returned `Some`.
+    /// Legacy monolith blob (`vault.blob`). Prefer `fetch_collection` when the
+    /// manifest carries a collection index.
     fn fetch_blob(&self) -> Result<Vec<u8>, SyncError>;
+    /// Fetch one Phase-C collection file (`col-<name>.blob`).
+    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError>;
     /// `expected_blob_version = None` creates fresh; `Some(v)` is a
     /// compare-and-swap against the remote's current `blobVersion` where the
     /// backend supports it. A mismatch must return `Err(SyncError::Conflict)`.
@@ -84,6 +88,14 @@ pub trait SyncBackend: Send {
         blob: &[u8],
         expected_blob_version: Option<u64>,
     ) -> Result<(), SyncError>;
-    /// Deletes all remote sync data (manifest + blob) from the backend.
+    /// CAS + write only the changed collection blobs, then the manifest.
+    /// `changed` entries are `(collection_name, encrypted_bytes)`.
+    fn store_delta(
+        &self,
+        manifest: &Manifest,
+        changed: &[(String, Vec<u8>)],
+        expected_blob_version: Option<u64>,
+    ) -> Result<(), SyncError>;
+    /// Deletes all remote sync data (manifest + blob + collections) from the backend.
     fn wipe(&self) -> Result<(), SyncError>;
 }

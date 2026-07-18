@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use crate::sync::backend::{SyncBackend, SyncError, TokenStore};
+use crate::sync::collections::CollectionKind;
 use crate::sync::payload::Manifest;
 
 pub struct DropboxBackend {
@@ -252,7 +253,6 @@ impl SyncBackend for DropboxBackend {
             (Some(_), None) => return Err(SyncError::Conflict),
         };
 
-        // Upload blob first (no CAS needed for blob file, just overwrite it)
         upload_file(
             &self.client,
             &token,
@@ -261,7 +261,6 @@ impl SyncBackend for DropboxBackend {
             WriteMode::Overwrite,
         )?;
 
-        // Upload manifest (with CAS rev validation)
         let manifest_bytes = serde_json::to_vec_pretty(manifest)?;
         let mode = match rev {
             Some(r) => WriteMode::Update { update: r },
@@ -279,10 +278,102 @@ impl SyncBackend for DropboxBackend {
         Ok(())
     }
 
+    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+        let token = self.get_token()?;
+        let file_name = CollectionKind::from_str(name)
+            .map(|k| k.file_name())
+            .unwrap_or_else(|| format!("col-{name}.blob"));
+        let path = format!("/{file_name}");
+        let url = "https://content.dropboxapi.com/2/files/download";
+
+        #[derive(Serialize)]
+        struct DownloadArg {
+            path: String,
+        }
+        let arg = DownloadArg { path };
+        let arg_str = serde_json::to_string(&arg)?;
+
+        let res = self
+            .client
+            .post(url)
+            .bearer_auth(&token)
+            .header("Dropbox-API-Arg", arg_str)
+            .send()
+            .map_err(|e| SyncError::Backend(format!("Dropbox collection download failed: {e}")))?;
+
+        let status = res.status();
+        if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::NOT_FOUND {
+            return Err(SyncError::NotFound);
+        }
+        if !status.is_success() {
+            let err_text = res.text().unwrap_or_default();
+            if err_text.contains("path/not_found") {
+                return Err(SyncError::NotFound);
+            }
+            return Err(SyncError::Backend(format!(
+                "Dropbox collection download failed: {} - {}",
+                status, err_text
+            )));
+        }
+        Ok(res.bytes().map_err(|e| SyncError::Backend(e.to_string()))?.to_vec())
+    }
+
+    fn store_delta(
+        &self,
+        manifest: &Manifest,
+        changed: &[(String, Vec<u8>)],
+        expected_blob_version: Option<u64>,
+    ) -> Result<(), SyncError> {
+        let token = self.get_token()?;
+        let remote = self.fetch_manifest_with_rev()?;
+        let rev = match (expected_blob_version, remote.as_ref()) {
+            (None, None) => None,
+            (None, Some(_)) => return Err(SyncError::Conflict),
+            (Some(expected), Some((current, rev))) => {
+                if current.blob_version != expected {
+                    return Err(SyncError::Conflict);
+                }
+                Some(rev.clone())
+            }
+            (Some(_), None) => return Err(SyncError::Conflict),
+        };
+
+        for (name, bytes) in changed {
+            let file_name = CollectionKind::from_str(name)
+                .map(|k| k.file_name())
+                .unwrap_or_else(|| format!("col-{name}.blob"));
+            upload_file(
+                &self.client,
+                &token,
+                &format!("/{file_name}"),
+                bytes,
+                WriteMode::Overwrite,
+            )?;
+        }
+
+        let manifest_bytes = serde_json::to_vec_pretty(manifest)?;
+        let mode = match rev {
+            Some(r) => WriteMode::Update { update: r },
+            None => WriteMode::Add,
+        };
+        upload_file(
+            &self.client,
+            &token,
+            "/manifest.json",
+            &manifest_bytes,
+            mode,
+        )?;
+        let _ = delete_file(&self.client, &token, "/vault.blob");
+        Ok(())
+    }
+
     fn wipe(&self) -> Result<(), SyncError> {
         let token = self.get_token()?;
         let _ = delete_file(&self.client, &token, "/manifest.json");
         let _ = delete_file(&self.client, &token, "/vault.blob");
+        for kind in CollectionKind::ALL {
+            let _ = delete_file(&self.client, &token, &format!("/{}", kind.file_name()));
+        }
         Ok(())
     }
 }

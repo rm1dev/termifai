@@ -1,11 +1,26 @@
 use crate::AppState;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
-use termifai_core::model::sync_state::{migrate_sync_state, SyncBackendConfig, SyncState};
-use termifai_core::sync::{
-    self, LocalDirBackend, LocalSnapshot, Manifest, SettingsBlob, SettingsPayload, SyncBackend,
-    SyncError, SyncOutcome, TokenStore,
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use tauri::{AppHandle, Emitter, Manager};
+use termifai_core::model::sync_state::{
+    migrate_sync_state, CachedSettingsBlob, SettingsCache, SyncBackendConfig, SyncState,
 };
+use termifai_core::sync::{
+    self, CollectionKind, LocalDirBackend, LocalSnapshot, Manifest, SettingsBlob, SettingsPayload,
+    SyncBackend, SyncError, SyncOutcome, TokenStore,
+};
+
+fn sync_mutex() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+static SYNCING: AtomicBool = AtomicBool::new(false);
+
+pub fn is_syncing() -> bool {
+    SYNCING.load(Ordering::SeqCst)
+}
 
 // ── Request / response DTOs (Tauri command boundary) ──────────────────────────
 
@@ -26,6 +41,12 @@ pub struct SyncNowRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SyncNowResult {
     pub blob_version: u64,
+    /// True when a new remote blob was written (version bumped).
+    pub uploaded: bool,
+    /// True when local stores were rewritten from the merge result.
+    pub applied: bool,
+    pub collections_uploaded: Vec<String>,
+    pub collections_downloaded: Vec<String>,
     pub app_theme: SettingsBlob,
     pub terminal_appearance: SettingsBlob,
     pub shortcuts: SettingsBlob,
@@ -40,6 +61,21 @@ pub struct SyncStatusDto {
     pub sync_ssh_keys: bool,
     pub dirty: bool,
     pub device_id: Option<String>,
+    pub auto_sync: bool,
+    pub last_error: Option<String>,
+    pub syncing: bool,
+    pub last_sync_stats: Option<termifai_core::model::sync_state::SyncStats>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheSettingsRequest {
+    #[serde(default)]
+    pub app_theme: Option<SettingsBlob>,
+    #[serde(default)]
+    pub terminal_appearance: Option<SettingsBlob>,
+    #[serde(default)]
+    pub shortcuts: Option<SettingsBlob>,
 }
 
 #[derive(Deserialize)]
@@ -270,6 +306,11 @@ pub async fn sync_connect_provider(_app: AppHandle, provider: String) -> Result<
 }
 
 pub fn sync_set_config(app: &AppHandle, request: SetSyncConfigRequest) -> Result<(), String> {
+    // Switching away from (or between) SFTP targets should drop the badge on
+    // whichever host previously wore it — the new config may not be SFTP.
+    if !matches!(request.backend, SyncBackendConfig::Sftp { .. }) {
+        clear_sync_server_flags(app)?;
+    }
     let state = app.state::<AppState>();
     state
         .sync_state_store
@@ -280,8 +321,13 @@ pub fn sync_set_config(app: &AppHandle, request: SetSyncConfigRequest) -> Result
             s.last_synced_blob_version = 0;
             s.last_sync_at = None;
             s.dirty = true;
+            s.last_error = None;
         })
         .map_err(|e| e.to_string())?;
+    crate::sync_auto::note_dirty();
+    if crate::vault::is_unlocked() {
+        crate::sync_auto::request_sync_after_unlock();
+    }
     Ok(())
 }
 
@@ -296,6 +342,8 @@ pub fn sync_disconnect(app: &AppHandle, delete_remote: bool) -> Result<(), Strin
             wipe_remote(app, backend_config)?;
         }
     }
+    // Badge روی هاست sync server بعد از قطع باید برداشته بشه
+    clear_sync_server_flags(app)?;
     let state = app.state::<AppState>();
     state
         .sync_state_store
@@ -309,7 +357,188 @@ pub fn sync_disconnect(app: &AppHandle, delete_remote: bool) -> Result<(), Strin
     Ok(())
 }
 
+/// Marks the vault dirty so the next sync cycle knows local mutations exist.
+/// Safe to call even when sync is not configured — the flag is simply ignored.
+pub fn mark_dirty(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let mut marked = false;
+    let _ = state
+        .sync_state_store
+        .update_with_migration(migrate_sync_state, |s| {
+            if s.backend.is_some() {
+                s.dirty = true;
+                marked = true;
+            }
+        });
+    if marked {
+        crate::sync_auto::note_dirty();
+    }
+}
+
+pub fn set_auto_sync(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state
+        .sync_state_store
+        .update_with_migration(migrate_sync_state, |s| {
+            s.auto_sync = enabled;
+        })
+        .map_err(|e| e.to_string())?;
+    if enabled {
+        crate::sync_auto::request_sync_after_unlock();
+    }
+    Ok(())
+}
+
+pub fn cache_settings(app: &AppHandle, request: CacheSettingsRequest) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut touched = false;
+    state
+        .sync_state_store
+        .update_with_migration(migrate_sync_state, |s| {
+            if let Some(blob) = request.app_theme {
+                let next = to_cached_blob(blob);
+                if next != s.settings_cache.app_theme {
+                    s.settings_cache.app_theme = next;
+                    touched = true;
+                }
+            }
+            if let Some(blob) = request.terminal_appearance {
+                let next = to_cached_blob(blob);
+                if next != s.settings_cache.terminal_appearance {
+                    s.settings_cache.terminal_appearance = next;
+                    touched = true;
+                }
+            }
+            if let Some(blob) = request.shortcuts {
+                let next = to_cached_blob(blob);
+                if next != s.settings_cache.shortcuts {
+                    s.settings_cache.shortcuts = next;
+                    touched = true;
+                }
+            }
+            if touched && s.backend.is_some() {
+                s.dirty = true;
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    if touched {
+        crate::sync_auto::note_dirty();
+    }
+    Ok(())
+}
+
+pub fn set_last_error(app: &AppHandle, error: Option<String>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state
+        .sync_state_store
+        .update_with_migration(migrate_sync_state, |s| {
+            s.last_error = error;
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn to_cached_blob(blob: SettingsBlob) -> CachedSettingsBlob {
+    CachedSettingsBlob {
+        value: blob.value,
+        updated_at: blob.updated_at,
+    }
+}
+
+fn persist_settings_cache(app: &AppHandle, settings: &SettingsPayload) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state
+        .sync_state_store
+        .update_with_migration(migrate_sync_state, |s| {
+            s.settings_cache = SettingsCache {
+                app_theme: to_cached_blob(settings.app_theme.clone()),
+                terminal_appearance: to_cached_blob(settings.terminal_appearance.clone()),
+                shortcuts: to_cached_blob(settings.shortcuts.clone()),
+            };
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn sync_now(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowResult, String> {
+    let _guard = sync_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    SYNCING.store(true, Ordering::SeqCst);
+    let result = sync_now_inner(app, request);
+    SYNCING.store(false, Ordering::SeqCst);
+    emit_sync_finished(app, &result);
+    result
+}
+
+/// Like `sync_now`, but returns `None` immediately if another sync holds the lock
+/// (used by the background loop so ticks don't pile up behind a long upload).
+pub fn try_sync_now(app: &AppHandle, request: SyncNowRequest) -> Option<Result<SyncNowResult, String>> {
+    let Ok(_guard) = sync_mutex().try_lock() else {
+        return None;
+    };
+    SYNCING.store(true, Ordering::SeqCst);
+    let result = sync_now_inner(app, request);
+    SYNCING.store(false, Ordering::SeqCst);
+    emit_sync_finished(app, &result);
+    Some(result)
+}
+
+fn emit_sync_finished(app: &AppHandle, result: &Result<SyncNowResult, String>) {
+    let status = load_state(app).ok();
+    match result {
+        Ok(outcome) => {
+            let _ = app.emit(
+                "sync:activity",
+                crate::sync_auto::SyncActivityEvent {
+                    phase: "ok",
+                    uploaded: outcome.uploaded,
+                    applied: outcome.applied,
+                    blob_version: outcome.blob_version,
+                    last_sync_at: status.as_ref().and_then(|s| s.last_sync_at.clone()),
+                    error: None,
+                    dirty: status.as_ref().map(|s| s.dirty).unwrap_or(false),
+                    auto_sync: status.as_ref().map(|s| s.auto_sync).unwrap_or(true),
+                },
+            );
+        }
+        Err(err) => {
+            let _ = set_last_error(app, Some(err.clone()));
+            let _ = app.emit(
+                "sync:activity",
+                crate::sync_auto::SyncActivityEvent {
+                    phase: "error",
+                    uploaded: false,
+                    applied: false,
+                    blob_version: status
+                        .as_ref()
+                        .map(|s| s.last_synced_blob_version)
+                        .unwrap_or(0),
+                    last_sync_at: status.as_ref().and_then(|s| s.last_sync_at.clone()),
+                    error: Some(err.clone()),
+                    dirty: status.as_ref().map(|s| s.dirty).unwrap_or(false),
+                    auto_sync: status.as_ref().map(|s| s.auto_sync).unwrap_or(true),
+                },
+            );
+        }
+    }
+}
+
+fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowResult, String> {
+    let _ = app.emit(
+        "sync:activity",
+        crate::sync_auto::SyncActivityEvent {
+            phase: "syncing",
+            uploaded: false,
+            applied: false,
+            blob_version: 0,
+            last_sync_at: None,
+            error: None,
+            dirty: true,
+            auto_sync: true,
+        },
+    );
+
     let sync_state = load_state(app)?;
     let backend_config = sync_state
         .backend
@@ -318,11 +547,26 @@ pub fn sync_now(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowResul
     let master_password = resolve_master_password(request.master_password)?;
     let device_id = ensure_device_id(app)?;
 
+    // اگه فرانت تنظیمات نفرستاده، از کش دیسک استفاده کن (مسیر auto-sync)
     let settings = SettingsPayload {
-        app_theme: request.app_theme.unwrap_or_default(),
-        terminal_appearance: request.terminal_appearance.unwrap_or_default(),
-        shortcuts: request.shortcuts.unwrap_or_default(),
+        app_theme: request
+            .app_theme
+            .unwrap_or_else(|| SettingsBlob {
+                value: sync_state.settings_cache.app_theme.value.clone(),
+                updated_at: sync_state.settings_cache.app_theme.updated_at.clone(),
+            }),
+        terminal_appearance: request
+            .terminal_appearance
+            .unwrap_or_else(|| SettingsBlob {
+                value: sync_state.settings_cache.terminal_appearance.value.clone(),
+                updated_at: sync_state.settings_cache.terminal_appearance.updated_at.clone(),
+            }),
+        shortcuts: request.shortcuts.unwrap_or_else(|| SettingsBlob {
+            value: sync_state.settings_cache.shortcuts.value.clone(),
+            updated_at: sync_state.settings_cache.shortcuts.updated_at.clone(),
+        }),
     };
+    let _ = persist_settings_cache(app, &settings);
 
     let local = gather_local_snapshot(
         app,
@@ -341,14 +585,32 @@ pub fn sync_now(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowResul
     )
     .map_err(|e| e.to_string())?;
 
-    apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
+    let applied = if outcome.local_changed {
+        apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
+        true
+    } else {
+        false
+    };
 
     let blob_version = outcome.blob_version;
     let result = SyncNowResult {
         blob_version,
+        uploaded: outcome.uploaded,
+        applied,
+        collections_uploaded: outcome.collections_uploaded.clone(),
+        collections_downloaded: outcome.collections_downloaded.clone(),
         app_theme: outcome.settings.app_theme.clone(),
         terminal_appearance: outcome.settings.terminal_appearance.clone(),
         shortcuts: outcome.settings.shortcuts.clone(),
+    };
+
+    let synced_at = now_iso();
+    let stats = termifai_core::model::sync_state::SyncStats {
+        uploaded: outcome.uploaded,
+        applied,
+        collections_uploaded: outcome.collections_uploaded,
+        collections_downloaded: outcome.collections_downloaded,
+        at: synced_at.clone(),
     };
 
     let state = app.state::<AppState>();
@@ -356,8 +618,15 @@ pub fn sync_now(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowResul
         .sync_state_store
         .update_with_migration(migrate_sync_state, |s| {
             s.last_synced_blob_version = blob_version;
-            s.last_sync_at = Some(now_iso());
+            s.last_sync_at = Some(synced_at);
             s.dirty = false;
+            s.last_error = None;
+            s.last_sync_stats = Some(stats);
+            s.settings_cache = SettingsCache {
+                app_theme: to_cached_blob(result.app_theme.clone()),
+                terminal_appearance: to_cached_blob(result.terminal_appearance.clone()),
+                shortcuts: to_cached_blob(result.shortcuts.clone()),
+            };
         })
         .map_err(|e| e.to_string())?;
 
@@ -480,6 +749,8 @@ pub fn sync_import_foreign(
         kdf: sync::default_kdf_params(),
         sync_salt: sync::b64_encode(&new_salt),
         blob_sha256: sync::sha256_hex(&blob_bytes),
+        content_hash: Some(sync::payload_content_hash(&merged_payload)),
+        collections: Default::default(),
     };
     backend
         .store(&new_manifest, &blob_bytes, Some(manifest.blob_version))
@@ -519,6 +790,10 @@ fn to_status_dto(state: &SyncState) -> SyncStatusDto {
         sync_ssh_keys: state.sync_ssh_keys,
         dirty: state.dirty,
         device_id: state.device_id.clone(),
+        auto_sync: state.auto_sync,
+        last_error: state.last_error.clone(),
+        syncing: is_syncing(),
+        last_sync_stats: state.last_sync_stats.clone(),
     }
 }
 
@@ -683,21 +958,33 @@ fn gather_local_snapshot(
 }
 
 /// Writes a merged result back to every local store: hosts (re-encrypting
-/// plaintext passwords with the local DEK), groups, snippets, port forwards,
-/// SSH keys (opt-in only), and the merged tombstone list.
+/// plaintext passwords with the local DEK only when the secret changed),
+/// groups, snippets (including `.sh` bodies), port forwards, SSH keys
+/// (opt-in only), and the merged tombstone list.
 fn apply_outcome(
     app: &AppHandle,
     outcome: &SyncOutcome,
     sync_ssh_keys: bool,
 ) -> Result<(), String> {
+    let existing_hosts = crate::hosts::list_hosts(app)?.hosts;
     let mut hosts = outcome.hosts.clone();
     for host in hosts.iter_mut() {
         if let Some(plaintext) = host.password.take() {
-            if !plaintext.is_empty() {
-                let guard = crate::vault::current_key();
-                if let Some(key) = guard.as_ref() {
-                    host.password = termifai_core::crypto::encrypt_field(key, &plaintext).ok();
+            if plaintext.is_empty() {
+                continue;
+            }
+            // اگه پسورد منطقی عوض نشده، همون ciphertext قبلی رو نگه می‌داریم
+            // تا هر sync بی‌خودی vault محلی رو کثیف نکنه.
+            if let Some(existing) = existing_hosts.iter().find(|h| h.id == host.id) {
+                if crate::hosts::decrypt_host_password(existing).as_deref() == Some(plaintext.as_str())
+                {
+                    host.password = existing.password.clone();
+                    continue;
                 }
+            }
+            let guard = crate::vault::current_key();
+            if let Some(key) = guard.as_ref() {
+                host.password = termifai_core::crypto::encrypt_field(key, &plaintext).ok();
             }
         }
     }
@@ -712,18 +999,11 @@ fn apply_outcome(
         })
         .map_err(|e| e.to_string())?;
 
-    let snippets = outcome.snippets.clone();
-    let snippet_groups = outcome.snippet_groups.clone();
-    state
-        .snippets_store
-        .update_with_migration(
-            termifai_core::model::snippets::migrate_snippets_vault,
-            |vault| {
-                vault.snippets = snippets.clone();
-                vault.groups = snippet_groups.clone();
-            },
-        )
-        .map_err(|e| e.to_string())?;
+    crate::snippets::apply_synced_snippets(
+        app,
+        outcome.snippets.clone(),
+        outcome.snippet_groups.clone(),
+    )?;
 
     let port_forwards = outcome.port_forwards.clone();
     state
@@ -764,6 +1044,22 @@ fn apply_outcome(
     Ok(())
 }
 
+/// Clears the `syncServer` badge from every host. Used on disconnect / when
+/// switching to a non-SFTP backend. Does **not** mark the vault dirty — the
+/// badge is a local UI flag for the active sync target, not user content.
+fn clear_sync_server_flags(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    state
+        .hosts_store
+        .update_with_migration(termifai_core::model::hosts::migrate_hosts_vault, |vault| {
+            for host in vault.hosts.iter_mut() {
+                host.sync_server = None;
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 fn write_payload_to_local_stores(
     app: &AppHandle,
     payload: &termifai_core::sync::SyncPayload,
@@ -778,6 +1074,10 @@ fn write_payload_to_local_stores(
         settings: payload.settings.clone(),
         tombstones: payload.tombstones.clone(),
         blob_version: 0,
+        uploaded: false,
+        local_changed: true,
+        collections_downloaded: vec![],
+        collections_uploaded: vec![],
     };
     apply_outcome(app, &outcome, false)
 }
@@ -965,6 +1265,24 @@ impl SyncBackend for SftpSyncBackend {
         Ok(contents)
     }
 
+    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+        let session = self.connect().map_err(SyncError::Backend)?;
+        let sftp = session
+            .sftp()
+            .map_err(|e| SyncError::Backend(e.to_string()))?;
+        let remote_dir = self.resolve_remote_dir(&sftp)?;
+        let file_name = CollectionKind::from_str(name)
+            .map(|k| k.file_name())
+            .unwrap_or_else(|| format!("col-{name}.blob"));
+        let path = remote_dir.join(file_name);
+        let mut file = sftp.open(&path).map_err(|_| SyncError::NotFound)?;
+        use std::io::Read;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|e| SyncError::Io(e.to_string()))?;
+        Ok(contents)
+    }
+
     fn store(
         &self,
         manifest: &Manifest,
@@ -1047,6 +1365,81 @@ impl SyncBackend for SftpSyncBackend {
         Ok(())
     }
 
+    fn store_delta(
+        &self,
+        manifest: &Manifest,
+        changed: &[(String, Vec<u8>)],
+        expected_blob_version: Option<u64>,
+    ) -> Result<(), SyncError> {
+        let session = self.connect().map_err(SyncError::Backend)?;
+        let sftp = session
+            .sftp()
+            .map_err(|e| SyncError::Backend(e.to_string()))?;
+
+        let remote_dir = self.ensure_remote_dir(&sftp)?;
+        let lock_path = remote_dir.join(".lock");
+        let manifest_path = remote_dir.join("manifest.json");
+
+        self.acquire_lock(&sftp, &lock_path)?;
+
+        let mut conflict = false;
+        let current_manifest = sftp.open(&manifest_path).ok().and_then(|mut f| {
+            use std::io::Read;
+            let mut contents = String::new();
+            f.read_to_string(&mut contents).ok()?;
+            serde_json::from_str::<Manifest>(&contents).ok()
+        });
+
+        match (expected_blob_version, current_manifest.as_ref()) {
+            (None, None) => {}
+            (None, Some(_)) => conflict = true,
+            (Some(expected), Some(current)) if current.blob_version != expected => conflict = true,
+            (Some(_), None) => conflict = true,
+            _ => {}
+        }
+
+        if conflict {
+            let _ = sftp.unlink(&lock_path);
+            return Err(SyncError::Conflict);
+        }
+
+        use std::io::Write;
+        for (name, bytes) in changed {
+            let file_name = CollectionKind::from_str(name)
+                .map(|k| k.file_name())
+                .unwrap_or_else(|| format!("col-{name}.blob"));
+            let path = remote_dir.join(&file_name);
+            let tmp = remote_dir.join(format!("{file_name}.tmp"));
+            {
+                let mut f = sftp
+                    .create(&tmp)
+                    .map_err(|e| SyncError::Backend(e.to_string()))?;
+                f.write_all(bytes)
+                    .map_err(|e| SyncError::Io(e.to_string()))?;
+            }
+            let _ = sftp.unlink(&path);
+            sftp.rename(&tmp, &path, None)
+                .map_err(|e| SyncError::Backend(e.to_string()))?;
+        }
+
+        let manifest_tmp = remote_dir.join("manifest.json.tmp");
+        {
+            let manifest_bytes = serde_json::to_vec_pretty(manifest)?;
+            let mut f = sftp
+                .create(&manifest_tmp)
+                .map_err(|e| SyncError::Backend(e.to_string()))?;
+            f.write_all(&manifest_bytes)
+                .map_err(|e| SyncError::Io(e.to_string()))?;
+        }
+        let _ = sftp.unlink(&manifest_path);
+        sftp.rename(&manifest_tmp, &manifest_path, None)
+            .map_err(|e| SyncError::Backend(e.to_string()))?;
+
+        let _ = sftp.unlink(&remote_dir.join("vault.blob"));
+        let _ = sftp.unlink(&lock_path);
+        Ok(())
+    }
+
     fn wipe(&self) -> Result<(), SyncError> {
         let session = self.connect().map_err(SyncError::Backend)?;
         let sftp = session
@@ -1057,6 +1450,9 @@ impl SyncBackend for SftpSyncBackend {
         let _ = sftp.unlink(&remote_dir.join("manifest.json"));
         let _ = sftp.unlink(&remote_dir.join("vault.blob"));
         let _ = sftp.unlink(&remote_dir.join(".lock"));
+        for kind in CollectionKind::ALL {
+            let _ = sftp.unlink(&remote_dir.join(kind.file_name()));
+        }
         Ok(())
     }
 }
