@@ -785,4 +785,6 @@ export function saveAppTheme(themeId: AppThemeId) {
   void publish(appThemeChangedEvent, theme).catch(() => {
     /* Non-Tauri environments fall back to localStorage + storage events. */
   });
+
+  void import("@/lib/sync-settings-cache").then((m) => m.pushSyncSettingsCache());
 }
