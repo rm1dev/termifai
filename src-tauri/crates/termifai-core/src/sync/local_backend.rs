@@ -1,13 +1,11 @@
 use crate::sync::backend::{SyncBackend, SyncError};
+use crate::sync::collections::CollectionKind;
 use crate::sync::payload::Manifest;
 use std::fs;
 use std::path::PathBuf;
 
-/// Syncs to a plain directory: `manifest.json` (plaintext) + `vault.blob`
-/// (ciphertext). Doubles as the phase-1 test harness (two "devices" pointed
-/// at the same folder) and as a real option for anyone who points it at a
-/// folder already synced by another tool (Dropbox/Drive desktop client, a
-/// NAS mount, etc).
+/// Syncs to a plain directory: `manifest.json` (plaintext) + either legacy
+/// `vault.blob` or Phase-C `col-*.blob` collection files.
 pub struct LocalDirBackend {
     dir: PathBuf,
 }
@@ -23,6 +21,34 @@ impl LocalDirBackend {
 
     fn blob_path(&self) -> PathBuf {
         self.dir.join("vault.blob")
+    }
+
+    fn collection_path(&self, name: &str) -> PathBuf {
+        if let Some(kind) = CollectionKind::from_str(name) {
+            self.dir.join(kind.file_name())
+        } else {
+            self.dir.join(format!("col-{name}.blob"))
+        }
+    }
+
+    fn cas_check(&self, expected_blob_version: Option<u64>) -> Result<(), SyncError> {
+        let current = self.fetch_manifest()?;
+        match (expected_blob_version, current.as_ref()) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(SyncError::Conflict),
+            (Some(expected), Some(current)) if current.blob_version != expected => {
+                Err(SyncError::Conflict)
+            }
+            (Some(_), None) => Err(SyncError::Conflict),
+            _ => Ok(()),
+        }
+    }
+
+    fn write_manifest(&self, manifest: &Manifest) -> Result<(), SyncError> {
+        let manifest_tmp = self.dir.join("manifest.json.tmp");
+        fs::write(&manifest_tmp, serde_json::to_string_pretty(manifest)?)?;
+        fs::rename(&manifest_tmp, self.manifest_path())?;
+        Ok(())
     }
 }
 
@@ -41,6 +67,14 @@ impl SyncBackend for LocalDirBackend {
         Ok(fs::read(self.blob_path())?)
     }
 
+    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+        let path = self.collection_path(name);
+        if !path.exists() {
+            return Err(SyncError::NotFound);
+        }
+        Ok(fs::read(path)?)
+    }
+
     fn store(
         &self,
         manifest: &Manifest,
@@ -48,41 +82,58 @@ impl SyncBackend for LocalDirBackend {
         expected_blob_version: Option<u64>,
     ) -> Result<(), SyncError> {
         fs::create_dir_all(&self.dir)?;
+        self.cas_check(expected_blob_version)?;
 
-        // Compare-and-swap: re-read the manifest right before writing so a
-        // concurrent writer's blobVersion bump isn't silently overwritten.
-        let current = self.fetch_manifest()?;
-        match (expected_blob_version, current.as_ref()) {
-            (None, None) => {}
-            (None, Some(_)) => return Err(SyncError::Conflict),
-            (Some(expected), Some(current)) if current.blob_version != expected => {
-                return Err(SyncError::Conflict)
-            }
-            (Some(_), None) => return Err(SyncError::Conflict),
-            _ => {}
+        let blob_tmp = self.dir.join("vault.blob.tmp");
+        fs::write(&blob_tmp, blob)?;
+        fs::rename(&blob_tmp, self.blob_path())?;
+        self.write_manifest(manifest)?;
+        Ok(())
+    }
+
+    fn store_delta(
+        &self,
+        manifest: &Manifest,
+        changed: &[(String, Vec<u8>)],
+        expected_blob_version: Option<u64>,
+    ) -> Result<(), SyncError> {
+        fs::create_dir_all(&self.dir)?;
+        self.cas_check(expected_blob_version)?;
+
+        for (name, bytes) in changed {
+            let path = self.collection_path(name);
+            let tmp = path.with_extension("blob.tmp");
+            fs::write(&tmp, bytes)?;
+            fs::rename(&tmp, &path)?;
         }
 
-        let manifest_tmp = self.dir.join("manifest.json.tmp");
-        let blob_tmp = self.dir.join("vault.blob.tmp");
+        // Manifest last — readers that see the new index find blobs already in place.
+        self.write_manifest(manifest)?;
 
-        fs::write(&blob_tmp, blob)?;
-        fs::write(&manifest_tmp, serde_json::to_string_pretty(manifest)?)?;
-
-        // Blob first, then manifest — a reader that sees the new manifest
-        // must find the matching blob already in place.
-        fs::rename(&blob_tmp, self.blob_path())?;
-        fs::rename(&manifest_tmp, self.manifest_path())?;
+        // Legacy monolith رو پاک می‌کنیم تا نسخهٔ کهنه گمراه‌کننده نمونه
+        let legacy = self.blob_path();
+        if legacy.exists() {
+            let _ = fs::remove_file(legacy);
+        }
         Ok(())
     }
 
     fn wipe(&self) -> Result<(), SyncError> {
-        let manifest = self.manifest_path();
-        let blob = self.blob_path();
-        if manifest.exists() {
-            fs::remove_file(manifest)?;
+        if self.manifest_path().exists() {
+            fs::remove_file(self.manifest_path())?;
         }
-        if blob.exists() {
-            fs::remove_file(blob)?;
+        if self.blob_path().exists() {
+            fs::remove_file(self.blob_path())?;
+        }
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with("col-") && name.ends_with(".blob") {
+                        let _ = fs::remove_file(path);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -93,14 +144,13 @@ mod tests {
     use super::*;
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        std::env::temp_dir().join(format!(
             "termifai-local-backend-test-{name}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        ));
-        dir
+        ))
     }
 
     fn sample_manifest(blob_version: u64) -> Manifest {
@@ -114,6 +164,8 @@ mod tests {
             kdf: crate::sync::payload::default_kdf_params(),
             sync_salt: "c2FsdA".into(),
             blob_sha256: "abc".into(),
+            content_hash: None,
+            collections: Default::default(),
         }
     }
 
@@ -137,13 +189,30 @@ mod tests {
     }
 
     #[test]
+    fn store_delta_writes_collection_files() {
+        let dir = tmp_dir("delta");
+        let backend = LocalDirBackend::new(&dir);
+        let mut manifest = sample_manifest(1);
+        manifest.format_version = 2;
+        backend
+            .store_delta(
+                &manifest,
+                &[("hosts".into(), b"enc-hosts".to_vec())],
+                None,
+            )
+            .unwrap();
+        assert_eq!(backend.fetch_collection("hosts").unwrap(), b"enc-hosts");
+        assert!(!backend.blob_path().exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn store_rejects_stale_expected_version() {
         let dir = tmp_dir("cas");
         let backend = LocalDirBackend::new(&dir);
         backend.store(&sample_manifest(1), b"v1", None).unwrap();
         backend.store(&sample_manifest(2), b"v2", Some(1)).unwrap();
 
-        // Someone still thinks the remote is at version 1 — must conflict.
         let result = backend.store(&sample_manifest(3), b"v3", Some(1));
         assert!(matches!(result, Err(SyncError::Conflict)));
         fs::remove_dir_all(&dir).ok();
@@ -155,7 +224,6 @@ mod tests {
         let backend = LocalDirBackend::new(&dir);
         backend.store(&sample_manifest(1), b"v1", None).unwrap();
 
-        // A second "first sync" against an already-populated remote must conflict.
         let result = backend.store(&sample_manifest(1), b"v1-again", None);
         assert!(matches!(result, Err(SyncError::Conflict)));
         fs::remove_dir_all(&dir).ok();

@@ -77,6 +77,59 @@ fn delete_script_file(dir: &std::path::Path, id: &str) {
     let _ = std::fs::remove_file(script_path(dir, id));
 }
 
+/// Applies a merged snippet set from sync: writes/updates `.sh` files for
+/// Script snippets, drops orphaned script files, and stores metadata with
+/// `script: None` (body lives on disk, same as `save_snippet`).
+pub fn apply_synced_snippets(
+    app: &AppHandle,
+    snippets: Vec<Snippet>,
+    groups: Vec<SnippetGroup>,
+) -> Result<(), String> {
+    let dir = get_snippets_dir(app)?;
+    let keep_ids: std::collections::HashSet<&str> =
+        snippets.iter().map(|s| s.id.as_str()).collect();
+
+    // پاک کردن فایل اسکریپت‌هایی که دیگه تو لیست merged نیستن
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sh") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if !keep_ids.contains(stem) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    let mut vault_snippets = Vec::with_capacity(snippets.len());
+    for mut snippet in snippets {
+        if matches!(snippet.kind, SnippetKind::Script) {
+            if let Some(content) = snippet.script.take() {
+                write_script_file(&dir, &snippet.id, &content)?;
+            }
+        } else {
+            snippet.script = None;
+            delete_script_file(&dir, &snippet.id);
+        }
+        // مثل save_snippet — محتوای اسکریپت تو DB نمی‌مونه
+        snippet.script = None;
+        vault_snippets.push(snippet);
+    }
+
+    let state = app.state::<AppState>();
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            vault.snippets = vault_snippets.clone();
+            vault.groups = groups.clone();
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 pub fn list_snippets(app: &AppHandle) -> Result<SnippetsListResult, String> {
     let state = app.state::<AppState>();
     let vault = state
@@ -205,6 +258,7 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
         delete_script_file(&dir, &id);
     }
 
+    crate::sync::mark_dirty(app);
     saved_snippet.ok_or_else(|| "Failed to save snippet".to_string())
 }
 
@@ -224,6 +278,7 @@ pub fn remove_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String> 
             delete_script_file(&dir, id);
         }
     }
+    crate::sync::mark_dirty(app);
     Ok(())
 }
 
@@ -245,6 +300,7 @@ pub fn reorder_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String>
             vault.snippets = reordered;
         })
         .map_err(|e| e.to_string())?;
+    crate::sync::mark_dirty(app);
     Ok(())
 }
 
@@ -299,6 +355,7 @@ pub fn save_snippet_group(
         return Err(err_msg);
     }
 
+    crate::sync::mark_dirty(app);
     Ok(group)
 }
 
@@ -334,6 +391,7 @@ pub fn remove_snippet_group(app: &AppHandle, id: String) -> Result<(), String> {
         crate::tombstones::EntityKind::SnippetGroup,
         &removed_group_ids,
     )?;
+    crate::sync::mark_dirty(app);
     Ok(())
 }
 

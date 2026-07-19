@@ -6,6 +6,7 @@ use crate::model::ssh_keys::SshKey;
 use crate::model::tombstones::Tombstone;
 use base64::engine::general_purpose::STANDARD_NO_PAD as B64;
 use base64::Engine;
+use crate::sync::collections::CollectionIndex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -103,6 +104,15 @@ pub struct Manifest {
     pub sync_salt: String,
     /// hex-encoded SHA-256 of the (encrypted) blob bytes.
     pub blob_sha256: String,
+    /// SHA-256 of the *logical* payload (entities/settings/tombstones), ignoring
+    /// ephemeral fields like `exportedAt` / `deviceId`. Lets a no-op sync skip
+    /// re-encrypt + upload even though AEAD nonces would differ.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// Per-collection content hashes (Phase C). When non-empty, peers sync via
+    /// `col-*.blob` files instead of a monolithic `vault.blob`.
+    #[serde(default, skip_serializing_if = "CollectionIndex::is_empty")]
+    pub collections: CollectionIndex,
 }
 
 /// Derive the SyncKey from the master password and the manifest's `syncSalt`.
@@ -145,6 +155,44 @@ pub fn sha256_hex(data: &[u8]) -> String {
     digest.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
+/// Logical content used for change-detection. Excludes `exported_at` / `device_id`
+/// so a re-export of the same vault doesn't look like a new revision.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalSyncContent<'a> {
+    format_version: u32,
+    hosts: &'a [Host],
+    groups: &'a [HostGroup],
+    snippets: &'a [Snippet],
+    snippet_groups: &'a [SnippetGroup],
+    port_forwards: &'a [PortForwardRule],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_keys: Option<&'a [SshKey]>,
+    settings: &'a SettingsPayload,
+    tombstones: &'a [Tombstone],
+}
+
+/// Stable SHA-256 over the syncable data. Same logical vault ⇒ same hash,
+/// regardless of who exports it or when.
+pub fn payload_content_hash(payload: &SyncPayload) -> String {
+    let canonical = CanonicalSyncContent {
+        format_version: payload.format_version,
+        hosts: &payload.hosts,
+        groups: &payload.groups,
+        snippets: &payload.snippets,
+        snippet_groups: &payload.snippet_groups,
+        port_forwards: &payload.port_forwards,
+        ssh_keys: payload.ssh_keys.as_deref(),
+        settings: &payload.settings,
+        tombstones: &payload.tombstones,
+    };
+    // serde_json preserves field order from the struct definition; entity
+    // vectors are already sorted by id in merge_entities / gather paths that
+    // matter for equality after a sync cycle.
+    let bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+    sha256_hex(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +229,20 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn content_hash_ignores_exported_at_and_device_id() {
+        let a = SyncPayload {
+            exported_at: "2026-01-01T00:00:00Z".into(),
+            device_id: "dev-a".into(),
+            ..Default::default()
+        };
+        let b = SyncPayload {
+            exported_at: "2026-07-01T00:00:00Z".into(),
+            device_id: "dev-b".into(),
+            ..Default::default()
+        };
+        assert_eq!(payload_content_hash(&a), payload_content_hash(&b));
     }
 }

@@ -51,9 +51,12 @@ import {
   syncNow,
   syncDisconnect,
   syncConnectProvider,
+  syncSetAutoSync,
+  onSyncActivity,
   type SyncBackendConfig,
   type SyncStatus,
 } from "@/lib/api/sync";
+import { pushSyncSettingsCache } from "@/lib/sync-settings-cache";
 import { listHosts, saveHost } from "@/lib/api/hosts";
 import type { Host } from "@/components/app/types";
 import {
@@ -222,6 +225,7 @@ export function SettingsWindow() {
   useEffect(() => {
     refreshSyncStatus();
     refreshSyncableHosts();
+    pushSyncSettingsCache();
     // This window is created once at startup and only hidden/shown afterwards,
     // so mount-time data goes stale. Opening it always focuses it — refetch on
     // every focus so hosts added/edited in the main window show up here.
@@ -236,6 +240,43 @@ export function SettingsWindow() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void onSyncActivity((activity) => {
+      if (disposed) return;
+      setSyncStatusState((prev) =>
+        prev
+          ? {
+              ...prev,
+              dirty: activity.dirty,
+              autoSync: activity.autoSync,
+              lastError: activity.error,
+              syncing: activity.phase === "syncing",
+              lastSyncedBlobVersion: activity.blobVersion || prev.lastSyncedBlobVersion,
+              lastSyncAt: activity.lastSyncAt ?? prev.lastSyncAt,
+            }
+          : prev,
+      );
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  const handleAutoSyncToggle = async (enabled: boolean) => {
+    try {
+      await syncSetAutoSync(enabled);
+      setSyncStatusState((prev) => (prev ? { ...prev, autoSync: enabled } : prev));
+      toast.success(enabled ? "Auto-sync enabled" : "Auto-sync disabled");
+    } catch (e: unknown) {
+      setSyncError(String(e));
+    }
+  };
 
   const syncBackendLabel = (backend: SyncBackendConfig): string => {
     switch (backend.kind) {
@@ -290,7 +331,18 @@ export function SettingsWindow() {
       setSyncNeedsPassword(false);
       setSyncPassword("");
       refreshSyncStatus();
-      toast.success("Synced");
+      if (result.uploaded || result.applied) {
+        const parts: string[] = [];
+        if (result.collectionsUploaded.length > 0) {
+          parts.push(`↑ ${result.collectionsUploaded.join(", ")}`);
+        }
+        if (result.collectionsDownloaded.length > 0) {
+          parts.push(`↓ ${result.collectionsDownloaded.join(", ")}`);
+        }
+        toast.success(parts.length > 0 ? `Synced (${parts.join(" · ")})` : "Synced");
+      } else {
+        toast.success("Already up to date");
+      }
     } catch (e: unknown) {
       if (String(e).includes("master_password_required")) {
         setSyncNeedsPassword(true);
@@ -351,6 +403,7 @@ export function SettingsWindow() {
     try {
       await syncDisconnect(deleteRemote);
       refreshSyncStatus();
+      refreshSyncableHosts();
       toast.success("Disconnected");
     } catch (e: unknown) {
       setSyncError(String(e));
@@ -1439,48 +1492,103 @@ export function SettingsWindow() {
             </Card>
 
             {syncStatusState?.backend && (
-              <Card>
-                <CardHeader>
-                  <CardTitle className="text-sm">Sync Now</CardTitle>
-                  <CardDescription className="text-xs">
-                    Merges local changes with the remote copy and applies the result immediately.
-                  </CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-2">
-                  {syncNeedsPassword && (
-                    <>
-                      <p className="text-xs text-muted-foreground">
-                        Enter your master password to sync (only asked once per session unless the
-                        vault&apos;s lock policy clears the cache).
-                      </p>
-                      <input
-                        type="password"
-                        placeholder="Master password"
-                        className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[var(--color-brand-cyan)] focus:ring-1 focus:ring-[var(--color-brand-cyan)]"
-                        value={syncPassword}
-                        onChange={(e) => setSyncPassword(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter") void runSync(syncPassword); }}
+              <>
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Automatic Sync</CardTitle>
+                    <CardDescription className="text-xs">
+                      Syncs when the app opens, and again shortly after you change hosts,
+                      snippets, port forwards, or settings.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="space-y-0.5">
+                        <p className="text-sm text-foreground">Auto-sync</p>
+                        <p className="text-xs text-muted-foreground">
+                          {syncStatusState.syncing
+                            ? "Syncing now…"
+                            : syncStatusState.dirty
+                              ? "Pending local changes"
+                              : "Up to date"}
+                        </p>
+                      </div>
+                      <Switch
+                        checked={syncStatusState.autoSync}
+                        onCheckedChange={(checked) => void handleAutoSyncToggle(checked)}
                       />
-                    </>
-                  )}
-                  <div className="flex gap-2">
-                    <Button
-                      size="sm"
-                      onClick={() => void runSync(syncNeedsPassword ? syncPassword : undefined)}
-                      disabled={syncLoading}
-                    >
-                      {syncLoading ? "Syncing…" : "Sync Now"}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => void handleDisconnectSync(false)}
-                    >
-                      Disconnect
-                    </Button>
-                  </div>
-                </CardContent>
-              </Card>
+                    </div>
+                    {syncStatusState.lastError && (
+                      <p className="text-xs text-red-400">{syncStatusState.lastError}</p>
+                    )}
+                    {syncStatusState.lastSyncStats && (
+                      <div className="rounded-lg border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground space-y-1">
+                        <p>
+                          Last cycle:{" "}
+                          <span className="text-foreground">
+                            {new Date(syncStatusState.lastSyncStats.at).toLocaleString()}
+                          </span>
+                        </p>
+                        <p>
+                          Uploaded:{" "}
+                          {syncStatusState.lastSyncStats.collectionsUploaded.length > 0
+                            ? syncStatusState.lastSyncStats.collectionsUploaded.join(", ")
+                            : "none"}
+                        </p>
+                        <p>
+                          Downloaded:{" "}
+                          {syncStatusState.lastSyncStats.collectionsDownloaded.length > 0
+                            ? syncStatusState.lastSyncStats.collectionsDownloaded.join(", ")
+                            : "none"}
+                        </p>
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+
+                <Card>
+                  <CardHeader>
+                    <CardTitle className="text-sm">Sync Now</CardTitle>
+                    <CardDescription className="text-xs">
+                      Merges local changes with the remote copy and applies the result immediately.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    {syncNeedsPassword && (
+                      <>
+                        <p className="text-xs text-muted-foreground">
+                          Enter your master password to sync (only asked once per session unless the
+                          vault&apos;s lock policy clears the cache).
+                        </p>
+                        <input
+                          type="password"
+                          placeholder="Master password"
+                          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground outline-none focus:border-[var(--color-brand-cyan)] focus:ring-1 focus:ring-[var(--color-brand-cyan)]"
+                          value={syncPassword}
+                          onChange={(e) => setSyncPassword(e.target.value)}
+                          onKeyDown={(e) => { if (e.key === "Enter") void runSync(syncPassword); }}
+                        />
+                      </>
+                    )}
+                    <div className="flex gap-2">
+                      <Button
+                        size="sm"
+                        onClick={() => void runSync(syncNeedsPassword ? syncPassword : undefined)}
+                        disabled={syncLoading || syncStatusState.syncing}
+                      >
+                        {syncLoading || syncStatusState.syncing ? "Syncing…" : "Sync Now"}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleDisconnectSync(false)}
+                      >
+                        Disconnect
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
+              </>
             )}
           </TabsContent>
         </Tabs>
