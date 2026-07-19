@@ -1,4 +1,4 @@
-import type { IDecoration, Terminal } from "@xterm/xterm";
+import type { IBufferLine, IDecoration, Terminal } from "@xterm/xterm";
 import type { XtermTheme } from "./app-theme";
 import { publish } from "./api/transport";
 
@@ -39,6 +39,17 @@ export function saveSemanticHighlighting(enabled: boolean): void {
  * addon uses for match highlighting. This recolors rendered cells without
  * touching the PTY byte stream, so it can never corrupt what programs
  * actually receive.
+ *
+ * Performance note: decorations are kept ONLY for the visible viewport.
+ * Keeping them alive in scrollback (the old behaviour) made high-volume
+ * structured logs — docker compose logs, access logs full of IPs/paths —
+ * pile up tens of thousands of decorations and stall the whole UI.
+ *
+ * Contrast note: decorations use layer "bottom", skip the cursor line, and
+ * skip any line that still has inverse/reverse-video cells. Shells
+ * (zsh/fish/…) paint bracketed-paste with reverse-video; after Ctrl+C the
+ * cancelled line is no longer the cursor line but often keeps those cells,
+ * so decorating paths/IPs on top made paste unreadable again.
  */
 
 interface HighlightRule {
@@ -120,38 +131,108 @@ interface LineRecord {
   decorations: IDecoration[];
 }
 
+/** شل برای paste از reverse video استفاده می‌کنه؛ روی اون FG تزئینی نذار */
+function lineHasInverse(line: IBufferLine): boolean {
+  if (line.length === 0) return false;
+  const scratch = line.getCell(0);
+  if (!scratch) return false;
+  for (let x = 0; x < line.length; x++) {
+    if (line.getCell(x, scratch)?.isInverse()) return true;
+  }
+  return false;
+}
+
 const SCAN_DEBOUNCE_MS = 80;
-// Upper bound on remembered lines: decorations in scrollback stay alive (they
-// scrolled through the viewport once), but the bookkeeping map is pruned so a
-// long-running session doesn't grow without bound.
-const MAX_TRACKED_LINES = 4000;
+// وقتی استریم سنگینه (لاگ داکر و مشابه) اسکن رو عقب بنداز تا صف write خالی بشه
+const BUSY_DEBOUNCE_MS = 250;
+const BUSY_WRITE_WINDOW_MS = 200;
+const BUSY_WRITE_THRESHOLD = 8;
+const IDLE_RESUME_MS = 180;
 
 export function attachSemanticHighlighter(
   term: Terminal,
   getTheme: () => XtermTheme
 ): { refresh: () => void; setEnabled: (enabled: boolean) => void; dispose: () => void } {
-  // absolute buffer line -> what we last saw there
+  // فقط خط‌های داخل viewport رو نگه می‌داریم — اسکرول‌بک decoration نمی‌خواد
   const tracked = new Map<number, LineRecord>();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
   let enabled = loadSemanticHighlighting();
+  let writeStamps: number[] = [];
+  let busy = false;
 
   const disposeLine = (rec: LineRecord) => {
     for (const d of rec.decorations) d.dispose();
+  };
+
+  const clearAll = () => {
+    for (const rec of tracked.values()) disposeLine(rec);
+    tracked.clear();
+  };
+
+  const noteWrite = () => {
+    const now = performance.now();
+    writeStamps.push(now);
+    // فقط پنجرهٔ اخیر رو نگه دار
+    const cutoff = now - BUSY_WRITE_WINDOW_MS;
+    while (writeStamps.length > 0 && writeStamps[0]! < cutoff) {
+      writeStamps.shift();
+    }
+    const wasBusy = busy;
+    busy = writeStamps.length >= BUSY_WRITE_THRESHOLD;
+    // وسط سیل خروجی، decorationهای قبلی هم هزینهٔ رندرن — پاکشون کن
+    if (busy && !wasBusy && tracked.size > 0) clearAll();
+
+    // بعد از آخرین write صبر کن؛ اگه دیگه چیزی نیومد، هایلایت رو برگردون
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleTimer = null;
+      const was = busy;
+      busy = false;
+      writeStamps = [];
+      if (was) schedule(true);
+    }, IDLE_RESUME_MS);
   };
 
   const scanViewport = () => {
     if (disposed || !enabled) return;
     const buf = term.buffer.active;
     // Decorations aren't supported in the alternate buffer (vim, etc.).
-    if (buf.type === "alternate") return;
+    if (buf.type === "alternate") {
+      clearAll();
+      return;
+    }
+    // هنوز در حال بمباران خروجی هستیم — اسکن رو بگذار برای idle
+    if (busy) return;
+
     const theme = getTheme();
     const cursorAbs = buf.baseY + buf.cursorY;
+    const visible = new Set<number>();
 
     for (let vy = 0; vy < term.rows; vy++) {
       const abs = buf.viewportY + vy;
+      visible.add(abs);
+      // خط فعلی ورودی (paste/typing) رو هایلایت نکن — با reverse-video شل قاطی می‌شه
+      if (abs === cursorAbs) {
+        const live = tracked.get(abs);
+        if (live) {
+          disposeLine(live);
+          tracked.delete(abs);
+        }
+        continue;
+      }
       const line = buf.getLine(abs);
       if (!line) continue;
+      // بعد از Ctrl+C خط paste‌شده هنوز inverse داره؛ روش decoration نذار
+      if (lineHasInverse(line)) {
+        const inv = tracked.get(abs);
+        if (inv) {
+          disposeLine(inv);
+          tracked.delete(abs);
+        }
+        continue;
+      }
       const text = line.translateToString(true);
 
       const prev = tracked.get(abs);
@@ -182,7 +263,8 @@ export function attachSemanticHighlighter(
             x: start,
             width: m[0].length,
             foregroundColor: rule.color(theme),
-            layer: "top",
+            // زیر selection/paste-highlight تا متن همیشه خوانا بمونه
+            layer: "bottom",
           });
           if (deco) {
             decorations.push(deco);
@@ -195,27 +277,37 @@ export function attachSemanticHighlighter(
       tracked.set(abs, { text, decorations });
     }
 
-    if (tracked.size > MAX_TRACKED_LINES) {
-      const keys = [...tracked.keys()].sort((a, b) => a - b);
-      for (const key of keys.slice(0, tracked.size - MAX_TRACKED_LINES)) {
-        // Only the bookkeeping is dropped for old scrollback lines — their
-        // decorations stay attached to their markers until trimmed.
-        tracked.delete(key);
+    // خط‌هایی که از viewport خارج شدن رو واقعاً dispose کن، نه فقط از Map حذف
+    for (const [abs, rec] of tracked) {
+      if (!visible.has(abs)) {
+        disposeLine(rec);
+        tracked.delete(abs);
       }
     }
   };
 
-  const schedule = () => {
-    if (disposed || timer) return;
+  const schedule = (force = false) => {
+    if (disposed || !enabled) return;
+    if (timer) {
+      if (!force) return;
+      clearTimeout(timer);
+      timer = null;
+    }
+    const delay = busy ? BUSY_DEBOUNCE_MS : SCAN_DEBOUNCE_MS;
     timer = setTimeout(() => {
       timer = null;
       scanViewport();
-    }, SCAN_DEBOUNCE_MS);
+    }, delay);
+  };
+
+  const onWrite = () => {
+    noteWrite();
+    schedule();
   };
 
   const disposables = [
-    term.onWriteParsed(schedule),
-    term.onScroll(schedule),
+    term.onWriteParsed(onWrite),
+    term.onScroll(() => schedule()),
     term.onResize(() => {
       // Reflow rewrites line wrapping, shifting absolute positions — a stale
       // map would pin decorations to the wrong columns. Start over.
@@ -225,9 +317,10 @@ export function attachSemanticHighlighter(
 
   // Full re-scan with fresh colors; used on theme change.
   const refresh = () => {
-    for (const rec of tracked.values()) disposeLine(rec);
-    tracked.clear();
-    schedule();
+    clearAll();
+    busy = false;
+    writeStamps = [];
+    schedule(true);
   };
 
   schedule();
@@ -238,18 +331,27 @@ export function attachSemanticHighlighter(
       if (next === enabled) return;
       enabled = next;
       if (next) {
-        schedule();
+        schedule(true);
       } else {
-        for (const rec of tracked.values()) disposeLine(rec);
-        tracked.clear();
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+        clearAll();
+        busy = false;
+        writeStamps = [];
       }
     },
     dispose: () => {
       disposed = true;
       if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       for (const d of disposables) d.dispose();
-      for (const rec of tracked.values()) disposeLine(rec);
-      tracked.clear();
+      clearAll();
     },
   };
 }
