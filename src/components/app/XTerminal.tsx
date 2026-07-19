@@ -51,6 +51,14 @@ import {
   semanticHighlightingChangedEvent,
   semanticHighlightingStorageKey,
 } from "@/lib/terminal-highlighter";
+import {
+  applyEscapeToLineTracker,
+  applyInjectedTextToLineTracker,
+  applyRawInputToLineTracker,
+  emptyLineTracker,
+  isAtLineStart,
+  type LineTrackerState,
+} from "@/lib/terminal-line-tracker";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
 import { Search } from "lucide-react";
@@ -229,15 +237,12 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   // keyword -> snippet, for the text-only auto-expand feature. Only snippets
   // with no variables are eligible (mid-line variable prompts would be jarring).
   const keywordSnippetsRef = useRef<Map<string, Snippet>>(new Map());
-  // Raw text typed since the last Enter, tracked from keystrokes directly
-  // rather than read from the terminal's rendered buffer — the buffer only
-  // reflects a keystroke once the PTY echoes it back asynchronously, which
-  // isn't done yet at the moment the next keystroke (e.g. the space that
-  // triggers a keyword match) arrives. Used both for keyword auto-expand
-  // and to gate command/script snippets to "cursor at start of line" (a
-  // shell prompt already occupies columns before the cursor, so absolute
-  // terminal column can't be used for that either).
-  const currentLineRef = useRef("");
+  // متن تایپ‌شده از آخرین Enter — مستقیم از keystroke، نه از بافر xterm
+  // (اکوی PTY دیرتر می‌رسه). برای keyword expand و گیت command/script.
+  const lineTrackerRef = useRef<LineTrackerState>(emptyLineTracker());
+  const noteInjectedInput = (text: string) => {
+    lineTrackerRef.current = applyInjectedTextToLineTracker(lineTrackerRef.current, text);
+  };
   const shortcutsRefLocal = useRef<ShortcutMap>(loadShortcuts());
   const termRef = useRef<Terminal | null>(null);
   const sessionRef = useRef<string | null>(sessionId ?? null);
@@ -345,6 +350,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         return;
       }
       sessionRef.current = info.id;
+      lineTrackerRef.current = emptyLineTracker();
 
       if (term?.cols && term?.rows) {
         await resizeSession(info.id, term.cols, term.rows);
@@ -391,7 +397,9 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     navigator.clipboard
       .readText()
       .then((text) => {
-        if (text) writeToSession(sid, text).catch(() => {});
+        if (!text) return;
+        noteInjectedInput(text);
+        writeToSession(sid, text).catch(() => {});
       })
       .catch(() => {});
   }, []);
@@ -430,6 +438,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         const sid = sessionRef.current;
         if (!sid || !paths.length) return;
         const text = paths.map(quotePathForShell).join(" ");
+        noteInjectedInput(text);
         writeToSession(sid, text).catch(() => {});
         refocusTerminal();
       })
@@ -603,6 +612,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
           const sid = sessionRef.current;
           if (sid) {
             navigator.clipboard.readText().then((text) => {
+              if (!text) return;
+              noteInjectedInput(text);
               writeToSession(sid, text).catch(() => {});
             }).catch(() => {});
           }
@@ -786,22 +797,18 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
           }
         });
 
-      if (data === "\r") {
-        currentLineRef.current = "";
-        send(data);
+      if (data.length === 0) {
         return;
       }
-      if (data === "\x7f") {
-        currentLineRef.current = currentLineRef.current.slice(0, -1);
-        send(data);
-        return;
-      }
-      if (data.length === 0 || data.startsWith("\x1b")) {
+
+      // Escape sequence ها (فلش‌ها و …) جدا از متن printable پیگیری می‌شن
+      if (data.startsWith("\x1b")) {
+        lineTrackerRef.current = applyEscapeToLineTracker(lineTrackerRef.current, data);
         send(data);
         return;
       }
 
-      currentLineRef.current += data;
+      lineTrackerRef.current = applyRawInputToLineTracker(lineTrackerRef.current, data);
       send(data);
 
       // Immediate keyword match: as soon as the word just typed (tracked
@@ -810,13 +817,18 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       // back asynchronously) exactly equals a known keyword, expand it right
       // away without waiting for a boundary character. Only eligible on
       // kind === "text" snippets with no variables.
-      const match = /(\S+)$/.exec(currentLineRef.current);
+      const lineText = lineTrackerRef.current.text;
+      const match = /(\S+)$/.exec(lineText);
       const word = match?.[1];
       const snippet = word ? keywordSnippetsRef.current.get(word) : undefined;
       if (snippet) {
-        currentLineRef.current = currentLineRef.current.slice(0, -word!.length);
+        const body = snippet.body ?? "";
+        lineTrackerRef.current = {
+          ...lineTrackerRef.current,
+          text: lineText.slice(0, -word!.length) + body,
+        };
         const erase = "\x7f".repeat(word!.length);
-        send(erase + (snippet.body ?? ""));
+        send(erase + body);
       }
     });
 
@@ -940,6 +952,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
           sessionRef.current = info.id;
           notifiedSessionRef.current = info.id;
+          lineTrackerRef.current = emptyLineTracker();
           onSessionCreated?.(info.id);
           return info.id;
         };
@@ -1116,9 +1129,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   // ── Snippet Palette Logic ──────────────────────────────────────────────────
 
-  // command/script snippets are only offered when the cursor is at column 0 —
-  // if the user has typed anything on the current line, they're hidden.
-  const cursorAtLineStart = () => currentLineRef.current.length === 0;
+  // command/script فقط وقتی خط ورودی خالیه (نه وسط تایپ / تاریخچه شل)
+  const cursorAtLineStart = () => isAtLineStart(lineTrackerRef.current);
 
   // Full "Parent › Child" path for a snippet's group, or null when ungrouped —
   // used to cluster the palette by group instead of a flat list.
@@ -1171,14 +1183,16 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
     if (snippet.kind === "text") {
       const body = resolveVars(snippet.body ?? "");
+      noteInjectedInput(body);
       writeToSession(sid, body).catch(() => {});
     } else if (snippet.kind === "command") {
       const cmd = resolveVars(snippet.command ?? "");
+      noteInjectedInput(cmd + "\r");
       writeToSession(sid, cmd + "\r").catch(() => {});
     } else if (snippet.kind === "script") {
       const script = resolveVars(snippet.script ?? "");
-      // Send script to backend — it writes a temp .sh file, executes it, and cleans up
-      // Only title message is shown in terminal, not the script content
+      // اسکریپت از بک‌اند می‌ره بالا؛ خط ورودی رو خالی فرض می‌کنیم
+      lineTrackerRef.current = emptyLineTracker();
       runSnippetScript(sid, snippet.name, script).catch((err) =>
         console.error("run_snippet_script failed:", err)
       );
