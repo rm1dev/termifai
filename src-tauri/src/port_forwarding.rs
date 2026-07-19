@@ -130,6 +130,7 @@ pub fn save_port_forward(
         })
         .map_err(|e| e.to_string())?;
 
+    crate::sync::mark_dirty(app);
     saved_rule.ok_or_else(|| "Failed to save rule".to_string())
 }
 
@@ -155,6 +156,7 @@ pub fn remove_port_forwards(
         })
         .map_err(|e| e.to_string())?;
     crate::tombstones::record(app, crate::tombstones::EntityKind::PortForward, &ids)?;
+    crate::sync::mark_dirty(app);
     Ok(())
 }
 

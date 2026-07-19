@@ -1,4 +1,4 @@
-import { call } from "./transport";
+import { call, subscribe, type UnlistenFn } from "./transport";
 
 export type SyncBackendConfig =
   | { kind: "localDir"; path: string }
@@ -11,6 +11,14 @@ export interface SettingsBlob {
   updatedAt?: string;
 }
 
+export interface SyncStats {
+  uploaded: boolean;
+  applied: boolean;
+  collectionsUploaded: string[];
+  collectionsDownloaded: string[];
+  at: string;
+}
+
 export interface SyncStatus {
   backend: SyncBackendConfig | null;
   lastSyncedBlobVersion: number;
@@ -18,6 +26,23 @@ export interface SyncStatus {
   syncSshKeys: boolean;
   dirty: boolean;
   deviceId: string | null;
+  autoSync: boolean;
+  lastError: string | null;
+  syncing: boolean;
+  lastSyncStats: SyncStats | null;
+}
+
+export type SyncActivityPhase = "idle" | "syncing" | "ok" | "error";
+
+export interface SyncActivity {
+  phase: SyncActivityPhase;
+  uploaded: boolean;
+  applied: boolean;
+  blobVersion: number;
+  lastSyncAt: string | null;
+  error: string | null;
+  dirty: boolean;
+  autoSync: boolean;
 }
 
 export function syncGetConfig(): Promise<SyncStatus> {
@@ -34,6 +59,18 @@ export function syncStatus(): Promise<SyncStatus> {
 
 export function syncDisconnect(deleteRemote: boolean): Promise<void> {
   return call<void>("sync_disconnect", { deleteRemote });
+}
+
+export function syncSetAutoSync(enabled: boolean): Promise<void> {
+  return call<void>("sync_set_auto_sync", { enabled });
+}
+
+export function syncCacheSettings(request: {
+  appTheme?: SettingsBlob;
+  terminalAppearance?: SettingsBlob;
+  shortcuts?: SettingsBlob;
+}): Promise<void> {
+  return call<void>("sync_cache_settings", { request });
 }
 
 export type OAuthProvider = "google" | "dropbox";
@@ -55,6 +92,12 @@ export interface SyncNowRequest {
 
 export interface SyncNowResult {
   blobVersion: number;
+  /** True when a new remote blob was written (version bumped). */
+  uploaded: boolean;
+  /** True when local stores were rewritten from the merge result. */
+  applied: boolean;
+  collectionsUploaded: string[];
+  collectionsDownloaded: string[];
   appTheme: SettingsBlob;
   terminalAppearance: SettingsBlob;
   shortcuts: SettingsBlob;
@@ -65,6 +108,10 @@ export interface SyncNowResult {
  * should catch that specifically and prompt the user. */
 export function syncNow(request: SyncNowRequest = {}): Promise<SyncNowResult> {
   return call<SyncNowResult>("sync_now", { request });
+}
+
+export function onSyncActivity(handler: (activity: SyncActivity) => void): Promise<UnlistenFn> {
+  return subscribe<SyncActivity>("sync:activity", (event) => handler(event.payload));
 }
 
 export function vaultInitFromSync(

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use serde::Deserialize;
 use crate::sync::backend::{SyncBackend, SyncError, TokenStore};
+use crate::sync::collections::CollectionKind;
 use crate::sync::payload::Manifest;
 
 pub struct GoogleDriveBackend {
@@ -229,6 +230,17 @@ impl SyncBackend for GoogleDriveBackend {
         Ok(bytes)
     }
 
+    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+        let token = self.get_token()?;
+        let file_name = CollectionKind::from_str(name)
+            .map(|k| k.file_name())
+            .unwrap_or_else(|| format!("col-{name}.blob"));
+        let file_id_opt =
+            find_file_id(&self.client, &token, &file_name).map_err(SyncError::Backend)?;
+        let file_id = file_id_opt.ok_or(SyncError::NotFound)?;
+        download_file(&self.client, &token, &file_id).map_err(SyncError::Backend)
+    }
+
     fn store(
         &self,
         manifest: &Manifest,
@@ -236,53 +248,80 @@ impl SyncBackend for GoogleDriveBackend {
         expected_blob_version: Option<u64>,
     ) -> Result<(), SyncError> {
         let token = self.get_token()?;
+        self.cas_check(expected_blob_version)?;
+        upsert_file(&self.client, &token, "vault.blob", blob)?;
+        let manifest_bytes = serde_json::to_vec_pretty(manifest)?;
+        upsert_file(&self.client, &token, "manifest.json", &manifest_bytes)?;
+        Ok(())
+    }
 
-        // CAS check
-        let current = self.fetch_manifest()?;
-        match (expected_blob_version, current.as_ref()) {
-            (None, None) => {}
-            (None, Some(_)) => return Err(SyncError::Conflict),
-            (Some(expected), Some(current)) if current.blob_version != expected => {
-                return Err(SyncError::Conflict)
-            }
-            (Some(_), None) => return Err(SyncError::Conflict),
-            _ => {}
-        }
+    fn store_delta(
+        &self,
+        manifest: &Manifest,
+        changed: &[(String, Vec<u8>)],
+        expected_blob_version: Option<u64>,
+    ) -> Result<(), SyncError> {
+        let token = self.get_token()?;
+        self.cas_check(expected_blob_version)?;
 
-        // Upload blob first, then manifest.
-        let blob_id_opt = find_file_id(&self.client, &token, "vault.blob")
-            .map_err(SyncError::Backend)?;
-        match blob_id_opt {
-            Some(id) => {
-                update_file(&self.client, &token, &id, blob).map_err(SyncError::Backend)?
-            }
-            None => {
-                create_file(&self.client, &token, "vault.blob", blob).map_err(SyncError::Backend)?;
-            }
+        for (name, bytes) in changed {
+            let file_name = CollectionKind::from_str(name)
+                .map(|k| k.file_name())
+                .unwrap_or_else(|| format!("col-{name}.blob"));
+            upsert_file(&self.client, &token, &file_name, bytes)?;
         }
 
         let manifest_bytes = serde_json::to_vec_pretty(manifest)?;
-        let manifest_id_opt = find_file_id(&self.client, &token, "manifest.json")
-            .map_err(SyncError::Backend)?;
-        match manifest_id_opt {
-            Some(id) => update_file(&self.client, &token, &id, &manifest_bytes)
-                .map_err(SyncError::Backend)?,
-            None => {
-                create_file(&self.client, &token, "manifest.json", &manifest_bytes)
-                    .map_err(SyncError::Backend)?;
-            }
-        }
+        upsert_file(&self.client, &token, "manifest.json", &manifest_bytes)?;
 
+        // Drop stale monolith if present
+        if let Ok(Some(id)) = find_file_id(&self.client, &token, "vault.blob") {
+            let _ = delete_file(&self.client, &token, &id);
+        }
         Ok(())
     }
 
     fn wipe(&self) -> Result<(), SyncError> {
         let token = self.get_token()?;
-        for name in ["manifest.json", "vault.blob"] {
-            if let Ok(Some(id)) = find_file_id(&self.client, &token, name) {
+        let mut names = vec!["manifest.json".to_string(), "vault.blob".to_string()];
+        for kind in CollectionKind::ALL {
+            names.push(kind.file_name());
+        }
+        for name in names {
+            if let Ok(Some(id)) = find_file_id(&self.client, &token, &name) {
                 let _ = delete_file(&self.client, &token, &id);
             }
         }
         Ok(())
+    }
+}
+
+impl GoogleDriveBackend {
+    fn cas_check(&self, expected_blob_version: Option<u64>) -> Result<(), SyncError> {
+        let current = self.fetch_manifest()?;
+        match (expected_blob_version, current.as_ref()) {
+            (None, None) => Ok(()),
+            (None, Some(_)) => Err(SyncError::Conflict),
+            (Some(expected), Some(current)) if current.blob_version != expected => {
+                Err(SyncError::Conflict)
+            }
+            (Some(_), None) => Err(SyncError::Conflict),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn upsert_file(
+    client: &reqwest::blocking::Client,
+    token: &str,
+    name: &str,
+    content: &[u8],
+) -> Result<(), SyncError> {
+    match find_file_id(client, token, name).map_err(SyncError::Backend)? {
+        Some(id) => update_file(client, token, &id, content).map_err(SyncError::Backend),
+        None => {
+            create_file(client, token, name, content).map_err(SyncError::Backend)?;
+            Ok(())
+        }
     }
 }

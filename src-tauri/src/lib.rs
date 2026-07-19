@@ -11,6 +11,7 @@ mod snippets;
 mod ssh;
 mod ssh_keys;
 mod sync;
+mod sync_auto;
 mod tombstones;
 mod vault;
 use dashboard::DashboardManager;
@@ -396,6 +397,7 @@ fn vault_init(app: tauri::AppHandle, master_password: String) -> Result<(), Stri
 fn vault_unlock(app: tauri::AppHandle, master_password: String) -> Result<(), String> {
     vault::op_unlock(&app, &master_password)?;
     hosts::migrate_plaintext_passwords(&app)?;
+    sync_auto::request_sync_after_unlock();
     Ok(())
 }
 
@@ -457,6 +459,19 @@ fn sync_status(app: tauri::AppHandle) -> Result<sync::SyncStatusDto, String> {
 #[tauri::command]
 fn sync_disconnect(app: tauri::AppHandle, delete_remote: bool) -> Result<(), String> {
     sync::sync_disconnect(&app, delete_remote)
+}
+
+#[tauri::command]
+fn sync_set_auto_sync(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    sync::set_auto_sync(&app, enabled)
+}
+
+#[tauri::command]
+fn sync_cache_settings(
+    app: tauri::AppHandle,
+    request: sync::CacheSettingsRequest,
+) -> Result<(), String> {
+    sync::cache_settings(&app, request)
 }
 
 #[tauri::command]
@@ -2548,6 +2563,8 @@ pub fn run() {
             sync_set_config,
             sync_status,
             sync_disconnect,
+            sync_set_auto_sync,
+            sync_cache_settings,
             sync_now,
             vault_init_from_sync,
             sync_import_foreign,
@@ -2984,7 +3001,11 @@ pub fn run() {
             // auto-unlocks (the default OnRestart policy) would never get migrated.
             if let Ok(true) = vault::op_try_cached_unlock(app.handle()) {
                 let _ = hosts::migrate_plaintext_passwords(app.handle());
+                sync_auto::request_sync_after_unlock();
             }
+
+            // Background sync: debounce after dirty + periodic pull.
+            sync_auto::start(app.handle().clone());
 
             // Start background screen-lock monitor (macOS only).
             #[cfg(target_os = "macos")]
