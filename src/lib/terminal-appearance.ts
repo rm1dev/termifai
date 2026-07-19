@@ -98,6 +98,8 @@ export function saveTerminalAppearance(appearance: TerminalAppearance) {
   void publish(terminalAppearanceChangedEvent, normalized).catch(() => {
     /* Non-Tauri environments fall back to localStorage + storage events. */
   });
+
+  void import("@/lib/sync-settings-cache").then((m) => m.pushSyncSettingsCache());
 }
 
 export function clampTerminalFontSize(fontSize: number) {

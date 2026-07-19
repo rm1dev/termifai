@@ -22,6 +22,45 @@ fn default_version() -> u32 {
     1
 }
 
+fn default_auto_sync() -> bool {
+    true
+}
+
+/// Mirrors the sync engine's settings blobs so the background loop can sync
+/// theme / appearance / shortcuts without reading the webview's localStorage.
+#[derive(Clone, Serialize, Deserialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedSettingsBlob {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsCache {
+    #[serde(default)]
+    pub app_theme: CachedSettingsBlob,
+    #[serde(default)]
+    pub terminal_appearance: CachedSettingsBlob,
+    #[serde(default)]
+    pub shortcuts: CachedSettingsBlob,
+}
+
+/// Diagnostics from the most recent sync cycle (Phase C).
+#[derive(Clone, Serialize, Deserialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStats {
+    pub uploaded: bool,
+    pub applied: bool,
+    #[serde(default)]
+    pub collections_uploaded: Vec<String>,
+    #[serde(default)]
+    pub collections_downloaded: Vec<String>,
+    pub at: String,
+}
+
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncState {
@@ -44,12 +83,27 @@ pub struct SyncState {
     /// nothing changed on either side.
     #[serde(default)]
     pub dirty: bool,
+    /// When true (default), the background loop pushes/pulls automatically.
+    #[serde(default = "default_auto_sync")]
+    pub auto_sync: bool,
+    /// Last error from an automatic or manual sync attempt (cleared on success).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Frontend-pushed settings used by background sync.
+    #[serde(default)]
+    pub settings_cache: SettingsCache,
+    /// Last successful/failed cycle stats for the Settings diagnostics panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync_stats: Option<SyncStats>,
 }
 
 pub fn migrate_sync_state(value: &mut serde_json::Value) {
-    if value.get("version").is_none() {
-        if let Some(obj) = value.as_object_mut() {
+    if let Some(obj) = value.as_object_mut() {
+        if obj.get("version").is_none() {
             obj.insert("version".to_string(), serde_json::Value::from(1u32));
+        }
+        if obj.get("autoSync").is_none() {
+            obj.insert("autoSync".to_string(), serde_json::Value::Bool(true));
         }
     }
 }
@@ -86,5 +140,15 @@ mod tests {
         let json = r#"{"backend":{"kind":"sftp","hostId":"abc123","remotePath":"~/x"},"syncSshKeys":false}"#;
         let parsed: SetSyncConfigRequest = serde_json::from_str(json).expect("should deserialize");
         assert!(matches!(parsed.backend, SyncBackendConfig::Sftp { .. }));
+    }
+
+    #[test]
+    fn legacy_sync_state_gets_auto_sync_default() {
+        let mut value = serde_json::json!({
+            "version": 1,
+            "dirty": false
+        });
+        migrate_sync_state(&mut value);
+        assert_eq!(value["autoSync"], true);
     }
 }

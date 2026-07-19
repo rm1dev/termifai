@@ -248,6 +248,7 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
         return Err(err_msg);
     }
 
+    crate::sync::mark_dirty(app);
     saved_host.ok_or_else(|| "Failed to save host".to_string())
 }
 
@@ -274,6 +275,7 @@ pub fn remove_hosts(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
         })
         .map_err(|e| e.to_string())?;
     crate::tombstones::record(app, crate::tombstones::EntityKind::Host, &ids)?;
+    crate::sync::mark_dirty(app);
     Ok(())
 }
 
@@ -326,6 +328,7 @@ pub fn save_host_group(
         return Err(err_msg);
     }
 
+    crate::sync::mark_dirty(app);
     Ok(group)
 }
 
@@ -369,6 +372,7 @@ pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
         &removed_group_ids,
     )?;
     crate::tombstones::record(app, crate::tombstones::EntityKind::Host, &removed_host_ids)?;
+    crate::sync::mark_dirty(app);
     Ok(())
 }
 
