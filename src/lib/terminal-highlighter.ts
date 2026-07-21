@@ -237,7 +237,10 @@ export function attachSemanticHighlighter(
 
       const prev = tracked.get(abs);
       if (prev) {
-        if (prev.text === text) continue;
+        // بعد از term.clear()/ED3 مارکرها dispose می‌شن ولی map هنوز زنده‌ست —
+        // اگه alive نباشن باید از نو بسازیم، وگرنه هایلایت/رندر قاطی می‌کنه
+        const alive = prev.decorations.every((d) => d.marker && !d.marker.isDisposed);
+        if (prev.text === text && alive) continue;
         disposeLine(prev);
         tracked.delete(abs);
       }
