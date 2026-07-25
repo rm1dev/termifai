@@ -1,10 +1,26 @@
 import { useEffect, useRef, useLayoutEffect, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import type { UnlistenFn } from "@tauri-apps/api/event";
+import {
+  closeSession,
+  createSession,
+  onConnectionStatus,
+  onSessionExited,
+  onSessionOutput,
+  resizeSession,
+  runSnippetScript,
+  writeToSession,
+} from "@/lib/api/terminal";
+import { subscribe, type UnlistenFn } from "@/lib/api/transport";
+import { open as openExternalUrl } from "@tauri-apps/plugin-shell";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { quotePathForShell } from "@/lib/shell-quote";
+import { listSnippets } from "@/lib/api/snippets";
+import { listHosts } from "@/lib/api/hosts";
+import { onSnippetsChanged } from "@/lib/snippets-events";
+import { matchesOsTarget } from "@/features/snippets/osTargets";
 import {
   ensureTerminalFontLoaded,
   getTerminalFontStack,
@@ -20,18 +36,37 @@ import {
   type AppTheme,
 } from "@/lib/app-theme";
 import {
+  formatShortcut,
   isShortcutMatch,
   loadShortcuts,
   shortcutsChangedEvent,
   shortcutsStorageKey,
+  type ShortcutBinding,
   type ShortcutMap,
 } from "@/lib/shortcuts";
-import type { Snippet } from "@/components/app/types";
+import { isMac, platform } from "@/lib/platform";
+import {
+  attachSemanticHighlighter,
+  loadSemanticHighlighting,
+  semanticHighlightingChangedEvent,
+  semanticHighlightingStorageKey,
+} from "@/lib/terminal-highlighter";
+import {
+  applyEscapeToLineTracker,
+  applyInjectedTextToLineTracker,
+  applyRawInputToLineTracker,
+  emptyLineTracker,
+  isAtLineStart,
+  type LineTrackerState,
+} from "@/lib/terminal-line-tracker";
+import * as ContextMenu from "@radix-ui/react-context-menu";
+import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
 import { Search } from "lucide-react";
 
 interface Props {
   sessionId?: string;
   initialCommand?: string;
+  cwd?: string;
   hostId?: string;
   readyMarker?: string;
   connectionLabel?: string;
@@ -39,6 +74,12 @@ interface Props {
   isActive?: boolean;
   onClose?: () => void;
   onSessionCreated?: (sessionId: string) => void;
+  /**
+   * Quick Terminal glass mode: xterm paints its own opaque background canvas,
+   * which would cover the translucent panel — this swaps it for a fully
+   * transparent one so the panel's (blurred) backdrop shows through.
+   */
+  transparentBackground?: boolean;
 }
 
 type ConnectionStage = "connecting" | "handshaking" | "authenticating" | "shell";
@@ -63,6 +104,30 @@ const initialConnectionStatus: ConnectionStatusPayload = {
   status: "active",
   message: "Opening TCP connection to SSH server...",
 };
+
+// Reconnect after an unexpected host disconnect: 3 attempts with increasing
+// backoff, then give up and wait for the user to reconnect manually.
+const RECONNECT_DELAYS_SEC = [2, 4, 8];
+const MAX_RECONNECT_ATTEMPTS = RECONNECT_DELAYS_SEC.length;
+
+interface ReconnectState {
+  phase: "waiting" | "connecting" | "failed";
+  attempt: number;
+  countdown: number;
+}
+
+// Once the user has successfully opened a link with the modifier once, they
+// know the gesture — the hover hint has done its job and would only be
+// noise from then on. Persisted so it stays dismissed across restarts.
+const linkHintDismissedKey = "termifai:link-hint-dismissed";
+
+const menuItemCls =
+  "flex cursor-pointer select-none items-center gap-2 rounded px-2.5 py-1.5 text-xs text-foreground outline-none data-[highlighted]:bg-[var(--color-surface-2)] data-[disabled]:pointer-events-none data-[disabled]:opacity-40";
+
+function MenuShortcut({ binding }: { binding?: ShortcutBinding }) {
+  if (!binding) return null;
+  return <span className="text-[10px] text-muted-foreground">{formatShortcut(binding)}</span>;
+}
 
 function EnumDropdown({
   options,
@@ -147,17 +212,37 @@ function EnumDropdown({
   );
 }
 
-export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated }: Props) {
+export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker, connectionLabel, connectionTitle, isActive, onClose, onSessionCreated, transparentBackground }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const [isConnecting, setIsConnecting] = useState(Boolean(readyMarker && !sessionId));
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
   const [connectionLogs, setConnectionLogs] = useState<string[]>([]);
   const [showConnectionLogs, setShowConnectionLogs] = useState(false);
+  const [reconnectState, setReconnectState] = useState<ReconnectState | null>(null);
   const [snippetPalette, setSnippetPalette] = useState(false);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
+  const [snippetGroups, setSnippetGroups] = useState<SnippetGroup[]>([]);
   const [snippetQuery, setSnippetQuery] = useState("");
   const [snippetIndex, setSnippetIndex] = useState(0);
   const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
+  // Drives the enabled state of "Copy" in the terminal context menu.
+  const [hasSelection, setHasSelection] = useState(false);
+  // Hover hint for detected URLs: position (relative to the terminal
+  // wrapper) plus the link text, shown as a small tooltip until the mouse
+  // leaves the link.
+  const [linkHint, setLinkHint] = useState<{ x: number; y: number; uri: string } | null>(null);
+  // Resolved once per mount: local terminal tabs have no hostId, so `isLocal`
+  // is true; SSH tabs look up the host's OS to gate OS-restricted snippets.
+  const osContextRef = useRef<{ isLocal: boolean; hostOs?: OsKind }>({ isLocal: !hostId });
+  // keyword -> snippet, for the text-only auto-expand feature. Only snippets
+  // with no variables are eligible (mid-line variable prompts would be jarring).
+  const keywordSnippetsRef = useRef<Map<string, Snippet>>(new Map());
+  // متن تایپ‌شده از آخرین Enter — مستقیم از keystroke، نه از بافر xterm
+  // (اکوی PTY دیرتر می‌رسه). برای keyword expand و گیت command/script.
+  const lineTrackerRef = useRef<LineTrackerState>(emptyLineTracker());
+  const noteInjectedInput = (text: string) => {
+    lineTrackerRef.current = applyInjectedTextToLineTracker(lineTrackerRef.current, text);
+  };
   const shortcutsRefLocal = useRef<ShortcutMap>(loadShortcuts());
   const termRef = useRef<Terminal | null>(null);
   const sessionRef = useRef<string | null>(sessionId ?? null);
@@ -165,10 +250,265 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
   const unlistenExitRef = useRef<UnlistenFn | null>(null);
   const unlistenConnectionRef = useRef<UnlistenFn | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  // Cmd+K / منوی Clear — داخل effect ساخته می‌شه چون به term و highlighter نیاز داره
+  const clearTerminalRef = useRef<(() => void) | null>(null);
   const isInitializedRef = useRef(false);
   const mountCountRef = useRef(0);
   const notifiedSessionRef = useRef<string | null>(sessionId ?? null);
   const appearanceRequestRef = useRef(0);
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // The drag-drop event fires at the webview level, not per-DOM-element, and
+  // every tab's XTerminal (including hidden ones) mounts this listener — so
+  // handlers read isActive from a ref to ignore drops over background tabs.
+  const isActiveRef = useRef(isActive);
+  useEffect(() => {
+    isActiveRef.current = isActive;
+  }, [isActive]);
+
+  const clearReconnectTimers = () => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    if (reconnectIntervalRef.current) {
+      clearInterval(reconnectIntervalRef.current);
+      reconnectIntervalRef.current = null;
+    }
+  };
+
+  // Called whenever the PTY session ends unexpectedly. For SSH tabs (hostId
+  // present) this kicks off the auto-reconnect flow; local shells just get
+  // the old "press any key" message since there's no host to reconnect to.
+  const handleDisconnect = () => {
+    if (!hostId) {
+      termRef.current?.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
+      return;
+    }
+    termRef.current?.write("\r\n\x1b[38;2;255;99;99m[Connection to host lost.]\x1b[0m\r\n");
+    reconnectAttemptRef.current = 0;
+    scheduleReconnectAttempt();
+  };
+
+  const scheduleReconnectAttempt = () => {
+    const attempt = reconnectAttemptRef.current + 1;
+    reconnectAttemptRef.current = attempt;
+    if (attempt > MAX_RECONNECT_ATTEMPTS) {
+      clearReconnectTimers();
+      setReconnectState({ phase: "failed", attempt: MAX_RECONNECT_ATTEMPTS, countdown: 0 });
+      return;
+    }
+
+    const delay = RECONNECT_DELAYS_SEC[attempt - 1];
+    let remaining = delay;
+    setReconnectState({ phase: "waiting", attempt, countdown: remaining });
+
+    clearReconnectTimers();
+    reconnectIntervalRef.current = setInterval(() => {
+      remaining -= 1;
+      setReconnectState((s) => (s && s.phase === "waiting" ? { ...s, countdown: Math.max(remaining, 0) } : s));
+    }, 1000);
+    reconnectTimeoutRef.current = setTimeout(() => {
+      void performReconnect(attempt);
+    }, delay * 1000);
+  };
+
+  const performReconnect = async (attempt: number) => {
+    clearReconnectTimers();
+    // termRef is nulled on unmount — a reconnect completing after that would
+    // create an ownerless ssh session that (via tmux attach -D on the same
+    // named session) kicks the client of whichever terminal replaced us.
+    if (!termRef.current) return;
+    setReconnectState({ phase: "connecting", attempt, countdown: 0 });
+    const staleSid = sessionRef.current;
+    try {
+      const term = termRef.current;
+      const newSid = crypto.randomUUID();
+
+      // Register listeners against the new id before creating the session,
+      // same ordering as the initial connect — otherwise output emitted
+      // right after reconnect can be dropped before anything is listening.
+      unlistenOutputRef.current?.();
+      unlistenExitRef.current?.();
+      unlistenOutputRef.current = await onSessionOutput(newSid, (chunk) => {
+        termRef.current?.write(chunk);
+      });
+      unlistenExitRef.current = await onSessionExited(newSid, () => {
+        handleDisconnect();
+      });
+
+      const info = await createSession({
+        sessionId: newSid,
+        cwd: cwd ?? "",
+        initialCommand: initialCommand ?? null,
+        hostId: hostId ?? null,
+        readyMarker: readyMarker ?? null,
+        cols: term?.cols || undefined,
+        rows: term?.rows || undefined,
+      });
+      if (!termRef.current) {
+        closeSession(info.id).catch(() => {});
+        return;
+      }
+      sessionRef.current = info.id;
+      lineTrackerRef.current = emptyLineTracker();
+
+      if (term?.cols && term?.rows) {
+        await resizeSession(info.id, term.cols, term.rows);
+      }
+
+      // Keep the tab's persisted session id (AppShell state) in sync with the
+      // live session — otherwise it stays pinned to the pre-reconnect id and
+      // any later resync of sessionRef.current from that stale prop makes
+      // every keystroke write into a dead/nonexistent session.
+      notifiedSessionRef.current = info.id;
+      onSessionCreated?.(info.id);
+      if (staleSid && staleSid !== info.id) {
+        closeSession(staleSid).catch(() => {});
+      }
+
+      reconnectAttemptRef.current = 0;
+      setReconnectState(null);
+      term?.write("\r\n\x1b[38;2;120;220;140m[Reconnected.]\x1b[0m\r\n");
+    } catch {
+      scheduleReconnectAttempt();
+    }
+  };
+
+  // Manual reconnect from the "failed" screen, or a manual retry at any point.
+  const manualReconnect = () => {
+    clearReconnectTimers();
+    reconnectAttemptRef.current = 0;
+    void performReconnect(1).catch(() => {});
+  };
+
+  // ── Terminal clipboard actions (context menu + Windows right-click) ───────
+  const copySelection = useCallback(() => {
+    const term = termRef.current;
+    const selection = term?.getSelection();
+    if (term && selection) {
+      navigator.clipboard.writeText(selection).catch(() => {});
+      term.clearSelection();
+    }
+  }, []);
+
+  const pasteClipboard = useCallback(() => {
+    const sid = sessionRef.current;
+    if (!sid) return;
+    navigator.clipboard
+      .readText()
+      .then((text) => {
+        if (!text) return;
+        noteInjectedInput(text);
+        writeToSession(sid, text).catch(() => {});
+      })
+      .catch(() => {});
+  }, []);
+
+  const refocusTerminal = useCallback(() => {
+    setTimeout(() => termRef.current?.focus(), 50);
+  }, []);
+
+  // Windows terminal convention (VS Code / Windows Terminal default): right
+  // click never shows a menu — it copies the selection if there is one,
+  // otherwise pastes. macOS/Linux get a context menu instead (see render).
+  const handleWindowsRightClick = useCallback(
+    (event: React.MouseEvent) => {
+      event.preventDefault();
+      if (termRef.current?.hasSelection()) {
+        copySelection();
+      } else {
+        pasteClipboard();
+      }
+    },
+    [copySelection, pasteClipboard]
+  );
+
+  // Dropping a file/folder from the OS file manager onto the terminal types
+  // its (shell-quoted) path, same convention as iTerm2/Terminal.app/Warp.
+  // Tauri's drag-drop event is webview-scoped rather than per-element, so
+  // every tab mounts this listener; isActiveRef filters drops that land
+  // while this pane isn't the visible one.
+  useEffect(() => {
+    let unlisten: (() => void) | null = null;
+    let cancelled = false;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        if (!isActiveRef.current || event.payload.type !== "drop") return;
+        const { paths } = event.payload;
+        const sid = sessionRef.current;
+        if (!sid || !paths.length) return;
+        const text = paths.map(quotePathForShell).join(" ");
+        noteInjectedInput(text);
+        writeToSession(sid, text).catch(() => {});
+        refocusTerminal();
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [refocusTerminal]);
+
+  const loadSnippets = useCallback(() => {
+    return listSnippets().then((data) => {
+      setSnippets(data.snippets);
+      setSnippetGroups(data.groups);
+      const map = new Map<string, Snippet>();
+      for (const s of data.snippets) {
+        if (
+          s.kind === "text" &&
+          s.keyword &&
+          (!s.variables || s.variables.length === 0) &&
+          matchesOsTarget(s.osTargets, osContextRef.current)
+        ) {
+          map.set(s.keyword, s);
+        }
+      }
+      keywordSnippetsRef.current = map;
+    });
+  }, []);
+
+  // Resolve this tab's OS context once, then (re)build the keyword map with it.
+  useEffect(() => {
+    let cancelled = false;
+    if (!hostId) {
+      osContextRef.current = { isLocal: true };
+      void loadSnippets();
+      return;
+    }
+    listHosts()
+      .then(({ hosts }) => {
+        if (cancelled) return;
+        const host = hosts.find((h) => h.id === hostId);
+        osContextRef.current = { isLocal: false, hostOs: host?.os };
+        void loadSnippets();
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hostId]);
+
+  // Refresh the palette + keyword map whenever a snippet is created, edited,
+  // removed, or moved — otherwise changes made in the Snippets panel would
+  // have no effect on terminals that were already open.
+  useEffect(() => {
+    const { unlisten } = onSnippetsChanged(() => void loadSnippets());
+    return unlisten;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+
+  // Constant per window (the quick-terminal window always passes true).
+  const xtermTheme = (theme: AppTheme) =>
+    transparentBackground ? { ...theme.xterm, background: "#00000000" } : theme.xterm;
 
   useLayoutEffect(() => {
     if (!ref.current || isInitializedRef.current) return;
@@ -185,18 +525,97 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       fontFamily: getTerminalFontStack(appearance.fontFamily),
       fontSize: appearance.fontSize,
       lineHeight: appearance.lineHeight,
-      theme: appTheme.xterm,
+      theme: xtermTheme(appTheme),
       allowTransparency: true,
       scrollback: 50000,
+      // registerDecoration (semantic highlighting) and parser.registerOscHandler
+      // (ClipboardAddon's OSC52 support) are gated behind this flag and throw
+      // without it.
+      allowProposedApi: true,
     });
 
     const fit = new FitAddon();
     fitAddonRef.current = fit;
     term.loadAddon(fit);
-    term.loadAddon(new WebLinksAddon());
+    // Links open only with the platform modifier held (⌘ on macOS,
+    // Ctrl elsewhere — the standard terminal-emulator convention), so a
+    // plain click inside a URL still just moves selection. Opening goes
+    // through the Tauri shell plugin: the webview's own window.open (the
+    // addon's default handler) doesn't reach the system browser.
+    term.loadAddon(
+      new WebLinksAddon(
+        (event, uri) => {
+          if (!(isMac ? event.metaKey : event.ctrlKey)) return;
+          setLinkHint(null);
+          try {
+            localStorage.setItem(linkHintDismissedKey, "1");
+          } catch {
+            /* storage unavailable — hint just stays on */
+          }
+          openExternalUrl(uri).catch((err) => console.error("open url failed:", err));
+        },
+        {
+          hover: (event, uri) => {
+            if (localStorage.getItem(linkHintDismissedKey)) return;
+            const rect = ref.current?.getBoundingClientRect();
+            if (!rect) return;
+            setLinkHint({
+              x: Math.max(0, Math.min(event.clientX - rect.left, rect.width - 340)),
+              y: event.clientY - rect.top,
+              uri,
+            });
+          },
+          leave: () => setLinkHint(null),
+        }
+      )
+    );
+    // OSC52 clipboard support: remote programs (tmux, nvim, …) can push
+    // copied text to the system clipboard through this escape sequence.
+    term.loadAddon(new ClipboardAddon());
     term.open(ref.current);
     termRef.current = term;
     requestAnimationFrame(() => term.focus());
+
+    // Semantic highlighting (URLs, IPs, paths, emails, ids, timestamps, log
+    // keywords), colored from the active theme's own xterm palette so each
+    // theme gets its own coherent set of highlight colors.
+    let currentTheme = appTheme;
+    const highlighter = attachSemanticHighlighter(term, () => currentTheme.xterm);
+
+    // Cmd+K نباید فقط term.clear() همگام بزنه:
+    // ۱) clear() با صف write قاطی می‌شه و خروجی pending کرسر رو وسط صفحه می‌بره
+    // ۲) شل از clear لوکال خبر نداره؛ prompt چندخطی/starship با offset غلط redraw می‌کنه
+    //    → چند خط اول ls و مشابه «غیب» می‌شن یا از وسط viewport شروع می‌شن
+    // ۳) clearAllMarkers هایلایتر رو بدون refresh ول می‌کنه
+    // راه‌حل: ED3 از صف write (پاک‌کردن اسکرول‌بک) + Ctrl+L به شل (صفحه + sync کرسر/prompt)
+    const clearTerminalBuffer = () => {
+      if (term.buffer.active.type === "alternate") {
+        // vim و مشابه: فقط viewport؛ Ctrl+L نده که با برنامه قاطی نشه
+        term.write("\x1b[H\x1b[2J", () => {
+          if (!destroyed) highlighter.refresh();
+        });
+        return;
+      }
+
+      term.write("\x1b[3J", () => {
+        if (destroyed) return;
+        term.scrollToTop();
+        highlighter.refresh();
+      });
+
+      const sid = sessionRef.current;
+      if (sid) {
+        writeToSession(sid, "\x0c").catch((err) => {
+          console.error("clear terminal failed:", err);
+        });
+      } else {
+        // هنوز session نداریم — فقط emulator رو خالی کن
+        term.write("\x1b[H\x1b[2J", () => {
+          if (!destroyed) highlighter.refresh();
+        });
+      }
+    };
+    clearTerminalRef.current = clearTerminalBuffer;
 
     // Intercept terminal shortcuts before xterm processes them
     term.attachCustomKeyEventHandler((event) => {
@@ -205,8 +624,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       if (shortcuts["open-snippets"] && isShortcutMatch(event, shortcuts["open-snippets"])) {
         if (event.type === "keydown") {
           event.preventDefault();
-          invoke<Snippet[]>("list_snippets").then((data) => {
-            setSnippets(data);
+          loadSnippets().then(() => {
             setSnippetQuery("");
             setSnippetIndex(0);
             setSnippetPalette(true);
@@ -231,9 +649,19 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
           const sid = sessionRef.current;
           if (sid) {
             navigator.clipboard.readText().then((text) => {
-              invoke("write_to_session", { sessionId: sid, data: text }).catch(() => {});
+              if (!text) return;
+              noteInjectedInput(text);
+              writeToSession(sid, text).catch(() => {});
             }).catch(() => {});
           }
+        }
+        return false;
+      }
+
+      if (shortcuts["clear-terminal"] && isShortcutMatch(event, shortcuts["clear-terminal"])) {
+        if (event.type === "keydown") {
+          event.preventDefault();
+          clearTerminalBuffer();
         }
         return false;
       }
@@ -241,7 +669,15 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       return true;
     });
 
+    // Tabs are never unmounted, just toggled with display:none (see
+    // AppShell). A hidden container reports clientWidth/Height 0, and
+    // fitting against that shrinks the terminal to bogus cols/rows — which
+    // then gets pushed to the backend PTY via onResize below, corrupting
+    // how already-written lines reflow once the tab is shown again. Skip
+    // fitting whenever the container has no real layout box yet.
     const safeFit = () => {
+      const el = ref.current;
+      if (!el || el.clientWidth === 0 || el.clientHeight === 0) return;
       try {
         fit.fit();
       } catch {
@@ -249,6 +685,56 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       }
     };
     requestAnimationFrame(safeFit);
+
+    // Poll across frames until the container's layout box has been the same
+    // size for a few consecutive frames, then fit. Used before creating a
+    // fresh SSH session: `ssh -tt` execs straight into `tmux new-session -A`,
+    // which births the remote window at whatever size the local PTY has *at
+    // that moment* — tmux/byobu's window-size handling frequently doesn't
+    // retroactively grow a window past its birth size even after a later
+    // resize is forwarded over SSH. So the PTY needs the real, *settled*
+    // size up front, not a guess corrected later. A single non-zero reading
+    // isn't enough: right after a new tab is inserted the flex layout can
+    // still be reflowing (and the terminal font may still be loading, which
+    // changes cell measurements), so the first non-zero frame is often a
+    // transient, too-small intermediate size rather than the final one.
+    const waitForLayoutAndFit = (): Promise<void> =>
+      new Promise((resolve) => {
+        let attempts = 0;
+        let lastW = -1;
+        let lastH = -1;
+        let stableFrames = 0;
+        const tick = () => {
+          const el = ref.current;
+          const w = el?.clientWidth ?? 0;
+          const h = el?.clientHeight ?? 0;
+          if (w > 0 && h > 0) {
+            stableFrames = w === lastW && h === lastH ? stableFrames + 1 : 0;
+            lastW = w;
+            lastH = h;
+            if (stableFrames >= 4) {
+              try {
+                fit.fit();
+              } catch {
+                /* element not visible yet */
+              }
+              resolve();
+              return;
+            }
+          }
+          if (++attempts < 60) {
+            requestAnimationFrame(tick);
+          } else {
+            try {
+              fit.fit();
+            } catch {
+              /* element not visible yet */
+            }
+            resolve();
+          }
+        };
+        requestAnimationFrame(tick);
+      });
 
     const ro = new ResizeObserver(safeFit);
     ro.observe(ref.current);
@@ -267,21 +753,30 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
     const onAppearanceChanged = (event: Event) => {
       applyAppearance((event as CustomEvent<TerminalAppearance>).detail);
     };
+    const applyTheme = (theme: AppTheme) => {
+      term.options.theme = xtermTheme(theme);
+      currentTheme = theme;
+      // Existing decorations were painted with the old palette.
+      highlighter.refresh();
+    };
     const onStorageChanged = (event: StorageEvent) => {
       if (event.key === terminalAppearanceStorageKey) {
         applyAppearance(loadTerminalAppearance());
       } else if (event.key === appThemeStorageKey) {
-        term.options.theme = loadAppTheme().xterm;
+        applyTheme(loadAppTheme());
+      } else if (event.key === semanticHighlightingStorageKey) {
+        highlighter.setEnabled(loadSemanticHighlighting());
       }
-    };
-    const applyTheme = (theme: AppTheme) => {
-      term.options.theme = theme.xterm;
     };
     const onAppThemeChanged = (event: Event) => {
       applyTheme((event as CustomEvent<AppTheme>).detail);
     };
+    const onHighlightingChanged = (event: Event) => {
+      highlighter.setEnabled((event as CustomEvent<boolean>).detail);
+    };
     window.addEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
     window.addEventListener(appThemeChangedEvent, onAppThemeChanged);
+    window.addEventListener(semanticHighlightingChangedEvent, onHighlightingChanged);
     window.addEventListener("storage", onStorageChanged);
     const onShortcutStorageChanged = (event: StorageEvent) => {
       if (event.key === shortcutsStorageKey) {
@@ -295,7 +790,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       term.options.lineHeight = appearance.lineHeight;
       safeFit();
     });
-    void listen<TerminalAppearance>(terminalAppearanceChangedEvent, (event) => {
+    void subscribe<TerminalAppearance>(terminalAppearanceChangedEvent, (event) => {
       applyAppearance(event.payload);
     })
       .then((unlisten) => {
@@ -303,7 +798,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
         unlistenAppearance = unlisten;
       })
       .catch(() => {});
-    void listen<AppTheme>(appThemeChangedEvent, (event) => {
+    void subscribe<AppTheme>(appThemeChangedEvent, (event) => {
       applyTheme(event.payload);
     })
       .then((unlisten) => {
@@ -311,22 +806,83 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
         unlistenAppTheme = unlisten;
       })
       .catch(() => {});
+    let unlistenHighlighting: UnlistenFn | null = null;
+    void subscribe<boolean>(semanticHighlightingChangedEvent, (event) => {
+      highlighter.setEnabled(event.payload);
+    })
+      .then((unlisten) => {
+        if (destroyed) { unlisten(); return; }
+        unlistenHighlighting = unlisten;
+      })
+      .catch(() => {});
 
     // Send keystrokes to backend PTY
     const dataDisp = term.onData((data) => {
       const sid = sessionRef.current;
-      if (sid) {
-        invoke("write_to_session", { sessionId: sid, data }).catch((err) =>
-          console.error("write_to_session failed:", err)
-        );
+      if (!sid) return;
+
+      const send = (payload: string) =>
+        writeToSession(sid, payload).catch((err) => {
+          console.error("write_to_session failed:", err);
+          // A "Session not found" write means the backend PTY behind sid is
+          // gone (e.g. it was superseded by a reconnect this component
+          // missed, or the process exited) — every future keystroke would
+          // silently no-op otherwise. Trigger the same recovery path as an
+          // unexpected disconnect instead of leaving the user stuck typing
+          // into a dead session.
+          if (sid === sessionRef.current && String(err).toLowerCase().includes("not found")) {
+            handleDisconnect();
+          }
+        });
+
+      if (data.length === 0) {
+        return;
+      }
+
+      // Escape sequence ها (فلش‌ها و …) جدا از متن printable پیگیری می‌شن
+      if (data.startsWith("\x1b")) {
+        lineTrackerRef.current = applyEscapeToLineTracker(lineTrackerRef.current, data);
+        send(data);
+        return;
+      }
+
+      lineTrackerRef.current = applyRawInputToLineTracker(lineTrackerRef.current, data);
+      send(data);
+
+      // Immediate keyword match: as soon as the word just typed (tracked
+      // locally from raw keystrokes, not read from the terminal's rendered
+      // buffer — the buffer only reflects a keystroke once the PTY echoes it
+      // back asynchronously) exactly equals a known keyword, expand it right
+      // away without waiting for a boundary character. Only eligible on
+      // kind === "text" snippets with no variables.
+      const lineText = lineTrackerRef.current.text;
+      const match = /(\S+)$/.exec(lineText);
+      const word = match?.[1];
+      const snippet = word ? keywordSnippetsRef.current.get(word) : undefined;
+      if (snippet) {
+        const body = snippet.body ?? "";
+        lineTrackerRef.current = {
+          ...lineTrackerRef.current,
+          text: lineText.slice(0, -word!.length) + body,
+        };
+        const erase = "\x7f".repeat(word!.length);
+        send(erase + body);
       }
     });
+
+    const selectionDisp = term.onSelectionChange(() => {
+      setHasSelection(term.hasSelection());
+    });
+
+    // Scrolling shifts link ranges under the pointer without a mouseleave,
+    // so the hover hint would otherwise linger over unrelated content.
+    const scrollDisp = term.onScroll(() => setLinkHint(null));
 
     // Notify backend on resize
     const resizeDisp = term.onResize(({ cols, rows }) => {
       const sid = sessionRef.current;
       if (sid) {
-        invoke("resize_session", { sessionId: sid, cols, rows }).catch((err) =>
+        resizeSession(sid, cols, rows).catch((err) =>
           console.error("resize_session failed:", err)
         );
       }
@@ -336,20 +892,20 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
     const setup = async () => {
       try {
         if (readyMarker) {
-          unlistenConnectionRef.current = await listen<ConnectionStatusPayload>(
-            `term:${readyMarker}:connection-status`,
-            (event) => {
-              if (event.payload.log) {
-                setConnectionLogs((logs) => [...logs.slice(-80), event.payload.log as string]);
+          unlistenConnectionRef.current = await onConnectionStatus<ConnectionStatusPayload>(
+            readyMarker,
+            (payload) => {
+              if (payload.log) {
+                setConnectionLogs((logs) => [...logs.slice(-80), payload.log as string]);
               }
               setConnectionStatus({
-                stage: event.payload.stage,
-                status: event.payload.status,
-                message: event.payload.message,
+                stage: payload.stage,
+                status: payload.status,
+                message: payload.message,
               });
-              if (event.payload.status === "done") {
+              if (payload.status === "done") {
                 setTimeout(() => setIsConnecting(false), 350);
-              } else if (event.payload.status === "failed") {
+              } else if (payload.status === "failed") {
                 setIsConnecting(true);
                 setShowConnectionLogs(true);
               }
@@ -357,42 +913,133 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
           );
         }
 
-        let sid = sessionRef.current;
-        if (!sid) {
-          const info = await invoke<{ id: string; label: string }>("create_session", {
-            cwd: "",
+        // Registers listeners for a brand-new session id *before* calling
+        // createSession (Tauri drops events emitted with no listener
+        // attached — any output the backend emits before this registration
+        // lands would otherwise be silently lost), waits for the container's
+        // real, settled layout so the PTY is opened at the right size (SSH
+        // hosts exec straight into `tmux new-session -A`, which births the
+        // remote window at whatever size the PTY has *right now* — tmux/byobu
+        // won't reliably grow a window past its birth size even once a
+        // later resize is forwarded), then creates the session.
+        // Returns null when this setup pass was orphaned mid-flight (its
+        // mount got cleaned up — Strict Mode double-invoke or a fast
+        // unmount). Aborting matters beyond hygiene: a leaked ssh session
+        // attaches the same named tmux session as the live one, and since
+        // the attach uses `-D` (detach other clients), the orphan and the
+        // real session would kick each other's client off in a loop — seen
+        // by the user as several spurious auto-reconnects right after
+        // connecting.
+        const createFresh = async (): Promise<string | null> => {
+          if (destroyed) return null;
+          const newSid = crypto.randomUUID();
+          sessionRef.current = newSid;
+
+          unlistenOutputRef.current?.();
+          unlistenExitRef.current?.();
+          unlistenOutputRef.current = null;
+          unlistenExitRef.current = null;
+
+          const unlistenOutput = await onSessionOutput(newSid, (chunk) => {
+            if (!readyMarker) setIsConnecting(false);
+            term.write(chunk);
+          });
+          const unlistenExit = await onSessionExited(newSid, () => {
+            if (!readyMarker) setIsConnecting(false);
+            handleDisconnect();
+          });
+
+          // Tears down only what THIS pass created. The shared refs must
+          // never be blanket-disposed here: with two setup passes in flight
+          // (Strict Mode double-invoke), the refs may already hold the
+          // *newer* pass's live listeners, and disposing those would leave
+          // the surviving terminal deaf to all PTY output.
+          const abort = (createdId?: string): null => {
+            unlistenOutput();
+            unlistenExit();
+            if (unlistenOutputRef.current === unlistenOutput) unlistenOutputRef.current = null;
+            if (unlistenExitRef.current === unlistenExit) unlistenExitRef.current = null;
+            if (sessionRef.current === newSid) sessionRef.current = null;
+            if (createdId) closeSession(createdId).catch(() => {});
+            return null;
+          };
+
+          if (destroyed) return abort();
+          unlistenOutputRef.current = unlistenOutput;
+          unlistenExitRef.current = unlistenExit;
+
+          // Character-cell measurements (and therefore fit()'s cols/rows)
+          // depend on the terminal font actually being loaded — fitting
+          // against a fallback font can under/over-count columns.
+          await ensureTerminalFontLoaded(appearance).catch(() => {});
+          await waitForLayoutAndFit();
+
+          if (destroyed) return abort();
+
+          const info = await createSession({
+            sessionId: newSid,
+            cwd: cwd ?? "",
             initialCommand: initialCommand ?? null,
             hostId: hostId ?? null,
             readyMarker: readyMarker ?? null,
+            cols: term.cols || undefined,
+            rows: term.rows || undefined,
           });
-          sid = info.id;
-          sessionRef.current = sid;
-          notifiedSessionRef.current = sid;
-          onSessionCreated?.(sid);
+
+          if (destroyed) return abort(info.id);
+
+          sessionRef.current = info.id;
+          notifiedSessionRef.current = info.id;
+          lineTrackerRef.current = emptyLineTracker();
+          onSessionCreated?.(info.id);
+          return info.id;
+        };
+
+        let sid = sessionRef.current;
+        if (!sid) {
+          sid = await createFresh();
+          if (!sid) return;
+        } else {
+          // Reattaching to an already-running session (e.g. remount, or a
+          // tab restored from before an app restart/backend rebuild — in
+          // which case the backend has no memory of this id at all). Probe
+          // liveness with resize_session; if the backend reports the
+          // session doesn't exist, fall back to creating a fresh one instead
+          // of surfacing "Session not found" as a hard connection failure.
+          try {
+            if (term.cols && term.rows) {
+              await resizeSession(sid, term.cols, term.rows);
+            }
+            const unlistenOutput = await onSessionOutput(sid, (chunk) => {
+              if (!readyMarker) setIsConnecting(false);
+              term.write(chunk);
+            });
+            const unlistenExit = await onSessionExited(sid, () => {
+              if (!readyMarker) setIsConnecting(false);
+              handleDisconnect();
+            });
+            // Orphaned mid-flight: dispose only our own listeners, never the
+            // shared refs — a newer setup pass may own them by now.
+            if (destroyed) {
+              unlistenOutput();
+              unlistenExit();
+              return;
+            }
+            unlistenOutputRef.current = unlistenOutput;
+            unlistenExitRef.current = unlistenExit;
+          } catch (err) {
+            if (!String(err).toLowerCase().includes("not found")) throw err;
+            sid = await createFresh();
+            if (!sid) return;
+          }
         }
 
-        // Listen for PTY output
-        unlistenOutputRef.current = await listen<string>(
-          `term:${sid}:output`,
-          (event) => {
-            if (!readyMarker) setIsConnecting(false);
-            term.write(event.payload);
-          }
-        );
-
-        // Listen for shell exit
-        unlistenExitRef.current = await listen<boolean>(
-          `term:${sid}:exited`,
-          () => {
-            if (!readyMarker) setIsConnecting(false);
-            term.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
-          }
-        );
+        if (destroyed) return;
 
         // Do an initial fit + resize notification to backend
         safeFit();
         if (term.cols && term.rows) {
-          await invoke("resize_session", { sessionId: sid, cols: term.cols, rows: term.rows });
+          await resizeSession(sid, term.cols, term.rows);
         }
       } catch (err) {
         setConnectionStatus({
@@ -411,22 +1058,33 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
       if (mountId !== mountCountRef.current) {
         // Strict Mode double-invoke: این mount قدیمیه، فقط clean کن
         destroyed = true;
+        clearTerminalRef.current = null;
         ro.disconnect();
         dataDisp.dispose();
+        selectionDisp.dispose();
+        scrollDisp.dispose();
+        highlighter.dispose();
         resizeDisp.dispose();
         isInitializedRef.current = false;
         return;
       }
       destroyed = true;
+      clearTerminalRef.current = null;
+      clearReconnectTimers();
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
       window.removeEventListener(appThemeChangedEvent, onAppThemeChanged);
+      window.removeEventListener(semanticHighlightingChangedEvent, onHighlightingChanged);
       window.removeEventListener("storage", onStorageChanged);
       window.removeEventListener("storage", onShortcutStorageChanged);
       unlistenAppTheme?.();
       unlistenAppearance?.();
+      unlistenHighlighting?.();
       ro.disconnect();
       dataDisp.dispose();
+      selectionDisp.dispose();
+      scrollDisp.dispose();
+      highlighter.dispose();
       resizeDisp.dispose();
       unlistenOutputRef.current?.();
       unlistenExitRef.current?.();
@@ -451,7 +1109,7 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
   const closeConnection = () => {
     const sid = sessionRef.current;
     if (sid) {
-      invoke("close_session", { sessionId: sid }).catch(() => {});
+      closeSession(sid).catch(() => {});
     }
     onClose?.();
   };
@@ -468,38 +1126,88 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
     }
   }, [onSessionCreated]);
 
+  // A single requestAnimationFrame after a tab's container flips from
+  // display:none to visible isn't reliably enough time for layout to land
+  // on slower machines (seen on Intel Macs) — fitting too early measures a
+  // stale/zero-size box and corrupts how the terminal reflows. Poll across
+  // frames until the container actually has a size, capped so we don't spin
+  // forever if it's legitimately hidden.
+  const fitWhenLaidOut = useCallback((onDone?: () => void) => {
+    let attempts = 0;
+    const tick = () => {
+      const el = ref.current;
+      if (el && el.clientWidth > 0 && el.clientHeight > 0) {
+        fitAddonRef.current?.fit();
+        // fit() -> term.resize() is a no-op when it computes the same
+        // cols/rows as before, which skips xterm's internal re-render. If
+        // an earlier fit ran against a measurement that turned out to be
+        // wrong (e.g. taken while the container was still hidden), this
+        // guarantees a real repaint against the current, correct dimensions
+        // instead of leaving stale content painted into a stale pixel box.
+        const term = termRef.current;
+        if (term) term.refresh(0, term.rows - 1);
+        onDone?.();
+        return;
+      }
+      if (++attempts < 20) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }, []);
+
   // Re-fit and focus when this tab becomes active
   useEffect(() => {
     if (!isActive || isConnecting) return;
-    requestAnimationFrame(() => {
-      fitAddonRef.current?.fit();
-      requestAnimationFrame(() => termRef.current?.focus());
-    });
-  }, [isActive, isConnecting]);
+    fitWhenLaidOut(() => requestAnimationFrame(() => termRef.current?.focus()));
+  }, [isActive, isConnecting, fitWhenLaidOut]);
 
   // Focus terminal when connection overlay is dismissed
   useEffect(() => {
     if (!isConnecting && termRef.current) {
-      requestAnimationFrame(() => {
-        fitAddonRef.current?.fit();
-        requestAnimationFrame(() => termRef.current?.focus());
-      });
+      fitWhenLaidOut(() => requestAnimationFrame(() => termRef.current?.focus()));
     }
-  }, [isConnecting]);
+  }, [isConnecting, fitWhenLaidOut]);
 
   // ── Snippet Palette Logic ──────────────────────────────────────────────────
 
-  const filteredSnippets = snippets.filter((s) => {
-    // Filter by search query
-    if (!snippetQuery.trim()) return true;
-    const q = snippetQuery.toLowerCase();
-    const content = s.body || s.command || s.script || "";
-    return s.name.toLowerCase().includes(q) || content.toLowerCase().includes(q);
-  });
+  // command/script فقط وقتی خط ورودی خالیه (نه وسط تایپ / تاریخچه شل)
+  const cursorAtLineStart = () => isAtLineStart(lineTrackerRef.current);
+
+  // Full "Parent › Child" path for a snippet's group, or null when ungrouped —
+  // used to cluster the palette by group instead of a flat list.
+  const groupPathFor = (groupId: string | null | undefined): string | null => {
+    if (!groupId) return null;
+    const parts: string[] = [];
+    let cur = snippetGroups.find((g) => g.id === groupId);
+    while (cur) {
+      parts.unshift(cur.name);
+      cur = cur.parentId ? snippetGroups.find((g) => g.id === cur!.parentId) : undefined;
+    }
+    return parts.length > 0 ? parts.join(" › ") : null;
+  };
+
+  const filteredSnippets = snippets
+    .filter((s) => {
+      if (!matchesOsTarget(s.osTargets, osContextRef.current)) return false;
+      if ((s.kind === "command" || s.kind === "script") && !cursorAtLineStart()) return false;
+      // Filter by search query
+      if (!snippetQuery.trim()) return true;
+      const q = snippetQuery.toLowerCase();
+      const content = s.body || s.command || s.script || "";
+      return s.name.toLowerCase().includes(q) || content.toLowerCase().includes(q);
+    })
+    .sort((a, b) => {
+      const pa = groupPathFor(a.groupId);
+      const pb = groupPathFor(b.groupId);
+      if (pa === pb) return 0;
+      if (pa === null) return 1; // ungrouped snippets sort after grouped ones
+      if (pb === null) return -1;
+      return pa.localeCompare(pb);
+    });
 
   const executeSnippet = useCallback((snippet: Snippet, varValues?: Record<string, string>) => {
     const sid = sessionRef.current;
     if (!sid) return;
+    if ((snippet.kind === "command" || snippet.kind === "script") && !cursorAtLineStart()) return;
 
     const resolveVars = (text: string) => {
       if (!snippet.variables?.length) return text;
@@ -515,19 +1223,19 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
 
     if (snippet.kind === "text") {
       const body = resolveVars(snippet.body ?? "");
-      invoke("write_to_session", { sessionId: sid, data: body }).catch(() => {});
+      noteInjectedInput(body);
+      writeToSession(sid, body).catch(() => {});
     } else if (snippet.kind === "command") {
       const cmd = resolveVars(snippet.command ?? "");
-      invoke("write_to_session", { sessionId: sid, data: cmd + "\r" }).catch(() => {});
+      noteInjectedInput(cmd + "\r");
+      writeToSession(sid, cmd + "\r").catch(() => {});
     } else if (snippet.kind === "script") {
       const script = resolveVars(snippet.script ?? "");
-      // Send script to backend — it writes a temp .sh file, executes it, and cleans up
-      // Only title message is shown in terminal, not the script content
-      invoke("run_snippet_script", {
-        sessionId: sid,
-        title: snippet.name,
-        script,
-      }).catch((err) => console.error("run_snippet_script failed:", err));
+      // اسکریپت از بک‌اند می‌ره بالا؛ خط ورودی رو خالی فرض می‌کنیم
+      lineTrackerRef.current = emptyLineTracker();
+      runSnippetScript(sid, snippet.name, script).catch((err) =>
+        console.error("run_snippet_script failed:", err)
+      );
     }
 
     setSnippetPalette(false);
@@ -584,6 +1292,17 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
 
   return (
     <div className="relative h-full w-full bg-background">
+      {linkHint && (
+        <div
+          className="pointer-events-none absolute z-30 flex max-w-[340px] items-center gap-2 rounded-md border border-border bg-popover px-2 py-1 text-xs shadow-lg"
+          style={{ left: linkHint.x, top: linkHint.y + 18 }}
+        >
+          <span className="truncate font-mono text-foreground">{linkHint.uri}</span>
+          <span className="shrink-0 text-muted-foreground">
+            {isMac ? "⌘ + click to open" : "Ctrl + click to open"}
+          </span>
+        </div>
+      )}
       {isConnecting && (
         <div className="absolute inset-0 z-10 flex flex-col items-center justify-center bg-background px-4 text-center">
           <div className="w-full max-w-2xl">
@@ -663,11 +1382,104 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
           </div>
         </div>
       )}
-      <div
-        ref={ref}
-        className="xterm-wrapper h-full w-full pl-1 pt-1"
-        style={{ visibility: isConnecting ? "hidden" : "visible" }}
-      />
+      {!isConnecting && reconnectState && (reconnectState.phase === "waiting" || reconnectState.phase === "connecting") && (
+        <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-3 border-b border-border bg-[var(--color-surface)]/95 px-4 py-2 text-xs backdrop-blur">
+          <div className="flex items-center gap-2">
+            <div className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-muted-foreground border-t-red-400" />
+            <span className="font-medium text-foreground">
+              {reconnectState.phase === "connecting"
+                ? `Reconnecting… (attempt ${reconnectState.attempt} of ${MAX_RECONNECT_ATTEMPTS})`
+                : `Connection lost — retrying (${reconnectState.attempt}/${MAX_RECONNECT_ATTEMPTS}) in ${reconnectState.countdown}s`}
+            </span>
+          </div>
+          {reconnectState.phase === "waiting" && (
+            <button
+              type="button"
+              onClick={() => { clearReconnectTimers(); void performReconnect(reconnectState.attempt); }}
+              className="shrink-0 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-semibold text-foreground hover:bg-[var(--color-surface)]"
+            >
+              Retry now
+            </button>
+          )}
+        </div>
+      )}
+
+      {!isConnecting && reconnectState?.phase === "failed" && (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-background/95 px-4 text-center backdrop-blur">
+          <div className="w-full max-w-sm">
+            <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-red-500/15 text-red-400">
+              <span className="text-2xl">⚠</span>
+            </div>
+            <h3 className="text-base font-bold text-foreground">Connection lost</h3>
+            <p className="mt-1.5 text-sm text-muted-foreground">
+              Couldn&apos;t reconnect after {MAX_RECONNECT_ATTEMPTS} attempts. Your terminal history is preserved.
+            </p>
+            <button
+              type="button"
+              onClick={manualReconnect}
+              className="mt-5 h-9 w-full rounded-md bg-[var(--color-brand-orange,oklch(0.75_0.15_55))] text-sm font-semibold text-white hover:opacity-90"
+            >
+              Connect
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/*
+        The terminal element is never itself hidden while connecting — the
+        opaque, fully-covering overlay above (bg-background, inset-0, z-10)
+        already obscures it visually. Toggling this element's own
+        `visibility` used to also gate it, but xterm.js's FitAddon/
+        CharSizeService measures character-cell size via a probe element in
+        this same DOM subtree, and `visibility:hidden` produced unreliable
+        cell measurements on some platforms — cols/rows would get pinned to
+        a stale, too-small size that a later fit (once visible) wouldn't
+        recompute, since xterm.js treats a resize() to the same cols/rows as
+        a no-op and skips re-rendering its internal canvas to the right
+        pixel size.
+      */}
+      {platform === "windows" ? (
+        <div
+          ref={ref}
+          className="xterm-wrapper h-full w-full pl-1 pt-1"
+          onContextMenu={handleWindowsRightClick}
+        />
+      ) : (
+        <ContextMenu.Root>
+          <ContextMenu.Trigger asChild>
+            <div
+              ref={ref}
+              className="xterm-wrapper h-full w-full pl-1 pt-1"
+            />
+          </ContextMenu.Trigger>
+          <ContextMenu.Portal>
+            <ContextMenu.Content
+              className="z-50 min-w-[180px] overflow-hidden rounded-lg border border-border bg-popover p-1 shadow-xl"
+              onCloseAutoFocus={(e) => {
+                e.preventDefault();
+                refocusTerminal();
+              }}
+            >
+              <ContextMenu.Item className={menuItemCls} disabled={!hasSelection} onSelect={copySelection}>
+                <span className="flex-1">Copy</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["terminal-copy"]} />
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItemCls} onSelect={pasteClipboard}>
+                <span className="flex-1">Paste</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["terminal-paste"]} />
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItemCls} onSelect={() => termRef.current?.selectAll()}>
+                <span className="flex-1">Select All</span>
+              </ContextMenu.Item>
+              <ContextMenu.Separator className="my-1 h-px bg-border" />
+              <ContextMenu.Item className={menuItemCls} onSelect={() => clearTerminalRef.current?.()}>
+                <span className="flex-1">Clear</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["clear-terminal"]} />
+              </ContextMenu.Item>
+            </ContextMenu.Content>
+          </ContextMenu.Portal>
+        </ContextMenu.Root>
+      )}
 
       {/* Snippet Palette */}
       {snippetPalette && (
@@ -696,23 +1508,32 @@ export function XTerminal({ sessionId, initialCommand, hostId, readyMarker, conn
                 filteredSnippets.map((s, i) => {
                   const kindColors: Record<string, string> = { text: "oklch(0.55_0.15_160)", command: "oklch(0.45_0.15_230)", script: "oklch(0.55_0.15_300)" };
                   const kindLabels: Record<string, string> = { text: "Text", command: "Cmd", script: "Script" };
+                  const groupPath = groupPathFor(s.groupId);
+                  const prevGroupPath = i > 0 ? groupPathFor(filteredSnippets[i - 1].groupId) : undefined;
+                  const showGroupHeader = groupPath !== prevGroupPath;
                   return (
-                    <div
-                      key={s.id}
-                      onClick={() => selectSnippet(s)}
-                      className={[
-                        "flex cursor-pointer items-center gap-3 px-3 py-2 transition",
-                        i === snippetIndex ? "bg-[var(--color-surface-2)]" : "hover:bg-[var(--color-surface-2)]/60",
-                      ].join(" ")}
-                    >
-                      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
-                        {kindLabels[s.kind]?.[0] || "C"}
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
-                        <div className="truncate text-xs text-muted-foreground font-mono">{s.body || s.command || s.script || ""}</div>
+                    <div key={s.id}>
+                      {showGroupHeader && (
+                        <div className="px-3 pb-1 pt-2.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70 first:pt-1.5">
+                          {groupPath ?? "Ungrouped"}
+                        </div>
+                      )}
+                      <div
+                        onClick={() => selectSnippet(s)}
+                        className={[
+                          "flex cursor-pointer items-center gap-3 px-3 py-2 transition",
+                          i === snippetIndex ? "bg-[var(--color-surface-2)]" : "hover:bg-[var(--color-surface-2)]/60",
+                        ].join(" ")}
+                      >
+                        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
+                          {kindLabels[s.kind]?.[0] || "C"}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
+                          <div className="truncate text-xs text-muted-foreground font-mono">{s.body || s.command || s.script || ""}</div>
+                        </div>
+                        <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">{kindLabels[s.kind] || "Command"}</span>
                       </div>
-                      <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] text-muted-foreground">{kindLabels[s.kind] || "Command"}</span>
                     </div>
                   );
                 })

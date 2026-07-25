@@ -5,29 +5,8 @@ use std::io::{Read, Write};
 use std::sync::Mutex;
 use std::thread;
 use tauri::{AppHandle, Manager};
-
-#[derive(Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum TunnelDirection {
-    Local,
-    Remote,
-    Dynamic,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PortForwardRule {
-    pub id: String,
-    pub name: String,
-    pub host_id: String,
-    pub direction: TunnelDirection,
-    pub local_host: String,
-    pub local_port: u16,
-    pub remote_host: String,
-    pub remote_port: u16,
-    pub auto_connect: bool,
-    pub created_at: String,
-}
+use termifai_core::model::forwards::migrate_port_forward_vault;
+pub use termifai_core::model::forwards::{PortForwardRule, PortForwardVault, TunnelDirection};
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,18 +31,6 @@ pub struct SavePortForwardRequest {
     pub auto_connect: bool,
 }
 
-fn default_version() -> u32 {
-    1
-}
-
-#[derive(Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct PortForwardVault {
-    #[serde(default = "default_version")]
-    pub version: u32,
-    pub rules: Vec<PortForwardRule>,
-}
-
 /// Manages running SSH tunnel processes.
 pub struct TunnelManager {
     /// Map from rule_id to child process handle
@@ -76,20 +43,19 @@ impl TunnelManager {
             processes: HashMap::new(),
         }
     }
+
+    /// Kills every running tunnel process — used by quit-to-background reset.
+    pub fn stop_all(&mut self) {
+        for (_, mut child) in self.processes.drain() {
+            let _ = child.kill();
+        }
+    }
 }
 
 pub type TunnelManagerState = Mutex<TunnelManager>;
 
 pub fn new_tunnel_manager() -> TunnelManagerState {
     Mutex::new(TunnelManager::new())
-}
-
-fn migrate_port_forward_vault(value: &mut serde_json::Value) {
-    if value.get("version").is_none() {
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert("version".to_string(), serde_json::Value::from(1u32));
-        }
-    }
 }
 
 pub fn list_port_forwards(app: &AppHandle) -> Result<Vec<PortForwardRule>, String> {
@@ -155,7 +121,8 @@ pub fn save_port_forward(
                 },
                 remote_port: request.remote_port,
                 auto_connect: request.auto_connect,
-                created_at: existing_created.unwrap_or(now),
+                created_at: existing_created.unwrap_or_else(|| now.clone()),
+                updated_at: Some(now.clone()),
             };
 
             upsert_by_id(&mut vault.rules, rule.clone(), |r| &r.id);
@@ -163,6 +130,7 @@ pub fn save_port_forward(
         })
         .map_err(|e| e.to_string())?;
 
+    crate::sync::mark_dirty(app);
     saved_rule.ok_or_else(|| "Failed to save rule".to_string())
 }
 
@@ -187,6 +155,8 @@ pub fn remove_port_forwards(
             vault.rules.retain(|r| !ids.contains(&r.id));
         })
         .map_err(|e| e.to_string())?;
+    crate::tombstones::record(app, crate::tombstones::EntityKind::PortForward, &ids)?;
+    crate::sync::mark_dirty(app);
     Ok(())
 }
 
@@ -563,4 +533,16 @@ fn now_iso() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+#[cfg(test)]
+mod quit_reset_tests {
+    use super::*;
+
+    #[test]
+    fn stop_all_on_empty_manager_is_noop() {
+        let mut mgr = TunnelManager::new();
+        mgr.stop_all();
+        assert!(mgr.processes.is_empty());
+    }
 }

@@ -9,22 +9,45 @@ This document provides a high-level overview of the architectural design, codeba
 ```
 termifai/
 ├── src/                          # React + TypeScript Frontend
-│   ├── main.tsx                  # Webview entry point
-│   ├── components/               # App layout & feature components
-│   └── lib/                      # Themes, shortcuts, and style configurations
+│   ├── main.tsx                  # Webview entry point — routes window type (main / settings / quick-terminal)
+│   ├── components/
+│   │   ├── app/                  # Main window shell: tabs, terminal workspace, vault gate
+│   │   ├── settings/             # Settings window
+│   │   ├── quick-terminal/       # Quake-style drop-down terminal window
+│   │   ├── shared/               # Shared UI primitives (modals, …)
+│   │   └── ui/                   # shadcn/ui primitives (Radix-based, generated)
+│   ├── features/                 # Feature views: hosts, sftp, dashboard, snippets, ssh-keys, port-forwarding
+│   ├── hooks/                    # React hooks
+│   └── lib/                      # Themes, shortcuts, appearance config
+│       └── api/                  # Typed Tauri command bindings (one file per backend module)
 │
-├── src-tauri/                    # Tauri + Rust Desktop Backend
-│   ├── Cargo.toml                # Rust dependencies
-│   ├── tauri.conf.json           # Native capabilities, window permissions
+├── src-tauri/                    # Tauri + Rust Desktop Backend (Cargo workspace)
+│   ├── Cargo.toml                # Workspace definition & app dependencies
+│   ├── tauri.conf.json           # Native capabilities, window permissions, bundling
+│   ├── crates/
+│   │   ├── termifai-core/        # Tauri-free core library
+│   │   │   └── src/
+│   │   │       ├── crypto.rs     # Argon2id KDF + ChaCha20-Poly1305 field encryption
+│   │   │       ├── store.rs      # JsonStore<T>: atomic, thread-safe file persistence
+│   │   │       ├── model/        # Host, snippet, SSH key, forward, vault, tombstone schemas
+│   │   │       └── sync/         # E2E-encrypted sync engine (Google Drive, Dropbox, local dir)
+│   │   └── termifaid/            # Background daemon: global hotkeys, app launcher
+│   ├── finder-extension/         # macOS Finder "Open in Termifai" extension (Swift)
 │   └── src/
-│       ├── main.rs               # Backend entry point
-│       ├── lib.rs                # Tauri command orchestration
-│       ├── store.rs              # Atomic, thread-safe file persistence
-│       ├── vault.rs              # Master keys and settings
-│       ├── hosts.rs              # SSH host configuration management
-│       ├── port_forwarding.rs    # SSH port forwarding tunnels
+│       ├── main.rs               # Process entry, single-instance, CLI args
+│       ├── lib.rs                # Tauri command orchestration, window builders, tray
+│       ├── pty_manager.rs        # PTY terminals & SSH verbose log tracker
+│       ├── ssh/                  # Shared SSH connect + known_hosts verification (libssh2)
+│       ├── hosts.rs              # SSH host & group repository
+│       ├── vault.rs              # Master-key lifecycle, lock policies, keychain caching
+│       ├── port_forwarding.rs    # SSH tunnels (local / remote / dynamic SOCKS)
 │       ├── sftp.rs               # SFTP session transfers & operations
-│       └── pty_manager.rs        # PTY terminals & SSH verbose log tracker
+│       ├── ssh_keys.rs           # SSH key generation & import
+│       ├── snippets.rs           # Snippet catalog (+ snippet_exec.rs for execution)
+│       ├── dashboard.rs          # Remote metrics polling (CPU, RAM, disk, network, Docker)
+│       ├── sync.rs               # App-side hooks into termifai-core's sync engine
+│       ├── global_hotkey.rs      # Global hotkey configuration
+│       └── quick_terminal.rs     # Quick Terminal window management
 ```
 
 ---
@@ -42,7 +65,7 @@ We enforce a strict separation of concerns between native orchestration and busi
 ### Data Persistence Rule
 
 - User configurations (hosts, snippets, keys, tunnels) are stored as JSON databases.
-- We do **not** use manual file writes. Instead, we use `JsonStore<T>` (defined in `src-tauri/src/store.rs`), which provides:
+- We do **not** use manual file writes. Instead, we use `JsonStore<T>` (defined in `src-tauri/crates/termifai-core/src/store.rs`), which provides:
   1. Thread-safe atomic file writes using a `.tmp` file and `rename`.
   2. Operating system sync (`fsync`) to guarantee data is fully persisted on the disk.
   3. Thread-safe synchronization using a per-file lock.
