@@ -1,8 +1,8 @@
 use crate::sftp_transfer::{
     clear_download_resume_files, clear_upload_marker, download_marker_matches,
-    download_resume_offset_verified, download_tmp_path, same_file_identity,
-    upload_marker_matches, upload_resume_offset_verified, write_download_marker,
-    write_upload_marker, DownloadMarker, UploadMarker,
+    download_resume_offset_verified, download_tmp_path, same_file_identity, upload_marker_matches,
+    upload_resume_offset_verified, write_download_marker, write_upload_marker, DownloadMarker,
+    UploadMarker,
 };
 use crate::ssh;
 use serde::{Deserialize, Serialize};
@@ -466,9 +466,8 @@ impl SftpEntry {
         // خطای شبکه/Cancel: tmp+marker برای resume می‌مونن
         result?;
 
-        std::fs::rename(&tmp_path, local_path).map_err(|e| {
-            format!("rename tmp to '{}': {}", local_path, e)
-        })?;
+        std::fs::rename(&tmp_path, local_path)
+            .map_err(|e| format!("rename tmp to '{}': {}", local_path, e))?;
         let _ = std::fs::remove_file(crate::sftp_transfer::download_marker_path(local_path));
         Ok(())
     }
@@ -501,8 +500,7 @@ impl SftpEntry {
             .ok()
             .and_then(|s| s.size);
 
-        let identity_ok =
-            upload_marker_matches(local_path, remote_path, total_bytes, local_mtime);
+        let identity_ok = upload_marker_matches(local_path, remote_path, total_bytes, local_mtime);
         let resume_at =
             upload_resume_offset_verified(remote_len, total_bytes, identity_ok).unwrap_or(0);
 
@@ -911,12 +909,8 @@ impl SftpEntry {
             let local_brief = stat_local_brief(lp);
             if let Some((_, dest_size, dest_mtime)) = &remote_brief {
                 let local_mtime = local_brief.as_ref().and_then(|(_, _, m)| *m);
-                let identical = same_file_identity(
-                    dest_size.unwrap_or(0),
-                    *dest_mtime,
-                    *size,
-                    local_mtime,
-                );
+                let identical =
+                    same_file_identity(dest_size.unwrap_or(0), *dest_mtime, *size, local_mtime);
                 if identical && !conflicts.forces_overwrite() {
                     offset += size;
                     on_progress(TransferProgress {
@@ -929,12 +923,7 @@ impl SftpEntry {
                 }
                 let lp_str = lp.to_string_lossy();
                 let is_our_partial = dest_size.map(|d| d > 0 && d < *size).unwrap_or(false)
-                    && upload_marker_matches(
-                        &lp_str,
-                        rp,
-                        *size,
-                        local_mtime.unwrap_or(0),
-                    );
+                    && upload_marker_matches(&lp_str, rp, *size, local_mtime.unwrap_or(0));
                 if !is_our_partial {
                     if let Some((dest_is_dir, dest_size, dest_mtime)) = remote_brief {
                         // هم‌اندازه با محتوای متفاوت، یا فایل غریبه — از کاربر بپرس / OverwriteAll
@@ -1109,17 +1098,14 @@ impl SftpEntry {
                     continue;
                 }
 
-                let has_our_tmp = download_marker_matches(
-                    &lp_str,
-                    rp,
-                    *size,
-                    remote_mtime.unwrap_or(0),
-                ) && std::fs::metadata(download_tmp_path(&lp_str))
-                    .map(|m| {
-                        let n = m.len();
-                        n > 0 && n < *size
-                    })
-                    .unwrap_or(false);
+                let has_our_tmp =
+                    download_marker_matches(&lp_str, rp, *size, remote_mtime.unwrap_or(0))
+                        && std::fs::metadata(download_tmp_path(&lp_str))
+                            .map(|m| {
+                                let n = m.len();
+                                n > 0 && n < *size
+                            })
+                            .unwrap_or(false);
 
                 if !has_our_tmp {
                     let proceed = conflicts.resolve(&ConflictInfo {
