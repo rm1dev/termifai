@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { sftpCall } from "@/lib/api/sftp";
 import * as Dialog from "@radix-ui/react-dialog";
 import * as Switch from "@radix-ui/react-switch";
 import * as Select from "@radix-ui/react-select";
@@ -54,8 +54,8 @@ export function SftpPermissionsDialog({ open, sessionId, path, onClose }: SftpPe
     setLoading(true);
     setError(null);
     Promise.all([
-      invoke<{ permissions: number; owner: string; group: string }>("sftp_stat_remote", { sessionId, path }),
-      invoke<{ users: string[]; groups: string[] }>("sftp_get_users_groups", { sessionId }),
+      sftpCall<{ permissions: number; owner: string; group: string }>("sftp_stat_remote", { sessionId, path }),
+      sftpCall<{ users: string[]; groups: string[] }>("sftp_get_users_groups", { sessionId }),
     ])
       .then(([stat, ug]) => {
         const octal = (stat.permissions & 0o777).toString(8).padStart(3, "0");
@@ -83,13 +83,13 @@ export function SftpPermissionsDialog({ open, sessionId, path, onClose }: SftpPe
 
   const applyChmod = async () => {
     try {
-      await invoke("sftp_chmod", { sessionId, path, mode: octalInput, recursive: chmodRecursive });
+      await sftpCall("sftp_chmod", { sessionId, path, mode: octalInput, recursive: chmodRecursive });
     } catch (e) { setError(String(e)); }
   };
 
   const applyChown = async () => {
     try {
-      await invoke("sftp_chown", { sessionId, path, user: selectedUser, group: selectedGroup, recursive: chownRecursive });
+      await sftpCall("sftp_chown", { sessionId, path, user: selectedUser, group: selectedGroup, recursive: chownRecursive });
     } catch (e) { setError(String(e)); }
   };
 

@@ -79,12 +79,45 @@ pub fn connect(cfg: &SshConfig, on_stage: impl Fn(&str, &str)) -> Result<Session
         "connecting",
         &format!("Opening TCP connection to {addr}..."),
     );
-    let tcp = TcpStream::connect(&addr).map_err(|e| SshError::Tcp(e.to_string()))?;
-    tcp.set_read_timeout(Some(Duration::from_secs(15))).ok();
-    tcp.set_write_timeout(Some(Duration::from_secs(15))).ok();
+    let sock_addrs: Vec<std::net::SocketAddr> =
+        std::net::ToSocketAddrs::to_socket_addrs(&addr.as_str())
+            .map_err(|e| SshError::Tcp(e.to_string()))?
+            .collect();
+
+    // Match TcpStream::connect semantics: try every resolved address in
+    // order (IPv4/IPv6 dual-stack, round-robin DNS), but bound each dial.
+    let mut tcp: Option<TcpStream> = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for sock_addr in &sock_addrs {
+        match TcpStream::connect_timeout(sock_addr, Duration::from_secs(10)) {
+            Ok(stream) => {
+                tcp = Some(stream);
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    let tcp = tcp.ok_or_else(|| match last_err {
+        Some(e) => SshError::Tcp(e.to_string()),
+        None => SshError::Tcp(format!("Could not resolve {addr}")),
+    })?;
+    // This timeout bounds a single blocking read()/write() on the socket, not
+    // the whole operation — but it's set on the session's TCP stream for its
+    // entire lifetime, which SFTP reuses for uploads/downloads/directory
+    // listings that can run far longer than a handshake. 15s was tight enough
+    // to fail large transfers or slow links ("Timed out waiting on socket")
+    // even though the connection was alive; 120s still catches a genuinely
+    // dead socket while giving slow I/O room to complete. True liveness is
+    // covered separately by the 15s keepalive below.
+    tcp.set_read_timeout(Some(Duration::from_secs(120))).ok();
+    tcp.set_write_timeout(Some(Duration::from_secs(120))).ok();
+    // کم کردن latency برای SFTP کوچک/چندفایله (Phase 2a)
+    tcp.set_nodelay(true).ok();
 
     let mut session = Session::new().map_err(|e| SshError::Handshake(e.to_string()))?;
     session.set_tcp_stream(tcp);
+    // فشرده‌سازی پیش‌فرض خاموش — روی LAN معمولاً ضرر می‌زنه؛ بعداً می‌شه تنظیم کرد
+    session.set_compress(false);
 
     // Nudge libssh2 to negotiate whichever host key type is already recorded
     // for this host in known_hosts (mirroring what the system `ssh` binary
