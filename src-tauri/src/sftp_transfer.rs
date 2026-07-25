@@ -372,7 +372,9 @@ pub fn upload_marker_matches(
 ) -> bool {
     match read_upload_marker(local_path) {
         Some(m) => {
-            m.remote_path == remote_path && m.local_size == local_size && m.local_mtime == local_mtime
+            m.remote_path == remote_path
+                && m.local_size == local_size
+                && m.local_mtime == local_mtime
         }
         None => false,
     }
@@ -405,7 +407,12 @@ pub fn upload_resume_offset_verified(
 }
 
 /// فایل هم‌اندازه فقط وقتی mtime هم بخونه «کامل» حساب می‌شه.
-pub fn same_file_identity(size_a: u64, mtime_a: Option<u64>, size_b: u64, mtime_b: Option<u64>) -> bool {
+pub fn same_file_identity(
+    size_a: u64,
+    mtime_a: Option<u64>,
+    size_b: u64,
+    mtime_b: Option<u64>,
+) -> bool {
     size_a == size_b && mtime_a.is_some() && mtime_a == mtime_b
 }
 
@@ -421,7 +428,9 @@ mod tests {
         assert!(is_retryable_network_error("Broken pipe"));
         assert!(is_retryable_network_error("SFTP subsystem: channel closed"));
         assert!(is_retryable_network_error("failed receiving channel data"));
-        assert!(is_retryable_network_error("TCP connect to host: Connection refused"));
+        assert!(is_retryable_network_error(
+            "TCP connect to host: Connection refused"
+        ));
         assert!(is_retryable_network_error(
             "SFTP subsystem: [Session(-21)] Unable to startup channel"
         ));

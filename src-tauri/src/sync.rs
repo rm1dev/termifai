@@ -473,7 +473,10 @@ pub fn sync_now(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowResul
 
 /// Like `sync_now`, but returns `None` immediately if another sync holds the lock
 /// (used by the background loop so ticks don't pile up behind a long upload).
-pub fn try_sync_now(app: &AppHandle, request: SyncNowRequest) -> Option<Result<SyncNowResult, String>> {
+pub fn try_sync_now(
+    app: &AppHandle,
+    request: SyncNowRequest,
+) -> Option<Result<SyncNowResult, String>> {
     let Ok(_guard) = sync_mutex().try_lock() else {
         return None;
     };
@@ -549,18 +552,18 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
 
     // اگه فرانت تنظیمات نفرستاده، از کش دیسک استفاده کن (مسیر auto-sync)
     let settings = SettingsPayload {
-        app_theme: request
-            .app_theme
-            .unwrap_or_else(|| SettingsBlob {
-                value: sync_state.settings_cache.app_theme.value.clone(),
-                updated_at: sync_state.settings_cache.app_theme.updated_at.clone(),
-            }),
-        terminal_appearance: request
-            .terminal_appearance
-            .unwrap_or_else(|| SettingsBlob {
-                value: sync_state.settings_cache.terminal_appearance.value.clone(),
-                updated_at: sync_state.settings_cache.terminal_appearance.updated_at.clone(),
-            }),
+        app_theme: request.app_theme.unwrap_or_else(|| SettingsBlob {
+            value: sync_state.settings_cache.app_theme.value.clone(),
+            updated_at: sync_state.settings_cache.app_theme.updated_at.clone(),
+        }),
+        terminal_appearance: request.terminal_appearance.unwrap_or_else(|| SettingsBlob {
+            value: sync_state.settings_cache.terminal_appearance.value.clone(),
+            updated_at: sync_state
+                .settings_cache
+                .terminal_appearance
+                .updated_at
+                .clone(),
+        }),
         shortcuts: request.shortcuts.unwrap_or_else(|| SettingsBlob {
             value: sync_state.settings_cache.shortcuts.value.clone(),
             updated_at: sync_state.settings_cache.shortcuts.updated_at.clone(),
@@ -976,7 +979,8 @@ fn apply_outcome(
             // اگه پسورد منطقی عوض نشده، همون ciphertext قبلی رو نگه می‌داریم
             // تا هر sync بی‌خودی vault محلی رو کثیف نکنه.
             if let Some(existing) = existing_hosts.iter().find(|h| h.id == host.id) {
-                if crate::hosts::decrypt_host_password(existing).as_deref() == Some(plaintext.as_str())
+                if crate::hosts::decrypt_host_password(existing).as_deref()
+                    == Some(plaintext.as_str())
                 {
                     host.password = existing.password.clone();
                     continue;

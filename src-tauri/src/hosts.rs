@@ -28,6 +28,8 @@ pub struct SaveHostRequest {
     pub default_sftp_path: Option<String>,
     #[serde(default)]
     pub sync_server: Option<bool>,
+    #[serde(default)]
+    pub resilient_session: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +239,8 @@ pub fn save_host(app: &AppHandle, request: SaveHostRequest) -> Result<Host, Stri
                     .filter(|value| !value.trim().is_empty()),
                 updated_at: Some(now),
                 sync_server: if is_sync_server { Some(true) } else { None },
+                // فقط وقتی روشنه ذخیره‌ش کن که فایل JSON شلوغ نشه
+                resilient_session: request.resilient_session.filter(|v| *v),
             };
 
             upsert_by_id(&mut vault.hosts, host.clone(), |item| &item.id);
@@ -672,6 +676,7 @@ mod tests {
             default_sftp_path: None,
             updated_at: None,
             sync_server: None,
+            resilient_session: None,
         };
         assert_eq!(decrypt_host_password(&host), Some("plainpw".to_string()));
     }
@@ -696,6 +701,7 @@ mod tests {
             default_sftp_path: None,
             updated_at: None,
             sync_server: None,
+            resilient_session: None,
         };
         assert_eq!(decrypt_host_password(&host), None);
     }
