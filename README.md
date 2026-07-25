@@ -16,10 +16,7 @@ Built with Rust and Tauri 2 — native performance, tiny footprint, and your sec
 [![Platforms](https://img.shields.io/badge/Platforms-macOS%20%7C%20Windows%20%7C%20Linux-lightgrey)](#installation)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-[Features](#features) · [Security](#security) · [Installation](#installation) · [Development](#development) · [Architecture](#architecture) · [Contributing](#contributing)
-
-<!-- Screenshot: drop a hero screenshot at .github/assets/screenshot-main.png and uncomment -->
-<!-- <img src=".github/assets/screenshot-main.png" alt="Termifai main window" width="820" /> -->
+[Features](#features) · [Roadmap](#roadmap) · [Security](#security) · [Installation](#installation) · [Development](#development) · [Architecture](#architecture) · [Contributing](#contributing)
 
 </div>
 
@@ -34,6 +31,10 @@ Managing servers means trusting your tools with your most sensitive credentials.
 - **Encrypted before it leaves.** Optional multi-device sync encrypts everything client-side with a key derived from your master password. Cloud providers only ever see ciphertext.
 - **Real host key verification.** SSH host keys are checked against `known_hosts` and connections hard-fail on a key mismatch — for terminals, tunnels, SFTP, and dashboards alike.
 - **Native and lightweight.** A Rust backend and system webview instead of a bundled browser engine — fast startup, low memory, and a real PTY under every tab.
+
+<div align="center">
+  <img src=".github/assets/termifai-tour.gif" alt="Termifai — Hosts, Dashboard overview, and host detail" width="820" />
+</div>
 
 ## Features
 
@@ -95,6 +96,16 @@ Managing servers means trusting your tools with your most sensitive credentials.
 - **Customizable keyboard shortcuts**, terminal fonts, and appearance
 - **System tray & background mode** with optional autostart
 - **Single-instance** app with multi-window support
+
+## Roadmap
+
+Planned work — unchecked items are not started yet; checked items ship in a release.
+
+- [ ] **OpenTelemetry (OTLP) connectivity** — connect to an OpenTelemetry Collector / agent on a host to pull or stream observability signals (metrics / traces / logs) into Termifai. This is *host* observability, not app analytics; Termifai itself still collects no usage telemetry.
+- [ ] **Tiled terminal panes** — classic horizontal/vertical pane splits inside a tab (à la iTerm2 / Windows Terminal / tmux), independent of multi-window
+- [ ] **Built-in remote file editor** — edit remote files inside Termifai with syntax highlighting for shell, YAML, and common programming languages (complements the existing “open in local editor” flow)
+- [ ] **Richer host OS overview** — expand the existing Server Dashboard with deeper OS inventory (distro/kernel, services, packages, filesystem layout) beyond live CPU / RAM / disk / network / Docker metrics
+- [ ] **Remote-to-remote file transfer** — copy files/folders between two SSH hosts from Termifai, primarily via a **dual-SFTP relay through the client** (reuse the existing transfer engine: progress, pause/resume, conflicts). Optional later: direct server-to-server copy when the source can reach the destination (e.g. `rsync`/`scp` over SSH) to avoid using local bandwidth
 
 ## Security
 

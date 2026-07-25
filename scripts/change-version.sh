@@ -4,6 +4,9 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
 NEW_VERSION="${1:-}"
 
 if [ -z "$NEW_VERSION" ]; then
@@ -37,5 +40,11 @@ perl -0777 -pi -e 's/(\[package\].*?\bversion\s*=\s*")[^"]+(")/${1}'"$NEW_VERSIO
 perl -0777 -pi -e 's/(\[package\].*?\bversion\s*=\s*")[^"]+(")/${1}'"$NEW_VERSION"'${2}/s' src-tauri/crates/termifai-core/Cargo.toml
 perl -0777 -pi -e 's/(\[package\].*?\bversion\s*=\s*")[^"]+(")/${1}'"$NEW_VERSION"'${2}/s' src-tauri/crates/termifaid/Cargo.toml
 echo "Updated Cargo.toml files"
+
+# Sync Cargo.lock with workspace package versions
+# (editing Cargo.toml alone does not refresh the lockfile)
+cargo update --manifest-path src-tauri/Cargo.toml \
+  -p termifai -p Termifaid -p termifai-core
+echo "Updated src-tauri/Cargo.lock"
 
 echo "Version update complete!"
