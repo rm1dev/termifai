@@ -765,6 +765,8 @@ function HostModal({
   const [showStatus, setShowStatus] = useState(host?.showStatusInDashboard ?? true);
   const [workingDir, setWorkingDir] = useState(host?.workingDirectory ?? "");
   const [sftpPath, setSftpPath] = useState(host?.defaultSftpPath ?? "/");
+  // پیش‌فرض خاموش: tmux اسکرول‌بک لوکال رو موقع خروجی پرحجم ناقص می‌کنه
+  const [resilient, setResilient] = useState(host?.resilientSession ?? false);
   const [sshKeys, setSshKeys] = useState<SshKey[]>([]);
   const [testing, setTesting] = useState(false);
 
@@ -973,12 +975,21 @@ function HostModal({
             <HostModalRow label="Show Status in Dashboard">
               <HostModalToggle checked={showStatus} onChange={setShowStatus} />
             </HostModalRow>
+            <HostModalRow label="Resilient Session (tmux)">
+              <HostModalToggle checked={resilient} onChange={setResilient} />
+            </HostModalRow>
             <HostModalRow label="Working Directory">
               <HostModalInput value={workingDir} onChange={(e) => setWorkingDir(e.target.value)} placeholder="e.g. /home/user/project" />
             </HostModalRow>
             <HostModalRow label="Default SFTP Path">
               <HostModalInput value={sftpPath} onChange={(e) => setSftpPath(e.target.value)} placeholder="/" />
             </HostModalRow>
+          </div>
+          <div className="px-4 pb-2 pt-1.5">
+            <p className="text-right text-[11px] text-muted-foreground">
+              Resilient Session keeps your shell alive across reconnects via tmux, but local
+              scrollback may miss lines during heavy output.
+            </p>
           </div>
         </div>
 
@@ -1014,6 +1025,7 @@ function HostModal({
                 showStatusInDashboard: showStatus,
                 workingDirectory: workingDir.trim() || undefined,
                 defaultSftpPath: sftpPath,
+                resilientSession: resilient || undefined,
                 // Not editable from this form — preserve whatever Settings → Sync set.
                 syncServer: host?.syncServer,
               })

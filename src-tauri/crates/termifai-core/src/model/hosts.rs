@@ -33,6 +33,12 @@ pub struct Host {
     /// Enforced in `save_host`. This host is the SFTP sync target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_server: Option<bool>,
+    // اگه true باشه، ترمینال SSH این هاست داخل یه سشن tmux باز می‌شه که بعد از
+    // قطعی اتصال همون شل قبلی رو زنده نگه می‌داره. عوضش tmux موقع خروجی‌های
+    // پرحجم (مثل cat یه فایل بزرگ) خط‌های وسط رو برای ترمینال نمی‌فرسته و
+    // اسکرول‌بک لوکال ناقص می‌شه — برای همین پیش‌فرض خاموشه.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resilient_session: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

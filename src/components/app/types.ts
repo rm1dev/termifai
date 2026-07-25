@@ -18,6 +18,9 @@ export interface Host {
   defaultSftpPath?: string;
   /** Marks this host as the SFTP sync target (Settings → Sync → My Server). At most one host can have this set. */
   syncServer?: boolean;
+  // ترمینال SSH داخل tmux باز بشه که سشن بعد از قطعی زنده بمونه؟
+  // پیش‌فرض خاموش، چون tmux خروجی‌های پرحجم رو کامل به اسکرول‌بک لوکال نمی‌رسونه.
+  resilientSession?: boolean;
 }
 
 export interface HostGroup {
