@@ -1826,6 +1826,8 @@ fn take_pending_open_folders(state: State<PendingOpenFolders>) -> Vec<String> {
 enum WebviewLoadState {
     /// Navigation started at `since` and has not reported Finished yet.
     Loading {
+        /// Read by `revive_webview_if_stuck` on macOS to detect stale loads.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
         since: std::time::Instant,
     },
     Finished,
@@ -1837,6 +1839,7 @@ struct WebviewHealth(std::sync::Mutex<std::collections::HashMap<String, WebviewL
 /// How long an in-flight load is given before a show path presumes it dead.
 /// A healthy cold load takes a couple of seconds; a suspended one stays
 /// "loading" forever.
+#[cfg(target_os = "macos")]
 const WEBVIEW_STALE_LOAD: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Reloads `window`'s webview if its initial load looks dead (started long
