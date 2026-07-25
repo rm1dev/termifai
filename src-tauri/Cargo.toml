@@ -34,13 +34,17 @@ auto-launch = "0.5"
 portable-pty = "0.8"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }
-ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 time = { version = "0.3", features = ["formatting"] }
 futures = "0.3"
 base64 = "0.22"
 keyring = "3"
 hmac = "0.12"
 sha1 = "0.10"
+
+# On Unix we vendor-build OpenSSL; on Windows libssh2 uses WinCNG
+# (no openssl) so cross-compiling from macOS does not break.
+[target.'cfg(unix)'.dependencies]
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 tauri = { version = "2", features = ["macos-private-api"] }
@@ -53,6 +57,7 @@ keyring = { version = "3", features = ["apple-native"] }
 objc2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
+ssh2 = { version = "0.9" }
 windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Win32_Foundation"] }
 keyring = { version = "3", features = ["windows-native"] }
 

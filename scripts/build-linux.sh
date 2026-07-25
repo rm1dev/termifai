@@ -36,7 +36,8 @@ build_for_arch() {
             set -e
             npm install
             bash scripts/build-termifaid.sh
-            npx tauri build --bundles deb
+            # deb for Debian/Ubuntu; rpm for Fedora/RHEL and derivatives
+            npx tauri build --bundles deb,rpm
         "
 
     echo "==> Artifacts ready at releases/linux/${arch}/"
