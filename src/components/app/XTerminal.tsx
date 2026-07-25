@@ -250,6 +250,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const unlistenExitRef = useRef<UnlistenFn | null>(null);
   const unlistenConnectionRef = useRef<UnlistenFn | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  // Cmd+K / منوی Clear — داخل effect ساخته می‌شه چون به term و highlighter نیاز داره
+  const clearTerminalRef = useRef<(() => void) | null>(null);
   const isInitializedRef = useRef(false);
   const mountCountRef = useRef(0);
   const notifiedSessionRef = useRef<string | null>(sessionId ?? null);
@@ -580,6 +582,41 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     let currentTheme = appTheme;
     const highlighter = attachSemanticHighlighter(term, () => currentTheme.xterm);
 
+    // Cmd+K نباید فقط term.clear() همگام بزنه:
+    // ۱) clear() با صف write قاطی می‌شه و خروجی pending کرسر رو وسط صفحه می‌بره
+    // ۲) شل از clear لوکال خبر نداره؛ prompt چندخطی/starship با offset غلط redraw می‌کنه
+    //    → چند خط اول ls و مشابه «غیب» می‌شن یا از وسط viewport شروع می‌شن
+    // ۳) clearAllMarkers هایلایتر رو بدون refresh ول می‌کنه
+    // راه‌حل: ED3 از صف write (پاک‌کردن اسکرول‌بک) + Ctrl+L به شل (صفحه + sync کرسر/prompt)
+    const clearTerminalBuffer = () => {
+      if (term.buffer.active.type === "alternate") {
+        // vim و مشابه: فقط viewport؛ Ctrl+L نده که با برنامه قاطی نشه
+        term.write("\x1b[H\x1b[2J", () => {
+          if (!destroyed) highlighter.refresh();
+        });
+        return;
+      }
+
+      term.write("\x1b[3J", () => {
+        if (destroyed) return;
+        term.scrollToTop();
+        highlighter.refresh();
+      });
+
+      const sid = sessionRef.current;
+      if (sid) {
+        writeToSession(sid, "\x0c").catch((err) => {
+          console.error("clear terminal failed:", err);
+        });
+      } else {
+        // هنوز session نداریم — فقط emulator رو خالی کن
+        term.write("\x1b[H\x1b[2J", () => {
+          if (!destroyed) highlighter.refresh();
+        });
+      }
+    };
+    clearTerminalRef.current = clearTerminalBuffer;
+
     // Intercept terminal shortcuts before xterm processes them
     term.attachCustomKeyEventHandler((event) => {
       const shortcuts = shortcutsRefLocal.current;
@@ -623,7 +660,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
       if (shortcuts["clear-terminal"] && isShortcutMatch(event, shortcuts["clear-terminal"])) {
         if (event.type === "keydown") {
-          term.clear();
+          event.preventDefault();
+          clearTerminalBuffer();
         }
         return false;
       }
@@ -1020,6 +1058,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       if (mountId !== mountCountRef.current) {
         // Strict Mode double-invoke: این mount قدیمیه، فقط clean کن
         destroyed = true;
+        clearTerminalRef.current = null;
         ro.disconnect();
         dataDisp.dispose();
         selectionDisp.dispose();
@@ -1030,6 +1069,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         return;
       }
       destroyed = true;
+      clearTerminalRef.current = null;
       clearReconnectTimers();
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
@@ -1432,7 +1472,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
                 <span className="flex-1">Select All</span>
               </ContextMenu.Item>
               <ContextMenu.Separator className="my-1 h-px bg-border" />
-              <ContextMenu.Item className={menuItemCls} onSelect={() => termRef.current?.clear()}>
+              <ContextMenu.Item className={menuItemCls} onSelect={() => clearTerminalRef.current?.()}>
                 <span className="flex-1">Clear</span>
                 <MenuShortcut binding={shortcutsRefLocal.current["clear-terminal"]} />
               </ContextMenu.Item>
