@@ -155,6 +155,13 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
     // so a dropped connection resumes the exact same shell (cwd, env, running
     // jobs, scrollback) rather than a fresh one. Falls back to a plain shell
     // when tmux isn't installed.
+    //
+    // این مسیر tmux فقط وقتی فعاله که «Resilient Session» روی هاست روشن باشه.
+    // چون tmux موقع خروجی burst (مثل cat یه فایل ۱۰۰ خطی) فقط آخرین صفحه رو
+    // برای ترمینال می‌کشه و خط‌های قبلی هیچ‌وقت به اسکرول‌بک لوکال xterm
+    // نمی‌رسن (رفتار عمدی tmux — issue #1019). vim هم با ترفند smcup@ روی
+    // بافر عادی می‌مونه و چرخ موس به‌جای حرکت کرسر، اسکرول‌بک رو تکون می‌ده.
+    // پیش‌فرض: شل سادهٔ ssh → اسکرول‌بک کامل و رفتار native برای vim/nano.
     const tmuxSession = id.replace(/[^a-zA-Z0-9_-]/g, "_");
     const plainShell = "${SHELL:-/bin/sh} -i";
     // -D detaches every other client from the session when attaching. Without
@@ -196,9 +203,10 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
       `tmux -L termifai set-option -g terminal-overrides ",xterm-256color:smcup@:rmcup@"` +
       ` \\; new-session -AD -s ${tmuxSession}` +
       ` \\; set-option status off`;
-    const remoteBootstrap =
-      `printf '${readyMarker}\\n'; ${cdPart}` +
-      `if command -v tmux >/dev/null 2>&1; then exec ${tmuxAttach}; else exec ${plainShell}; fi`;
+    const remoteBootstrap = host.resilientSession
+      ? `printf '${readyMarker}\\n'; ${cdPart}` +
+        `if command -v tmux >/dev/null 2>&1; then exec ${tmuxAttach}; else exec ${plainShell}; fi`
+      : `printf '${readyMarker}\\n'; ${cdPart}exec ${plainShell}`;
     // accept-new: trust a host's key on first contact and record it in the user's
     // known_hosts, but hard-fail if a previously recorded key changes (unlike
     // StrictHostKeyChecking=no, which trusted every connection unconditionally).

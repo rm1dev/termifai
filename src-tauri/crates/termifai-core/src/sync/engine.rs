@@ -377,6 +377,7 @@ fn load_remote_payload(
     Ok((Some(payload), vec!["vault".to_string()]))
 }
 
+#[allow(clippy::type_complexity)]
 fn prepare_delta_upload(
     key: &crate::crypto::VaultKey,
     merged: &SyncPayload,
@@ -494,6 +495,7 @@ mod tests {
             default_sftp_path: None,
             updated_at: Some(updated_at.to_string()),
             sync_server: None,
+            resilient_session: None,
         }
     }
 
