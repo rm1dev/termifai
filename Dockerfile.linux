@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     build-essential curl file unzip pkg-config \
     libwebkit2gtk-4.1-dev libssl-dev libayatana-appindicator3-dev \
     librsvg2-dev patchelf libgtk-3-dev \
+    rpm \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js for npm (handles platform-specific optional deps correctly)
