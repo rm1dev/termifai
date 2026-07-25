@@ -26,6 +26,7 @@ struct ConnectionStatusPayload {
 struct Session {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
+    host_id: Option<String>,
 }
 
 pub struct PtyManager {
@@ -39,19 +40,24 @@ impl PtyManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &self,
         app: &AppHandle,
+        session_id: &str,
         cwd: &str,
         initial_command: Option<&str>,
         initial_password: Option<&str>,
         ready_marker: Option<&str>,
+        host_id: Option<&str>,
+        cols: u16,
+        rows: u16,
     ) -> Result<TabInfo, String> {
         let pty_system = native_pty_system();
 
         let size = PtySize {
-            rows: 24,
-            cols: 80,
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         };
@@ -79,7 +85,7 @@ impl PtyManager {
             .spawn_command(cmd)
             .map_err(|e| format!("Failed to spawn shell: {}", e))?;
 
-        let session_id = uuid::Uuid::new_v4().to_string();
+        let session_id = session_id.to_string();
         let seq = COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
         let label = format!("Terminal {}", seq);
 
@@ -107,6 +113,7 @@ impl PtyManager {
         let session = Session {
             master: pair.master,
             writer,
+            host_id: host_id.map(|s| s.to_string()),
         };
 
         self.sessions
@@ -117,12 +124,50 @@ impl PtyManager {
         let mut connection_tracker = ConnectionTracker::new(app.clone(), ready_marker.as_deref());
         connection_tracker.start();
 
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let event_name_clone = event_name.clone();
+        let app_handle_clone = app.clone();
+        thread::spawn(move || {
+            let mut buffer = String::new();
+            let mut last_flush = std::time::Instant::now();
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(data) => {
+                        buffer.push_str(&data);
+                        if buffer.len() >= 8192
+                            || last_flush.elapsed() >= std::time::Duration::from_millis(10)
+                        {
+                            if !buffer.is_empty() {
+                                let _ = app_handle_clone.emit(&event_name_clone, &buffer);
+                                buffer.clear();
+                            }
+                            last_flush = std::time::Instant::now();
+                        }
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if !buffer.is_empty() {
+                            let _ = app_handle_clone.emit(&event_name_clone, &buffer);
+                            buffer.clear();
+                        }
+                        last_flush = std::time::Instant::now();
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        if !buffer.is_empty() {
+                            let _ = app_handle_clone.emit(&event_name_clone, &buffer);
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
         thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut recent_output = String::new();
             let mut password_sent = false;
             let mut ready = ready_marker.is_none();
             let mut pending_output = String::new();
+            let mut leftover: Vec<u8> = Vec::new();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => {
@@ -130,8 +175,7 @@ impl PtyManager {
                             connection_tracker.fail_current(
                                 "Connection failed before the SSH session became ready.",
                             );
-                            let _ = app_handle.emit(
-                                &event_name,
+                            let _ = tx.send(
                                 "\r\n\x1b[31mConnection failed before SSH session became ready.\x1b[0m\r\n"
                                     .to_string(),
                             );
@@ -140,14 +184,31 @@ impl PtyManager {
                         break;
                     }
                     Ok(n) => {
-                        let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                        leftover.extend_from_slice(&buf[..n]);
+                        let data = match std::str::from_utf8(&leftover) {
+                            Ok(s) => {
+                                let s = s.to_string();
+                                leftover.clear();
+                                s
+                            }
+                            Err(e) => {
+                                let valid_up_to = e.valid_up_to();
+                                let s =
+                                    String::from_utf8_lossy(&leftover[..valid_up_to]).to_string();
+                                let rest = leftover[valid_up_to..].to_vec();
+                                // A genuine truncated UTF-8 sequence is at most 3 trailing
+                                // bytes; anything longer is malformed input, not a split
+                                // multi-byte char, so don't hold onto it indefinitely.
+                                leftover = if rest.len() <= 3 { rest } else { Vec::new() };
+                                s
+                            }
+                        };
                         if !ready {
                             connection_tracker.handle_output(&data, ready_marker.as_deref());
                         }
                         if !password_sent && !ready {
                             if let Some(password) = password_for_prompt.as_deref() {
-                                recent_output
-                                    .push_str(&String::from_utf8_lossy(&buf[..n]).to_lowercase());
+                                recent_output.push_str(&data.to_lowercase());
                                 if recent_output.len() > 2048 {
                                     let keep_from = recent_output.len().saturating_sub(2048);
                                     recent_output = recent_output[keep_from..].to_string();
@@ -168,7 +229,7 @@ impl PtyManager {
                             }
                         }
                         if ready {
-                            let _ = app_handle.emit(&event_name, data);
+                            let _ = tx.send(data);
                         } else if let Some(marker) = ready_marker.as_deref() {
                             pending_output.push_str(&data);
                             if let Some(marker_end) =
@@ -176,13 +237,13 @@ impl PtyManager {
                             {
                                 ready = true;
                                 connection_tracker.complete();
-                                let _ = app_handle.emit(&event_name, "\x1b[2J\x1b[H".to_string());
+                                let _ = tx.send("\x1b[2J\x1b[H".to_string());
                                 let cleaned = pending_output[marker_end..]
                                     .trim_start_matches('\r')
                                     .trim_start_matches('\n')
                                     .to_string();
                                 if !cleaned.is_empty() {
-                                    let _ = app_handle.emit(&event_name, cleaned);
+                                    let _ = tx.send(cleaned);
                                 }
                                 pending_output.clear();
                             } else if pending_output.len() > 8192 {
@@ -196,8 +257,7 @@ impl PtyManager {
                             connection_tracker.fail_current(
                                 "Connection failed before the SSH session became ready.",
                             );
-                            let _ = app_handle.emit(
-                                &event_name,
+                            let _ = tx.send(
                                 "\r\n\x1b[31mConnection failed before SSH session became ready.\x1b[0m\r\n"
                                     .to_string(),
                             );
@@ -227,6 +287,14 @@ impl PtyManager {
         Ok(())
     }
 
+    pub fn get_host_id(&self, session_id: &str) -> Result<Option<String>, String> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| format!("Session not found: {}", session_id))?;
+        Ok(session.host_id.clone())
+    }
+
     pub fn resize_session(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), String> {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions
@@ -247,6 +315,12 @@ impl PtyManager {
     pub fn close_session(&self, session_id: &str) -> Result<(), String> {
         self.sessions.lock().unwrap().remove(session_id);
         Ok(())
+    }
+
+    /// Drops every session (same teardown as close_session) — used by
+    /// quit-to-background so the next open starts with no terminals.
+    pub fn kill_all(&self) {
+        self.sessions.lock().unwrap().clear();
     }
 }
 
@@ -583,4 +657,43 @@ fn find_ready_marker_line(output: &str, marker: &str) -> Option<usize> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_all_empties_sessions() {
+        let mgr = PtyManager::new();
+        // Build a real Session without an AppHandle: open a pty and spawn a shell.
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let _child = pair
+            .slave
+            .spawn_command(CommandBuilder::new(if cfg!(windows) {
+                "cmd"
+            } else {
+                "sh"
+            }))
+            .expect("spawn");
+        let writer = pair.master.take_writer().expect("writer");
+        mgr.sessions.lock().unwrap().insert(
+            "t1".into(),
+            Session {
+                master: pair.master,
+                writer,
+                host_id: None,
+            },
+        );
+        assert_eq!(mgr.sessions.lock().unwrap().len(), 1);
+        mgr.kill_all();
+        assert!(mgr.sessions.lock().unwrap().is_empty());
+    }
 }

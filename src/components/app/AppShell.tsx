@@ -1,8 +1,11 @@
 import { useState, useRef, useEffect, forwardRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
-import { listen } from "@tauri-apps/api/event";
+import { posixShellQuote } from "@/lib/shell-quote";
+import { subscribe } from "@/lib/api/transport";
+import { forceQuitApp, openSettingsWindow, quitApp, takePendingOpenFolders } from "@/lib/api/terminal";
+import { listSshKeys } from "@/lib/api/ssh-keys";
+import { pushSyncSettingsCache } from "@/lib/sync-settings-cache";
 import {
   Server,
   Network,
@@ -19,6 +22,8 @@ import {
   Square,
   Menu,
   Maximize2,
+  ChevronLeft,
+  ChevronRight,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -27,7 +32,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { AppTab, Host, SidebarKey, SshKey, TabKind } from "./types";
+import type { AppTab, Host, SidebarKey, TabKind } from "./types";
 import { XTerminal } from "./XTerminal";
 import {
   isShortcutMatch,
@@ -72,7 +77,18 @@ const sidebarItems: { key: SidebarKey; label: string; icon: typeof Server }[] = 
   // { key: "logs", label: "Logs", icon: ClipboardList },
 ];
 
-export function AppShell() {
+export interface AppShellProps {
+  /**
+   * "main" (default): standard window with window controls and drag region.
+   * "quick-terminal": Quake-style drop-down panel with glassmorphism,
+   * no window dragging, no window controls, and a close (×) button in the tab
+   * bar that collapses the panel via `onRequestClose`.
+   */
+  variant?: "main" | "quick-terminal";
+  onRequestClose?: () => void;
+}
+
+export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {}) {
   const [tabs, setTabs] = useState<AppTab[]>([
     { id: "t-vaults", kind: "vaults", title: "Hosts", closable: false },
     { id: "t-term", kind: "terminal", title: "Local Terminal", closable: true },
@@ -92,15 +108,40 @@ export function AppShell() {
     setTabs((t) => [...t, { id, kind, title, closable: true }]);
     setActiveTab(id);
   };
-  const shellQuote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+  const openFolderTab = (folderPath: string) => {
+    const id = `t-terminal-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const title = folderPath.split(/[/\\]/).filter(Boolean).pop() || folderPath;
+    setTabs((t) => [...t, { id, kind: "terminal", title, closable: true, cwd: folderPath }]);
+    setActiveTab(id);
+  };
+
+  // Folders arriving from the macOS Finder extension ("Open in Termifai").
+  // Paths are queued on the Rust side; drain on mount (covers cold launch,
+  // where the URL arrives before the webview is ready) and on every
+  // open-folder-pending signal (app already running).
+  useEffect(() => {
+    if (variant !== "main") return;
+    const drain = () => {
+      void takePendingOpenFolders().then((paths) => {
+        for (const p of paths) openFolderTab(p);
+      });
+    };
+    drain();
+    const unlistenPromise = subscribe("open-folder-pending", drain);
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [variant]);
+
   const openSshTerminal = async (host: Host) => {
     const id = `t-ssh-${host.id}-${Date.now()}`;
     let keyArg = "";
     if (host.sshKeyId) {
       try {
-        const keys = await invoke<SshKey[]>("list_ssh_keys");
+        const keys = await listSshKeys();
         const key = keys.find((item) => item.id === host.sshKeyId);
-        if (key?.privateKeyPath) keyArg = ` -i ${shellQuote(key.privateKeyPath)}`;
+        if (key?.privateKeyPath) keyArg = ` -i ${posixShellQuote(key.privateKeyPath)}`;
       } catch {
         /* SSH can still use agent/default keys. */
       }
@@ -108,11 +149,71 @@ export function AppShell() {
     const portArg = host.port && host.port !== 22 ? ` -p ${host.port}` : "";
     const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
     const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
-    const remoteBootstrap = `printf '${readyMarker}\\n'; ${cdPart}exec ` + "${SHELL:-/bin/sh}" + " -i";
+    // Stable per-tab tmux session name (fixed at tab creation, reused verbatim
+    // on every reconnect attempt): if tmux is on the remote host, attach to —
+    // or create — this named session instead of spawning a plain login shell,
+    // so a dropped connection resumes the exact same shell (cwd, env, running
+    // jobs, scrollback) rather than a fresh one. Falls back to a plain shell
+    // when tmux isn't installed.
+    //
+    // این مسیر tmux فقط وقتی فعاله که «Resilient Session» روی هاست روشن باشه.
+    // چون tmux موقع خروجی burst (مثل cat یه فایل ۱۰۰ خطی) فقط آخرین صفحه رو
+    // برای ترمینال می‌کشه و خط‌های قبلی هیچ‌وقت به اسکرول‌بک لوکال xterm
+    // نمی‌رسن (رفتار عمدی tmux — issue #1019). vim هم با ترفند smcup@ روی
+    // بافر عادی می‌مونه و چرخ موس به‌جای حرکت کرسر، اسکرول‌بک رو تکون می‌ده.
+    // پیش‌فرض: شل سادهٔ ssh → اسکرول‌بک کامل و رفتار native برای vim/nano.
+    const tmuxSession = id.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const plainShell = "${SHELL:-/bin/sh} -i";
+    // -D detaches every other client from the session when attaching. Without
+    // it, a client left over from a previous connection that died without
+    // detaching (network drop, app quit, reconnect) stays "attached" from
+    // tmux's point of view, and tmux clamps the window to the smallest
+    // attached client — pinning the visible area to that dead client's old
+    // geometry and filling the rest of the pane with its dotted placeholder
+    // pattern. Each tab owns its named session exclusively, so stealing the
+    // attachment is always correct here.
+    //
+    // `\; set-option status off` hides tmux's status bar in these sessions:
+    // tmux here is an invisible resilience layer (the session survives a
+    // dropped connection), not something the user asked for, so its status
+    // line reads as unexplained UI. Session-scoped — a user's own tmux
+    // sessions on the host keep their status bar.
+    //
+    // `smcup@:rmcup@` tells tmux the outer terminal has no alternate
+    // screen, so tmux draws on the NORMAL buffer. That's what keeps the
+    // terminal behaving like a plain (non-tmux) one: lines that scroll off
+    // the top land in xterm.js's own local scrollback, giving the native
+    // scrollbar, instant wheel scrolling with no network round-trip, and no
+    // wheel→arrow-keys translation (xterm.js only does that in the alt
+    // buffer). tmux's mouse mode stays OFF for the same reason — with it
+    // on, tmux owns the wheel (laggy remote copy-mode), drag-selection, and
+    // right-click (its own popup menu instead of the app's). This is the
+    // standard "native scrollback" tmux setup.
+    //
+    // `-L termifai` runs these sessions on a dedicated tmux server socket:
+    // terminal-overrides is server-global, and quietly stripping alt-screen
+    // support from the user's own tmux sessions on the host would corrupt
+    // their setup.
+    //
+    // terminal-overrides must be set BEFORE new-session — it's consulted
+    // when the client attaches. status off is session-scoped, so it comes
+    // after. Plain -g (not -ga) keeps the override idempotent across
+    // reconnects.
+    const tmuxAttach =
+      `tmux -L termifai set-option -g terminal-overrides ",xterm-256color:smcup@:rmcup@"` +
+      ` \\; new-session -AD -s ${tmuxSession}` +
+      ` \\; set-option status off`;
+    const remoteBootstrap = host.resilientSession
+      ? `printf '${readyMarker}\\n'; ${cdPart}` +
+        `if command -v tmux >/dev/null 2>&1; then exec ${tmuxAttach}; else exec ${plainShell}; fi`
+      : `printf '${readyMarker}\\n'; ${cdPart}exec ${plainShell}`;
     // accept-new: trust a host's key on first contact and record it in the user's
     // known_hosts, but hard-fail if a previously recorded key changes (unlike
     // StrictHostKeyChecking=no, which trusted every connection unconditionally).
-    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new${keyArg}${portArg} ${shellQuote(`${host.user}@${host.hostname}`)} ${shellQuote(remoteBootstrap)}`;
+    // ServerAlive*: let ssh itself detect a dead connection (3 missed keepalives,
+    // ~15s) instead of us guessing from unanswered keystrokes — that would
+    // misfire on ordinary latency spikes or brief network blips.
+    const command = `ssh -v -tt -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=5 -o ServerAliveCountMax=3${keyArg}${portArg} ${posixShellQuote(`${host.user}@${host.hostname}`)} ${posixShellQuote(remoteBootstrap)}`;
 
     // Count existing tabs for this host to generate a numbered title
     const baseTitle = host.name || host.hostname;
@@ -201,13 +302,16 @@ export function AppShell() {
       vaultStatus()
         .then((status: VaultStatus) => {
           setVaultInfo({ initialized: status.initialized, unlocked: status.unlocked });
+          if (status.unlocked) {
+            pushSyncSettingsCache();
+          }
         })
         .catch(console.error);
 
     void refreshVault();
 
     // Backend locks the vault on screen lock (per policy); re-gate immediately.
-    const unlistenPromise = listen("vault-locked", () => {
+    const unlistenPromise = subscribe("vault-locked", () => {
       setVaultInfo((prev) => ({ initialized: prev?.initialized ?? true, unlocked: false }));
     });
 
@@ -222,6 +326,38 @@ export function AppShell() {
     };
   }, []);
 
+  const [mainWindowOpacity, setMainWindowOpacity] = useState(0.7);
+
+  useEffect(() => {
+    if (variant === "main") {
+      const loadOpacity = () => {
+        try {
+          const stored = localStorage.getItem("termifai:main-window-opacity");
+          setMainWindowOpacity(stored ? parseFloat(stored) : 0.7);
+        } catch {
+          setMainWindowOpacity(0.7);
+        }
+      };
+      loadOpacity();
+
+      const unlistenPromise = subscribe<number>("main-window:opacity-changed", (event) => {
+        setMainWindowOpacity(event.payload);
+      });
+
+      const targets = [
+        document.documentElement,
+        document.body,
+        document.getElementById("root"),
+      ].filter((el): el is HTMLElement => el !== null);
+      const previous = targets.map((el) => el.style.backgroundColor);
+      targets.forEach((el) => (el.style.backgroundColor = "transparent"));
+
+      return () => {
+        void unlistenPromise.then((un) => un());
+        targets.forEach((el, i) => (el.style.backgroundColor = previous[i]));
+      };
+    }
+  }, [variant]);
 
   useEffect(() => {
     newTabRef.current = newTab;
@@ -277,19 +413,44 @@ export function AppShell() {
         if (previous) setActiveTab(previous.id);
       } else if (isShortcutMatch(event, shortcuts["open-settings"])) {
         event.preventDefault();
-        invoke("open_settings_window").catch((err) =>
+        openSettingsWindow().catch((err) =>
           console.error("open_settings_window failed:", err)
         );
       } else if (isShortcutMatch(event, shortcuts["lock-vault"])) {
         event.preventDefault();
         vaultLock().catch((err) => console.error("vault_lock failed:", err));
+      } else if (
+        // Skip while focus is inside the terminal: Ctrl+Q/Ctrl+S are XON/XOFF
+        // flow-control bytes shells and TUI apps rely on, so we only treat
+        // them as app shortcuts outside of xterm.
+        platform === "linux" &&
+        !isXtermInput &&
+        event.ctrlKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        !event.metaKey &&
+        event.code === "KeyQ"
+      ) {
+        event.preventDefault();
+        void quitApp();
+      } else if (
+        platform === "linux" &&
+        !isXtermInput &&
+        event.ctrlKey &&
+        event.altKey &&
+        !event.shiftKey &&
+        !event.metaKey &&
+        event.code === "KeyQ"
+      ) {
+        event.preventDefault();
+        void forceQuitApp();
       }
     };
 
     window.addEventListener("storage", onStorageChanged);
     window.addEventListener("keydown", onKeyDown);
 
-    listen<ShortcutMap>(shortcutsChangedEvent, (event) => {
+    subscribe<ShortcutMap>(shortcutsChangedEvent, (event) => {
       applyShortcuts(event.payload);
     })
       .then((unlisten) => {
@@ -298,14 +459,18 @@ export function AppShell() {
       })
       .catch(() => {});
 
-    listen("menu-new-terminal", () => {
-      newTabRef.current("terminal");
-    })
-      .then((unlisten) => {
-        if (destroyed) { unlisten(); return; }
-        unlistenMenuNewTerminal = unlisten;
+    // The macOS menu event broadcasts to every window; only the main shell
+    // should react, or a quick-terminal shell would also grow a tab.
+    if (variant === "main") {
+      subscribe("menu-new-terminal", () => {
+        newTabRef.current("terminal");
       })
-      .catch(() => {});
+        .then((unlisten) => {
+          if (destroyed) { unlisten(); return; }
+          unlistenMenuNewTerminal = unlisten;
+        })
+        .catch(() => {});
+    }
 
     return () => {
       destroyed = true;
@@ -317,9 +482,16 @@ export function AppShell() {
   }, []);
 
   const tab = tabs.find((t) => t.id === activeTab);
+  const glassClasses = variant === "main" ? "qt-glass" : "";
+  const alphaStyle = variant === "main" ? { ["--qt-alpha" as string]: mainWindowOpacity } : {};
 
   return (
-    <div className="flex h-screen w-screen flex-col bg-background text-foreground">
+    <div
+      className={`flex flex-col bg-background text-foreground ${glassClasses} ${
+        variant === "quick-terminal" ? "h-full w-full" : "h-screen w-screen"
+      }`}
+      style={alphaStyle}
+    >
       <TitleBar
         tabs={tabs}
         activeTab={activeTab}
@@ -329,6 +501,9 @@ export function AppShell() {
         onRename={renameTab}
         onReorder={reorderTab}
         platform={platform}
+        variant={variant}
+        onRequestClose={onRequestClose}
+        transparentBg={variant === "quick-terminal" || (variant === "main" && mainWindowOpacity < 1.0)}
       />
 
       <div className="flex min-h-0 flex-1">
@@ -343,6 +518,7 @@ export function AppShell() {
               <XTerminal
                 sessionId={t.sessionId}
                 initialCommand={t.initialCommand}
+                cwd={t.cwd}
                 hostId={t.hostId}
                 readyMarker={t.readyMarker}
                 connectionLabel={t.connectionLabel}
@@ -350,6 +526,7 @@ export function AppShell() {
                 isActive={t.id === activeTab}
                 onClose={() => closeTab(t.id)}
                 onSessionCreated={(sid) => updateTabSession(t.id, sid)}
+                transparentBackground={variant === "quick-terminal" || (variant === "main" && mainWindowOpacity < 1.0)}
               />
             </div>
           ) : null
@@ -372,7 +549,7 @@ export function AppShell() {
                 />
               ) : (
                 <>
-                  <Sidebar active={activeSidebar} onChange={setActiveSidebar} />
+                  <Sidebar active={activeSidebar} onChange={setActiveSidebar} variant={variant} />
                   <main className="flex min-w-0 flex-1 flex-col">
                     {activeSidebar === "dashboard" && <DashboardView />}
                     {activeSidebar === "hosts" && <HostsView onNewTerminal={() => newTab("terminal")} onNewSftp={(host?) => openSftpSession(host)} onConnectHost={(host) => void openSshTerminal(host)} />}
@@ -407,6 +584,9 @@ function TitleBar({
   onRename,
   onReorder,
   platform,
+  variant,
+  onRequestClose,
+  transparentBg,
 }: {
   tabs: AppTab[];
   activeTab: string;
@@ -416,7 +596,13 @@ function TitleBar({
   onRename: (id: string, title: string) => void;
   onReorder: (fromId: string, toId: string) => void;
   platform: string;
+  variant: "main" | "quick-terminal";
+  onRequestClose?: () => void;
+  transparentBg?: boolean;
 }) {
+  const isQuickTerminal = variant === "quick-terminal";
+  const dragRegion = isQuickTerminal ? {} : { "data-tauri-drag-region": true };
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
   );
@@ -443,17 +629,22 @@ function TitleBar({
   const closableTabs = tabs.filter((t) => t.closable);
 
   return (
-    <div className="flex h-11 shrink-0 items-center border-b border-border bg-[var(--color-surface)] select-none" data-tauri-drag-region>
+    <div
+      className={`flex h-11 shrink-0 items-center border-b border-border select-none ${
+        transparentBg ? "bg-transparent" : "bg-[var(--color-surface)]"
+      }`}
+      {...dragRegion}
+    >
       {/* Space for native macOS traffic lights — collapses in fullscreen, where they hide */}
-      {platform === "macos" && (
+      {!isQuickTerminal && platform === "macos" && (
         <div
           className="h-full shrink-0 flex items-center overflow-hidden transition-[width] duration-200"
           style={{ width: isFullscreen ? 0 : 80 }}
         />
       )}
-      {platform !== "macos" && <div className="w-3 h-full shrink-0" />}
+      {(isQuickTerminal || platform !== "macos") && <div className="w-3 h-full shrink-0" />}
 
-      <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" data-tauri-drag-region>
+      <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" {...dragRegion}>
         {/* Pinned tabs (Hosts) — outside DnD, immovable */}
         {pinnedTabs.map((t) => (
           <BaseTabChip
@@ -467,7 +658,7 @@ function TitleBar({
         ))}
 
         {/* Closable tabs — inside DnD, cannot pass Hosts */}
-        <div className="flex flex-1 items-end gap-1" data-tauri-drag-region>
+        <div className="flex flex-1 items-end gap-1" {...dragRegion}>
           <DndContext
             sensors={sensors}
             collisionDetection={closestCenter}
@@ -499,11 +690,22 @@ function TitleBar({
       </div>
 
       {/* Linux/Windows: hamburger app menu + window controls */}
-      {platform !== "macos" && (
-        <>
-          <AppHamburgerMenu onNew={onNew} />
-          <WindowControls />
-        </>
+      {isQuickTerminal ? (
+        <button
+          onClick={() => onRequestClose?.()}
+          title="Close Quick Terminal"
+          className="mr-2 flex h-8 w-8 shrink-0 items-center justify-center self-center rounded-md text-muted-foreground outline-none hover:bg-[var(--color-surface-2)] hover:text-foreground focus:outline-none transition-colors"
+          aria-label="Close Quick Terminal"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      ) : (
+        platform !== "macos" && (
+          <>
+            <AppHamburgerMenu onNew={onNew} />
+            <WindowControls />
+          </>
+        )
       )}
     </div>
   );
@@ -545,7 +747,7 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
           New Terminal
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+T</span>
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => void invoke("open_settings_window")}>
+        <DropdownMenuItem onSelect={() => void openSettingsWindow()}>
           Settings
           <span className="ml-auto text-xs text-muted-foreground">Ctrl+,</span>
         </DropdownMenuItem>
@@ -559,9 +761,17 @@ function AppHamburgerMenu({ onNew }: { onNew: (kind: TabKind) => void }) {
           {isFullscreen ? "Exit Full Screen" : "Full Screen"}
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={() => void invoke("quit_app")}>
+        <DropdownMenuItem onSelect={() => void quitApp()}>
           Quit
-          <span className="ml-auto text-xs text-muted-foreground">Alt+F4</span>
+          <span className="ml-auto text-xs text-muted-foreground">
+            {platform === "linux" ? "Ctrl+Q" : "Alt+F4"}
+          </span>
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => void forceQuitApp()}>
+          Force Quit
+          {platform === "linux" && (
+            <span className="ml-auto text-xs text-muted-foreground">Ctrl+Alt+Q</span>
+          )}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -681,10 +891,10 @@ const BaseTabChip = forwardRef<HTMLDivElement, BaseTabChipProps>(function BaseTa
         }
       }}
       className={[
-        "group relative flex h-9 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs font-medium outline-none",
+        "group relative flex h-9 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs font-medium outline-none border-t-2 transition-colors",
         active
-          ? "bg-[var(--color-tab-active)] text-foreground"
-          : "bg-[var(--color-tab-inactive)] text-muted-foreground hover:text-foreground",
+          ? "bg-[var(--color-tab-active)] text-foreground border-primary"
+          : "bg-[var(--color-tab-inactive)] text-muted-foreground hover:text-foreground border-transparent",
       ].join(" ")}
     >
       {icon}
@@ -760,9 +970,42 @@ function SortableTabChip(props: Omit<BaseTabChipProps, "style" | "dragAttributes
 
 /* ---------------- Sidebar ---------------- */
 
-function Sidebar({ active, onChange }: { active: SidebarKey; onChange: (k: SidebarKey) => void }) {
+function Sidebar({
+  active,
+  onChange,
+  variant,
+}: {
+  active: SidebarKey;
+  onChange: (k: SidebarKey) => void;
+  variant?: "main" | "quick-terminal";
+}) {
+  const isQuickTerminal = variant === "quick-terminal";
+  const [collapsed, setCollapsed] = useState(() => {
+    if (isQuickTerminal) return true;
+    return localStorage.getItem("sidebar-collapsed") === "true";
+  });
+
+  const isCurrentlyCollapsed = isQuickTerminal || collapsed;
+
+  const toggleCollapsed = () => {
+    if (isQuickTerminal) return;
+    const next = !collapsed;
+    setCollapsed(next);
+    localStorage.setItem("sidebar-collapsed", String(next));
+  };
+
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r border-border bg-sidebar py-3 text-sidebar-foreground">
+    <aside className={`relative flex shrink-0 flex-col border-r border-border bg-sidebar py-3 text-sidebar-foreground transition-all duration-200 ${isCurrentlyCollapsed ? "w-14" : "w-56"}`}>
+      {!isQuickTerminal && (
+        <button
+          onClick={toggleCollapsed}
+          className="absolute top-6 right-0 translate-x-1/2 z-40 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-[var(--color-surface)] text-sidebar-foreground hover:bg-[var(--color-sidebar-active)] hover:text-foreground shadow-sm transition-all"
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        >
+          {collapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronLeft className="h-3 w-3" />}
+        </button>
+      )}
+
       <nav className="flex-1 space-y-0.5 px-2">
         {sidebarItems.map((item) => {
           const Icon = item.icon;
@@ -771,21 +1014,23 @@ function Sidebar({ active, onChange }: { active: SidebarKey; onChange: (k: Sideb
             <button
               key={item.key}
               onClick={() => onChange(item.key)}
+              title={isCurrentlyCollapsed ? item.label : undefined}
               className={[
-                "flex w-full items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors",
+                "flex items-center rounded-md py-2 transition-colors",
+                isCurrentlyCollapsed ? "w-10 h-10 justify-center px-0 mx-auto" : "w-full gap-3 px-3 text-sm",
                 isActive
                   ? "bg-[var(--color-sidebar-active)] text-foreground"
                   : "text-sidebar-foreground hover:bg-[var(--color-sidebar-active)]/60 hover:text-foreground",
               ].join(" ")}
             >
               <Icon className="h-4 w-4" />
-              <span>{item.label}</span>
+              {!isCurrentlyCollapsed && <span>{item.label}</span>}
             </button>
           );
         })}
       </nav>
-      <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground">
-        v0.1 · Termifai
+      <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground text-center truncate">
+        {isCurrentlyCollapsed ? "v1.0.1" : "v1.0.1 · Termifai"}
       </div>
     </aside>
   );
