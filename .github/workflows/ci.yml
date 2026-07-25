@@ -13,6 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Prepare OAuth secrets stub
+        run: cp src-tauri/crates/termifai-core/src/sync/oauth_secrets.example.rs src-tauri/crates/termifai-core/src/sync/oauth_secrets.rs
+
       - name: Install system dependencies (Linux)
         run: |
           sudo apt-get update
@@ -51,6 +54,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Prepare OAuth secrets stub
+        run: cp src-tauri/crates/termifai-core/src/sync/oauth_secrets.example.rs src-tauri/crates/termifai-core/src/sync/oauth_secrets.rs
 
       - name: Install system dependencies (Linux)
         run: |
