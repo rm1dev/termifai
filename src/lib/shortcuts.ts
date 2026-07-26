@@ -12,7 +12,10 @@ export type ShortcutActionId =
   | "lock-vault"
   | "terminal-copy"
   | "terminal-paste"
-  | "clear-terminal";
+  | "clear-terminal"
+  | "find-in-terminal"
+  | "find-next"
+  | "find-previous";
 
 export interface ShortcutBinding {
   key: string;
@@ -95,6 +98,24 @@ export const shortcutDefinitions: ShortcutDefinition[] = [
     label: "Clear terminal",
     description: "Clear the terminal screen and scrollback buffer",
     defaultBinding: cmdOrCtrl("k", { code: "KeyK" }),
+  },
+  {
+    id: "find-in-terminal",
+    label: "Find in terminal",
+    description: "Open the find bar for the active terminal",
+    defaultBinding: cmdOrCtrl("f", { code: "KeyF" }),
+  },
+  {
+    id: "find-next",
+    label: "Find next",
+    description: "Jump to the next find match in the terminal",
+    defaultBinding: cmdOrCtrl("g", { code: "KeyG" }),
+  },
+  {
+    id: "find-previous",
+    label: "Find previous",
+    description: "Jump to the previous find match in the terminal",
+    defaultBinding: cmdOrCtrl("g", { shiftKey: true, code: "KeyG" }),
   },
 ];
 

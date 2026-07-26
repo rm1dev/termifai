@@ -2,6 +2,7 @@ import { useEffect, useRef, useLayoutEffect, useState, useCallback } from "react
 import { Terminal } from "@xterm/xterm";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
+import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
   closeSession,
@@ -59,6 +60,24 @@ import {
   isAtLineStart,
   type LineTrackerState,
 } from "@/lib/terminal-line-tracker";
+import {
+  buildSearchOptions,
+  clearFindSelectionAnchor,
+  compileFindQuery,
+  defaultFindOptions,
+  finalizeFindSelection,
+  findNextWithWrap,
+  findPreviousWithWrap,
+  getFindResultMeta,
+  hasFindQuery,
+  isFindSelectionClearSuppressed,
+  isSearchableFindQuery,
+  patchSearchAddonNonOverlappingHighlights,
+  snapFindSelectionToCanonicalMatch,
+  type FindOptions,
+  type FindPart,
+} from "@/lib/terminal-find";
+import { TerminalFindBar } from "@/components/app/TerminalFindBar";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
 import { Search } from "lucide-react";
@@ -225,6 +244,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [snippetQuery, setSnippetQuery] = useState("");
   const [snippetIndex, setSnippetIndex] = useState(0);
   const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
+  // Find bar — کوئری توکنی + گزینه‌ها، مشابه ترمینال مک
+  const [findOpen, setFindOpen] = useState(false);
+  const [findParts, setFindParts] = useState<FindPart[]>([]);
+  const [findOptions, setFindOptions] = useState<FindOptions>(defaultFindOptions);
+  const [findResultIndex, setFindResultIndex] = useState(-1);
+  const [findResultCount, setFindResultCount] = useState(0);
+  const [findFocusKey, setFindFocusKey] = useState(0);
   // Drives the enabled state of "Copy" in the terminal context menu.
   const [hasSelection, setHasSelection] = useState(false);
   // Hover hint for detected URLs: position (relative to the terminal
@@ -250,6 +276,16 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const unlistenExitRef = useRef<UnlistenFn | null>(null);
   const unlistenConnectionRef = useRef<UnlistenFn | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const searchAddonRef = useRef<SearchAddon | null>(null);
+  const highlighterRef = useRef<ReturnType<typeof attachSemanticHighlighter> | null>(null);
+  // اکشن‌های Find از داخل key handler ترمینال (mount effect) صدا زده می‌شن
+  const openFindRef = useRef<() => void>(() => {});
+  const findNextActionRef = useRef<(incremental?: boolean) => void>(() => {});
+  const findPreviousActionRef = useRef<() => void>(() => {});
+  const findOptionsRef = useRef(findOptions);
+  const findPartsRef = useRef(findParts);
+  const findOpenRef = useRef(findOpen);
+  const appThemeRef = useRef<AppTheme>(loadAppTheme());
   // Cmd+K / منوی Clear — داخل effect ساخته می‌شه چون به term و highlighter نیاز داره
   const clearTerminalRef = useRef<(() => void) | null>(null);
   const isInitializedRef = useRef(false);
@@ -409,6 +445,185 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const refocusTerminal = useCallback(() => {
     setTimeout(() => termRef.current?.focus(), 50);
   }, []);
+
+  useEffect(() => {
+    findOptionsRef.current = findOptions;
+  }, [findOptions]);
+  useEffect(() => {
+    findPartsRef.current = findParts;
+  }, [findParts]);
+  useEffect(() => {
+    findOpenRef.current = findOpen;
+  }, [findOpen]);
+
+  const compiledFindQuery = useCallback(() => {
+    const parts = findPartsRef.current;
+    if (!hasFindQuery(parts)) return "";
+    return compileFindQuery(parts, findOptionsRef.current.matchMode);
+  }, []);
+
+  const syncFindResultMeta = useCallback(() => {
+    const addon = searchAddonRef.current;
+    const term = termRef.current;
+    if (!addon || !term) return;
+    // onDidChangeResults قبل از snap ایندکس -1 می‌ده (Previous کوتاه)؛ خودمون درستش می‌کنیم
+    const meta = getFindResultMeta(addon, term);
+    setFindResultIndex(meta.index);
+    setFindResultCount(meta.count);
+  }, []);
+
+  const runFindNext = useCallback(
+    (incremental = false) => {
+      const addon = searchAddonRef.current;
+      const term = termRef.current;
+      if (!addon || !term) return;
+      const query = compiledFindQuery();
+      const caseInsensitive = findOptionsRef.current.caseInsensitive;
+      if (!query || !isSearchableFindQuery(query, caseInsensitive)) {
+        addon.clearDecorations();
+        term.clearSelection();
+        clearFindSelectionAnchor();
+        setFindResultIndex(-1);
+        setFindResultCount(0);
+        return;
+      }
+      findNextWithWrap(
+        addon,
+        term,
+        query,
+        buildSearchOptions(
+          caseInsensitive,
+          appThemeRef.current.xterm,
+          appThemeRef.current.mode
+        ),
+        findOptionsRef.current.wrapAround,
+        incremental
+      );
+      syncFindResultMeta();
+    },
+    [compiledFindQuery, syncFindResultMeta]
+  );
+
+  const runFindPrevious = useCallback(() => {
+    const addon = searchAddonRef.current;
+    const term = termRef.current;
+    if (!addon || !term) return;
+    const query = compiledFindQuery();
+    const caseInsensitive = findOptionsRef.current.caseInsensitive;
+    if (!query || !isSearchableFindQuery(query, caseInsensitive)) {
+      addon.clearDecorations();
+      term.clearSelection();
+      clearFindSelectionAnchor();
+      setFindResultIndex(-1);
+      setFindResultCount(0);
+      return;
+    }
+    findPreviousWithWrap(
+      addon,
+      term,
+      query,
+      buildSearchOptions(
+        caseInsensitive,
+        appThemeRef.current.xterm,
+        appThemeRef.current.mode
+      ),
+      findOptionsRef.current.wrapAround
+    );
+    syncFindResultMeta();
+  }, [compiledFindQuery, syncFindResultMeta]);
+
+  const applyFindSelectionTheme = useCallback((enabled: boolean) => {
+    const term = termRef.current;
+    if (!term) return;
+    const base = xtermTheme(appThemeRef.current);
+    // SearchAddon بعد از paste دوباره select می‌کنه؛ اگه FG selection سیاه باشه
+    // روی پس‌زمینهٔ تیرهٔ decoration متن غیب می‌شه — FG روشن اجباری می‌کنیم
+    term.options.theme = enabled
+      ? { ...base, selectionForeground: appThemeRef.current.xterm.brightWhite || "#ffffff" }
+      : base;
+  }, []);
+
+  const openFind = useCallback(() => {
+    const term = termRef.current;
+    const selection = term?.getSelection()?.trim();
+    if (selection && !findPartsRef.current.length) {
+      // اگه چیزی select شده، همون رو بذار تو ورودی Find
+      const seeded: FindPart[] = [{ kind: "text", value: selection }];
+      setFindParts(seeded);
+      findPartsRef.current = seeded;
+    }
+    clearFindSelectionAnchor();
+    // semantic highlight با decorationهای Find قاطی می‌شه — تا بسته شدن Find خاموش
+    highlighterRef.current?.setPaused(true);
+    applyFindSelectionTheme(true);
+    setFindOpen(true);
+    setFindFocusKey((k) => k + 1);
+  }, [applyFindSelectionTheme]);
+
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    searchAddonRef.current?.clearDecorations();
+    clearFindSelectionAnchor();
+    highlighterRef.current?.setPaused(false);
+    applyFindSelectionTheme(false);
+    setFindResultIndex(-1);
+    setFindResultCount(0);
+    refocusTerminal();
+  }, [applyFindSelectionTheme, refocusTerminal]);
+
+  useEffect(() => {
+    openFindRef.current = openFind;
+    findNextActionRef.current = runFindNext;
+    findPreviousActionRef.current = runFindPrevious;
+  }, [openFind, runFindNext, runFindPrevious]);
+
+  // با تغییر کوئری/گزینه، جستجوی incremental بزن
+  useEffect(() => {
+    if (!findOpen) return;
+    runFindNext(true);
+  }, [findOpen, findParts, findOptions, runFindNext]);
+
+  // SearchAddon بعد از paste/write دوباره select می‌کنه — همون لحظه پاکش کن
+  useEffect(() => {
+    if (!findOpen) return;
+    const term = termRef.current;
+    if (!term) return;
+    const disp = term.onSelectionChange(() => {
+      if (isFindSelectionClearSuppressed()) return;
+      if (!term.hasSelection()) return;
+      finalizeFindSelection(term);
+    });
+    // اگه از قبل selection مونده، همین الان پاک کن
+    if (term.hasSelection()) finalizeFindSelection(term);
+    return () => disp.dispose();
+  }, [findOpen]);
+
+  // وقتی فوکوس روی ورودی Find هست، xterm کلید رو نمی‌بینه — از window می‌گیریم
+  useEffect(() => {
+    if (!findOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      const shortcuts = shortcutsRefLocal.current;
+      if (shortcuts["find-in-terminal"] && isShortcutMatch(event, shortcuts["find-in-terminal"])) {
+        event.preventDefault();
+        event.stopPropagation();
+        openFind();
+        return;
+      }
+      if (shortcuts["find-next"] && isShortcutMatch(event, shortcuts["find-next"])) {
+        event.preventDefault();
+        event.stopPropagation();
+        runFindNext(false);
+        return;
+      }
+      if (shortcuts["find-previous"] && isShortcutMatch(event, shortcuts["find-previous"])) {
+        event.preventDefault();
+        event.stopPropagation();
+        runFindPrevious();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [findOpen, openFind, runFindNext, runFindPrevious]);
 
   // Windows terminal convention (VS Code / Windows Terminal default): right
   // click never shows a menu — it copies the selection if there is one,
@@ -572,6 +787,26 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     // OSC52 clipboard support: remote programs (tmux, nvim, …) can push
     // copied text to the system clipboard through this escape sequence.
     term.loadAddon(new ClipboardAddon());
+    // باگ شمارش overlapping regex در addon-search@0.16 رو قبل از ساخت پچ کن
+    patchSearchAddonNonOverlappingHighlights();
+    const searchAddon = new SearchAddon();
+    term.loadAddon(searchAddon);
+    searchAddonRef.current = searchAddon;
+    // بعد از تایپ، addon با _updateMatches دوباره findPrevious می‌زنه — snap/clear/ایندکس
+    const resultsDisp = searchAddon.onDidChangeResults((e) => {
+      if (findOpenRef.current && !isFindSelectionClearSuppressed()) {
+        if (term.hasSelection()) {
+          snapFindSelectionToCanonicalMatch(searchAddon, term);
+          finalizeFindSelection(term);
+        }
+        const meta = getFindResultMeta(searchAddon, term);
+        setFindResultIndex(meta.index);
+        setFindResultCount(meta.count);
+        return;
+      }
+      setFindResultIndex(e.resultIndex);
+      setFindResultCount(e.resultCount);
+    });
     term.open(ref.current);
     termRef.current = term;
     requestAnimationFrame(() => term.focus());
@@ -580,7 +815,9 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     // keywords), colored from the active theme's own xterm palette so each
     // theme gets its own coherent set of highlight colors.
     let currentTheme = appTheme;
+    appThemeRef.current = appTheme;
     const highlighter = attachSemanticHighlighter(term, () => currentTheme.xterm);
+    highlighterRef.current = highlighter;
 
     // Cmd+K نباید فقط term.clear() همگام بزنه:
     // ۱) clear() با صف write قاطی می‌شه و خروجی pending کرسر رو وسط صفحه می‌بره
@@ -589,6 +826,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     // ۳) clearAllMarkers هایلایتر رو بدون refresh ول می‌کنه
     // راه‌حل: ED3 از صف write (پاک‌کردن اسکرول‌بک) + Ctrl+L به شل (صفحه + sync کرسر/prompt)
     const clearTerminalBuffer = () => {
+      searchAddon.clearDecorations();
       if (term.buffer.active.type === "alternate") {
         // vim و مشابه: فقط viewport؛ Ctrl+L نده که با برنامه قاطی نشه
         term.write("\x1b[H\x1b[2J", () => {
@@ -662,6 +900,30 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         if (event.type === "keydown") {
           event.preventDefault();
           clearTerminalBuffer();
+        }
+        return false;
+      }
+
+      if (shortcuts["find-in-terminal"] && isShortcutMatch(event, shortcuts["find-in-terminal"])) {
+        if (event.type === "keydown") {
+          event.preventDefault();
+          openFindRef.current();
+        }
+        return false;
+      }
+
+      if (shortcuts["find-next"] && isShortcutMatch(event, shortcuts["find-next"])) {
+        if (event.type === "keydown") {
+          event.preventDefault();
+          findNextActionRef.current(false);
+        }
+        return false;
+      }
+
+      if (shortcuts["find-previous"] && isShortcutMatch(event, shortcuts["find-previous"])) {
+        if (event.type === "keydown") {
+          event.preventDefault();
+          findPreviousActionRef.current();
         }
         return false;
       }
@@ -754,10 +1016,18 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       applyAppearance((event as CustomEvent<TerminalAppearance>).detail);
     };
     const applyTheme = (theme: AppTheme) => {
-      term.options.theme = xtermTheme(theme);
+      const base = xtermTheme(theme);
+      // اگه Find بازه، FG selection روشن بمونه تا paste متن رو سیاه نکنه
+      term.options.theme = findOpenRef.current
+        ? { ...base, selectionForeground: theme.xterm.brightWhite || "#ffffff" }
+        : base;
       currentTheme = theme;
-      // Existing decorations were painted with the old palette.
+      appThemeRef.current = theme;
+      // decorationهای Find با پالت قبلی کشیده شدن — با تم جدید دوباره جستجو بزن
       highlighter.refresh();
+      if (findOpenRef.current) {
+        findNextActionRef.current(true);
+      }
     };
     const onStorageChanged = (event: StorageEvent) => {
       if (event.key === terminalAppearanceStorageKey) {
@@ -1059,10 +1329,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         // Strict Mode double-invoke: این mount قدیمیه، فقط clean کن
         destroyed = true;
         clearTerminalRef.current = null;
+        searchAddonRef.current = null;
+        highlighterRef.current = null;
         ro.disconnect();
         dataDisp.dispose();
         selectionDisp.dispose();
         scrollDisp.dispose();
+        resultsDisp.dispose();
         highlighter.dispose();
         resizeDisp.dispose();
         isInitializedRef.current = false;
@@ -1070,6 +1343,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       }
       destroyed = true;
       clearTerminalRef.current = null;
+      searchAddonRef.current = null;
+      highlighterRef.current = null;
       clearReconnectTimers();
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
@@ -1084,6 +1359,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       dataDisp.dispose();
       selectionDisp.dispose();
       scrollDisp.dispose();
+      resultsDisp.dispose();
       highlighter.dispose();
       resizeDisp.dispose();
       unlistenOutputRef.current?.();
@@ -1292,6 +1568,20 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   return (
     <div className="relative h-full w-full bg-background">
+      {findOpen && (
+        <TerminalFindBar
+          options={findOptions}
+          parts={findParts}
+          resultIndex={findResultIndex}
+          resultCount={findResultCount}
+          focusKey={findFocusKey}
+          onOptionsChange={setFindOptions}
+          onPartsChange={setFindParts}
+          onFindNext={() => runFindNext(false)}
+          onFindPrevious={runFindPrevious}
+          onClose={closeFind}
+        />
+      )}
       {linkHint && (
         <div
           className="pointer-events-none absolute z-30 flex max-w-[340px] items-center gap-2 rounded-md border border-border bg-popover px-2 py-1 text-xs shadow-lg"
@@ -1470,6 +1760,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
               </ContextMenu.Item>
               <ContextMenu.Item className={menuItemCls} onSelect={() => termRef.current?.selectAll()}>
                 <span className="flex-1">Select All</span>
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItemCls} onSelect={() => openFind()}>
+                <span className="flex-1">Find…</span>
+                <MenuShortcut binding={shortcutsRefLocal.current["find-in-terminal"]} />
               </ContextMenu.Item>
               <ContextMenu.Separator className="my-1 h-px bg-border" />
               <ContextMenu.Item className={menuItemCls} onSelect={() => clearTerminalRef.current?.()}>
