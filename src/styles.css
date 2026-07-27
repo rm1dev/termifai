@@ -288,6 +288,40 @@
   border-radius: 10px;
 }
 
+/* RTL overlay — متن فارسی/عربی وصل می‌مونه حتی موقع selection.
+   لایه کاملاً شفافه: ردیف‌های اصلی xterm مخفی می‌شن و این متن جاش می‌شینه؛
+   پس‌زمینه و مستطیل selection خود xterm از زیر رد می‌شن (هایلایت زنده). */
+.termifai-rtl-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* بالاتر از decorationهای xterm (z:6/7) تا متن روی هایلایت جستجو خوانا بمونه */
+  z-index: 8;
+  overflow: hidden;
+}
+.termifai-rtl-line {
+  position: absolute;
+  right: 0;
+  white-space: pre;
+  overflow: hidden;
+  unicode-bidi: normal;
+  direction: ltr;
+  text-align: left;
+}
+.termifai-rtl-cursor {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  opacity: 0.85;
+  pointer-events: none;
+  animation: termifai-rtl-cursor-blink 1s step-end infinite;
+}
+@keyframes termifai-rtl-cursor-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
 [data-sonner-toast][data-type="success"] {
   background: color-mix(in oklab, var(--brand-green) 14%, var(--background)) !important;
   border-color: color-mix(in oklab, var(--brand-green) 45%, transparent) !important;

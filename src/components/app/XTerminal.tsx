@@ -46,6 +46,7 @@ import {
   type ShortcutMap,
 } from "@/lib/shortcuts";
 import { isMac, platform } from "@/lib/platform";
+import { attachRtlOverlay, getRtlAwareSelection } from "@/lib/terminal-rtl-overlay";
 import {
   attachSemanticHighlighter,
   loadSemanticHighlighting,
@@ -278,6 +279,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const fitAddonRef = useRef<FitAddon | null>(null);
   const searchAddonRef = useRef<SearchAddon | null>(null);
   const highlighterRef = useRef<ReturnType<typeof attachSemanticHighlighter> | null>(null);
+  const rtlOverlayRef = useRef<ReturnType<typeof attachRtlOverlay> | null>(null);
   // اکشن‌های Find از داخل key handler ترمینال (mount effect) صدا زده می‌شن
   const openFindRef = useRef<() => void>(() => {});
   const findNextActionRef = useRef<(incremental?: boolean) => void>(() => {});
@@ -422,7 +424,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   // ── Terminal clipboard actions (context menu + Windows right-click) ───────
   const copySelection = useCallback(() => {
     const term = termRef.current;
-    const selection = term?.getSelection();
+    // روی خطوط فارسی/عربی، ستون‌های selection بصری‌ان نه منطقی — نگاشت لازمه
+    const selection = term ? getRtlAwareSelection(term) : "";
     if (term && selection) {
       navigator.clipboard.writeText(selection).catch(() => {});
       term.clearSelection();
@@ -545,7 +548,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   const openFind = useCallback(() => {
     const term = termRef.current;
-    const selection = term?.getSelection()?.trim();
+    // نگاشت RTL — تا سرچ با کلمه‌ای که کاربر «می‌بینه» سید بشه نه بایت‌های خام بافر
+    const selection = term ? getRtlAwareSelection(term).trim() : "";
     if (selection && !findPartsRef.current.length) {
       // اگه چیزی select شده، همون رو بذار تو ورودی Find
       const seeded: FindPart[] = [{ kind: "text", value: selection }];
@@ -818,6 +822,9 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     appThemeRef.current = appTheme;
     const highlighter = attachSemanticHighlighter(term, () => currentTheme.xterm);
     highlighterRef.current = highlighter;
+    // لایه RTL: shaping مرورگر + selection بدون شکستن حروف
+    const rtlOverlay = attachRtlOverlay(term, () => currentTheme.xterm);
+    rtlOverlayRef.current = rtlOverlay;
 
     // Cmd+K نباید فقط term.clear() همگام بزنه:
     // ۱) clear() با صف write قاطی می‌شه و خروجی pending کرسر رو وسط صفحه می‌بره
@@ -830,7 +837,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       if (term.buffer.active.type === "alternate") {
         // vim و مشابه: فقط viewport؛ Ctrl+L نده که با برنامه قاطی نشه
         term.write("\x1b[H\x1b[2J", () => {
-          if (!destroyed) highlighter.refresh();
+          if (!destroyed) {
+            highlighter.refresh();
+            rtlOverlay.refresh();
+          }
         });
         return;
       }
@@ -839,6 +849,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         if (destroyed) return;
         term.scrollToTop();
         highlighter.refresh();
+        rtlOverlay.refresh();
       });
 
       const sid = sessionRef.current;
@@ -849,7 +860,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       } else {
         // هنوز session نداریم — فقط emulator رو خالی کن
         term.write("\x1b[H\x1b[2J", () => {
-          if (!destroyed) highlighter.refresh();
+          if (!destroyed) {
+            highlighter.refresh();
+            rtlOverlay.refresh();
+          }
         });
       }
     };
@@ -873,7 +887,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
       if (shortcuts["terminal-copy"] && isShortcutMatch(event, shortcuts["terminal-copy"])) {
         if (event.type === "keydown") {
-          const selection = term.getSelection();
+          // نسخه RTL-aware — رو خطوط فارسی متن دیده‌شده رو کپی می‌کنه نه بافر خام
+          const selection = getRtlAwareSelection(term);
           if (selection) {
             navigator.clipboard.writeText(selection).catch(() => {});
             term.clearSelection();
@@ -1010,6 +1025,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         term.options.fontSize = nextAppearance.fontSize;
         term.options.lineHeight = nextAppearance.lineHeight;
         safeFit();
+        rtlOverlay.refresh();
       });
     };
     const onAppearanceChanged = (event: Event) => {
@@ -1025,6 +1041,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       appThemeRef.current = theme;
       // decorationهای Find با پالت قبلی کشیده شدن — با تم جدید دوباره جستجو بزن
       highlighter.refresh();
+      rtlOverlay.refresh();
       if (findOpenRef.current) {
         findNextActionRef.current(true);
       }
@@ -1331,12 +1348,14 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         clearTerminalRef.current = null;
         searchAddonRef.current = null;
         highlighterRef.current = null;
+        rtlOverlayRef.current = null;
         ro.disconnect();
         dataDisp.dispose();
         selectionDisp.dispose();
         scrollDisp.dispose();
         resultsDisp.dispose();
         highlighter.dispose();
+        rtlOverlay.dispose();
         resizeDisp.dispose();
         isInitializedRef.current = false;
         return;
@@ -1345,6 +1364,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       clearTerminalRef.current = null;
       searchAddonRef.current = null;
       highlighterRef.current = null;
+      rtlOverlayRef.current = null;
       clearReconnectTimers();
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
@@ -1361,6 +1381,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       scrollDisp.dispose();
       resultsDisp.dispose();
       highlighter.dispose();
+      rtlOverlay.dispose();
       resizeDisp.dispose();
       unlistenOutputRef.current?.();
       unlistenExitRef.current?.();
