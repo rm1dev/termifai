@@ -393,6 +393,10 @@ impl SftpEntry {
 
         // فایل کامل از قبل تو tmp هست — فقط rename کن
         if resume_at == total_bytes && total_bytes > 0 {
+            if std::path::Path::new(local_path).exists() {
+                std::fs::remove_file(local_path)
+                    .map_err(|e| format!("replace existing '{}': {}", local_path, e))?;
+            }
             std::fs::rename(&tmp_path, local_path)
                 .map_err(|e| format!("rename tmp to '{}': {}", local_path, e))?;
             let _ = std::fs::remove_file(crate::sftp_transfer::download_marker_path(local_path));
@@ -486,6 +490,11 @@ impl SftpEntry {
         // خطای شبکه/Cancel: tmp+marker برای resume می‌مونن
         result?;
 
+        // فقط بعد از دانلود کامل جایگزین کن (ویندوز rename روی فایل موجود fail می‌شه)
+        if std::path::Path::new(local_path).exists() {
+            std::fs::remove_file(local_path)
+                .map_err(|e| format!("replace existing '{}': {}", local_path, e))?;
+        }
         std::fs::rename(&tmp_path, local_path)
             .map_err(|e| format!("rename tmp to '{}': {}", local_path, e))?;
         let _ = std::fs::remove_file(crate::sftp_transfer::download_marker_path(local_path));
@@ -538,6 +547,10 @@ impl SftpEntry {
         let mut local_file =
             std::fs::File::open(local_path).map_err(|e| format!("open local: {}", e))?;
 
+        // آپلود تازه (غیر resume) اول می‌ره تو فایل موقت تا مقصد قبلی از بین نره
+        let remote_tmp = format!("{}.termifai-uploading", remote_path);
+        let using_temp = resume_at == 0;
+
         let mut remote_file = if resume_at > 0 {
             // فقط WRITE + seek — APPEND روی OpenSSH با O_APPEND ممکنه seek رو نادیده بگیره
             let mut f = sftp
@@ -555,19 +568,11 @@ impl SftpEntry {
                 .map_err(|e| format!("seek local: {}", e))?;
             f
         } else {
-            // فایل غریبه/کهنه رو ننویس روش — از صفر بساز
-            if remote_len.is_some() {
-                let _ = sftp.unlink(std::path::Path::new(remote_path));
-            }
+            // اگه از آپلود قبلی یه temp مونده، بنداز دور و از صفر بساز
+            let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
             clear_upload_marker(local_path);
-
-            // workaround to ensure dir exists if path is like 'foo/bar'
-            if let Some(parent) = std::path::Path::new(remote_path).parent() {
-                let _ = sftp.mkdir(parent, 0o755);
-            }
-
-            sftp.create(std::path::Path::new(remote_path))
-                .map_err(|e| format!("create remote '{}': {}", remote_path, e))?
+            sftp.create(std::path::Path::new(&remote_tmp))
+                .map_err(|e| format!("create remote temp '{}': {}", remote_tmp, e))?
         };
 
         write_upload_marker(
@@ -597,30 +602,61 @@ impl SftpEntry {
             total_bytes,
         });
 
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                // فایل resumed رو unlink نکن — گیگابایت منتقل‌شده رو نگه دار
-                return Err("Cancelled".to_string());
+        let write_result = (|| {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    // فایل resumed رو unlink نکن — گیگابایت منتقل‌شده رو نگه دار
+                    return Err("Cancelled".to_string());
+                }
+                let n = local_file
+                    .read(&mut buf)
+                    .map_err(|e| format!("read local: {}", e))?;
+                if n == 0 {
+                    break;
+                }
+                remote_file
+                    .write_all(&buf[..n])
+                    .map_err(|e| format!("write remote: {}", e))?;
+                bytes_transferred += n as u64;
+                if last_progress.elapsed() >= PROGRESS_THROTTLE || bytes_transferred >= total_bytes {
+                    last_progress = Instant::now();
+                    on_progress(TransferProgress {
+                        session_id: session_id.to_string(),
+                        file_name: file_name.clone(),
+                        bytes_transferred,
+                        total_bytes,
+                    });
+                }
             }
-            let n = local_file
-                .read(&mut buf)
-                .map_err(|e| format!("read local: {}", e))?;
-            if n == 0 {
-                break;
+            Ok::<(), String>(())
+        })();
+
+        if let Err(err) = write_result {
+            // آپلود ناقصِ temp رو پاک کن تا مقصد اصلی سالم بمونه؛
+            // marker رو هم بردار وگرنه دفعه بعد ممکنه روی فایل اصلی resume بشه
+            if using_temp {
+                let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
+                clear_upload_marker(local_path);
             }
-            remote_file
-                .write_all(&buf[..n])
-                .map_err(|e| format!("write remote: {}", e))?;
-            bytes_transferred += n as u64;
-            if last_progress.elapsed() >= PROGRESS_THROTTLE || bytes_transferred >= total_bytes {
-                last_progress = Instant::now();
-                on_progress(TransferProgress {
-                    session_id: session_id.to_string(),
-                    file_name: file_name.clone(),
-                    bytes_transferred,
-                    total_bytes,
-                });
+            return Err(err);
+        }
+
+        if using_temp {
+            // حالا که فایل کامل تو temp هست، مقصد قدیمی رو بردار و atomic-ish جایگزین کن
+            if remote_len.is_some() {
+                let _ = sftp.unlink(std::path::Path::new(remote_path));
             }
+            sftp.rename(
+                std::path::Path::new(&remote_tmp),
+                std::path::Path::new(remote_path),
+            )
+            .map_err(|e| {
+                // اگه rename ترکید، حداقل temp رو نگه می‌داریم تا بشه دستی نجات داد
+                format!(
+                    "promote upload temp '{}' -> '{}': {}",
+                    remote_tmp, remote_path, e
+                )
+            })?;
         }
 
         clear_upload_marker(local_path);
@@ -921,10 +957,10 @@ impl SftpEntry {
                         if !proceed {
                             return Ok(());
                         }
-                        // overwrite تأیید شد — marker/ریموت غریبه رو پاک کن
+                        // overwrite تأیید شد — marker غریبه رو پاک کن؛ فایل ریموت
+                        // رو نگه می‌داریم تا upload_file بعد از نوشتن کامل جایگزین کنه
                         if !local_is_dir {
                             clear_upload_marker(local_path);
-                            let _ = sftp.unlink(std::path::Path::new(remote_path));
                         }
                     }
                 }
@@ -1014,7 +1050,7 @@ impl SftpEntry {
                             continue;
                         }
                         clear_upload_marker(&lp_str);
-                        let _ = sftp.unlink(std::path::Path::new(rp));
+                        // ریموت رو اینجا unlink نکن — upload_file بعد از موفقیت جایگزین می‌کنه
                     }
                 }
             }
@@ -1095,8 +1131,9 @@ impl SftpEntry {
                     if !proceed {
                         return Ok(());
                     }
+                    // فایل مقصد رو اینجا پاک نکن — download_file اول تو tmp می‌نویسه
+                    // و فقط بعد از موفقیت جایگزین می‌کنه؛ پاک کردن زودهنگام = از دست رفتن دیتا
                     if !is_dir {
-                        let _ = std::fs::remove_file(local_path);
                         clear_download_resume_files(local_path);
                     }
                 }
@@ -1194,7 +1231,7 @@ impl SftpEntry {
                         });
                         continue;
                     }
-                    let _ = std::fs::remove_file(lp);
+                    // مقصد رو نگه دار تا download تموم بشه؛ جایگزین اتمیک تو download_file
                     clear_download_resume_files(&lp_str);
                 }
             }
@@ -1600,6 +1637,16 @@ mod tests {
             ConflictDecision::Cancel
         });
         assert_eq!(h.resolve(&conflict_info()).unwrap_err(), "Cancelled");
+    }
+
+    #[test]
+    fn upload_temp_path_is_sidecar_not_destination() {
+        // آپلود overwrite باید اول بره تو *.termifai-uploading تا مقصد اصلی
+        // موقع شکست شبکه از بین نره
+        let remote = "/var/data/config.json";
+        let tmp = format!("{}.termifai-uploading", remote);
+        assert_eq!(tmp, "/var/data/config.json.termifai-uploading");
+        assert_ne!(tmp, remote);
     }
 }
 
