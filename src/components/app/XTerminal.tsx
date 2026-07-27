@@ -15,6 +15,7 @@ import {
   writeToSession,
 } from "@/lib/api/terminal";
 import { subscribe, type UnlistenFn } from "@/lib/api/transport";
+import { readClipboardText } from "@/lib/api/clipboard";
 import { open as openExternalUrl } from "@tauri-apps/plugin-shell";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { quotePathForShell } from "@/lib/shell-quote";
@@ -435,8 +436,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const pasteClipboard = useCallback(() => {
     const sid = sessionRef.current;
     if (!sid) return;
-    navigator.clipboard
-      .readText()
+    // از مسیر native می‌خونیم که حباب تأیید Paste مک ظاهر نشه
+    readClipboardText()
       .then((text) => {
         if (!text) return;
         noteInjectedInput(text);
@@ -901,7 +902,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         if (event.type === "keydown") {
           const sid = sessionRef.current;
           if (sid) {
-            navigator.clipboard.readText().then((text) => {
+            readClipboardText().then((text) => {
               if (!text) return;
               noteInjectedInput(text);
               writeToSession(sid, text).catch(() => {});
