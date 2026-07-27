@@ -3,7 +3,7 @@ members = ["crates/termifai-core", "crates/termifaid"]
 
 [package]
 name = "termifai"
-version = "1.0.1"
+version = "1.1.0"
 description = "A modern terminal emulator"
 authors = ["you"]
 license = "MIT"
@@ -30,6 +30,7 @@ tauri-plugin-window-state = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-shell = "2"
+tauri-plugin-clipboard-manager = "2"
 auto-launch = "0.5"
 portable-pty = "0.8"
 uuid = { version = "1", features = ["v4"] }

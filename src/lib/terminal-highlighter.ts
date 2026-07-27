@@ -152,13 +152,20 @@ const IDLE_RESUME_MS = 180;
 export function attachSemanticHighlighter(
   term: Terminal,
   getTheme: () => XtermTheme
-): { refresh: () => void; setEnabled: (enabled: boolean) => void; dispose: () => void } {
+): {
+  refresh: () => void;
+  setEnabled: (enabled: boolean) => void;
+  setPaused: (paused: boolean) => void;
+  dispose: () => void;
+} {
   // فقط خط‌های داخل viewport رو نگه می‌داریم — اسکرول‌بک decoration نمی‌خواد
   const tracked = new Map<number, LineRecord>();
   let timer: ReturnType<typeof setTimeout> | null = null;
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
   let enabled = loadSemanticHighlighting();
+  // وقتی Find بازه decorationهای semantic با SearchAddon قاطی می‌شن — موقتاً خاموش
+  let paused = false;
   let writeStamps: number[] = [];
   let busy = false;
 
@@ -196,7 +203,7 @@ export function attachSemanticHighlighter(
   };
 
   const scanViewport = () => {
-    if (disposed || !enabled) return;
+    if (disposed || !enabled || paused) return;
     const buf = term.buffer.active;
     // Decorations aren't supported in the alternate buffer (vim, etc.).
     if (buf.type === "alternate") {
@@ -290,7 +297,7 @@ export function attachSemanticHighlighter(
   };
 
   const schedule = (force = false) => {
-    if (disposed || !enabled) return;
+    if (disposed || !enabled || paused) return;
     if (timer) {
       if (!force) return;
       clearTimeout(timer);
@@ -320,6 +327,7 @@ export function attachSemanticHighlighter(
 
   // Full re-scan with fresh colors; used on theme change.
   const refresh = () => {
+    if (paused) return;
     clearAll();
     busy = false;
     writeStamps = [];
@@ -334,7 +342,7 @@ export function attachSemanticHighlighter(
       if (next === enabled) return;
       enabled = next;
       if (next) {
-        schedule(true);
+        if (!paused) schedule(true);
       } else {
         if (timer) {
           clearTimeout(timer);
@@ -348,6 +356,16 @@ export function attachSemanticHighlighter(
         busy = false;
         writeStamps = [];
       }
+    },
+    setPaused: (next: boolean) => {
+      if (next === paused) return;
+      paused = next;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      clearAll();
+      if (!next && enabled) schedule(true);
     },
     dispose: () => {
       disposed = true;

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, forwardRef } from "react";
+import { useState, useRef, useEffect, useCallback, forwardRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { platform } from "@/lib/platform";
 import { posixShellQuote } from "@/lib/shell-quote";
@@ -24,6 +24,8 @@ import {
   Maximize2,
   ChevronLeft,
   ChevronRight,
+  ListFilter,
+  Search,
 } from "lucide-react";
 import {
   DropdownMenu,
@@ -627,6 +629,63 @@ function TitleBar({
 
   const pinnedTabs = tabs.filter((t) => !t.closable);
   const closableTabs = tabs.filter((t) => t.closable);
+  const carouselRef = useRef<HTMLDivElement | null>(null);
+  const carouselTrackRef = useRef<HTMLDivElement | null>(null);
+  const [tabsOverflow, setTabsOverflow] = useState(false);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  const updateCarouselState = useCallback(() => {
+    const viewport = carouselRef.current;
+    if (!viewport) return;
+    const overflowing = viewport.scrollWidth > viewport.clientWidth + 1;
+    const maxScroll = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
+    setTabsOverflow(overflowing);
+    setCanScrollLeft(overflowing && viewport.scrollLeft > 1);
+    setCanScrollRight(overflowing && viewport.scrollLeft < maxScroll - 1);
+  }, []);
+
+  useEffect(() => {
+    const viewport = carouselRef.current;
+    const track = carouselTrackRef.current;
+    if (!viewport || !track) return;
+
+    const observer = new ResizeObserver(updateCarouselState);
+    observer.observe(viewport);
+    observer.observe(track);
+    updateCarouselState();
+    return () => observer.disconnect();
+  }, [updateCarouselState]);
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => {
+      updateCarouselState();
+      const viewport = carouselRef.current;
+      const active = carouselTrackRef.current?.querySelector(
+        `[data-tab-id="${activeTab}"]`
+      ) as HTMLElement | null;
+      if (!viewport || !active) return;
+
+      // تب فعال همیشه باید داخل قاب carousel دیده بشه، حتی اگه با shortcut عوض شده.
+      const viewportRect = viewport.getBoundingClientRect();
+      const activeRect = active.getBoundingClientRect();
+      if (activeRect.left < viewportRect.left) {
+        viewport.scrollBy({ left: activeRect.left - viewportRect.left - 4, behavior: "smooth" });
+      } else if (activeRect.right > viewportRect.right) {
+        viewport.scrollBy({ left: activeRect.right - viewportRect.right + 4, behavior: "smooth" });
+      }
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [activeTab, tabs, updateCarouselState]);
+
+  const scrollTabs = (direction: -1 | 1) => {
+    const viewport = carouselRef.current;
+    if (!viewport) return;
+    viewport.scrollBy({
+      left: direction * Math.max(160, Math.round(viewport.clientWidth * 0.7)),
+      behavior: "smooth",
+    });
+  };
 
   return (
     <div
@@ -644,49 +703,100 @@ function TitleBar({
       )}
       {(isQuickTerminal || platform !== "macos") && <div className="w-3 h-full shrink-0" />}
 
-      <div className="flex h-full flex-1 items-end gap-1 overflow-x-auto pl-1" {...dragRegion}>
-        {/* Pinned tabs (Hosts) — outside DnD, immovable */}
-        {pinnedTabs.map((t) => (
-          <BaseTabChip
-            key={t.id}
-            tab={t}
-            active={t.id === activeTab}
-            onClick={() => onSelect(t.id)}
-            onClose={() => onClose(t.id)}
-            onRename={(title) => onRename(t.id, title)}
-          />
-        ))}
-
-        {/* Closable tabs — inside DnD, cannot pass Hosts */}
-        <div className="flex flex-1 items-end gap-1" {...dragRegion}>
-          <DndContext
-            sensors={sensors}
-            collisionDetection={closestCenter}
-            modifiers={[restrictToHorizontalAxis, restrictToParentElement]}
-            onDragEnd={handleDragEnd}
-          >
-            <SortableContext items={closableTabs.map((t) => t.id)} strategy={horizontalListSortingStrategy}>
-              {closableTabs.map((t) => (
-                <SortableTabChip
-                  key={t.id}
-                  tab={t}
-                  active={t.id === activeTab}
-                  onClick={() => onSelect(t.id)}
-                  onClose={() => onClose(t.id)}
-                  onRename={(title) => onRename(t.id, title)}
-                />
-              ))}
-            </SortableContext>
-          </DndContext>
-
+      <div className="flex h-full min-w-0 flex-1 items-end gap-0.5 pl-1" {...dragRegion}>
+        {tabsOverflow && (
           <button
-            onClick={() => onNew("terminal")}
-            className="ml-1 mb-1 flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
-            aria-label="New Local Terminal"
+            type="button"
+            onClick={() => scrollTabs(-1)}
+            disabled={!canScrollLeft}
+            className="mb-1 flex h-8 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30 disabled:hover:bg-transparent"
+            aria-label="Scroll tabs left"
           >
-            <Plus className="h-4 w-4" />
+            <ChevronLeft className="h-4 w-4" />
           </button>
+        )}
+
+        <div
+          ref={carouselRef}
+          onScroll={updateCarouselState}
+          onWheel={(event) => {
+            if (!tabsOverflow) return;
+            const viewport = carouselRef.current;
+            if (!viewport) return;
+            const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+            if (delta) viewport.scrollLeft += delta;
+          }}
+          className="h-full min-w-0 flex-1 overflow-hidden"
+          aria-label="Open tabs carousel"
+        >
+          <div
+            ref={carouselTrackRef}
+            className="flex h-full w-max min-w-full items-end gap-1"
+            {...dragRegion}
+          >
+            {/* تب Hosts پین شده و وارد drag-and-drop نمی‌شه */}
+            {pinnedTabs.map((t) => (
+              <BaseTabChip
+                key={t.id}
+                tab={t}
+                active={t.id === activeTab}
+                onClick={() => onSelect(t.id)}
+                onClose={() => onClose(t.id)}
+                onRename={(title) => onRename(t.id, title)}
+              />
+            ))}
+
+            {/* تب‌های قابل‌بستن داخل carousel قابل جابه‌جایی می‌مونن */}
+            <div className="flex items-end gap-1" {...dragRegion}>
+              <DndContext
+                sensors={sensors}
+                collisionDetection={closestCenter}
+                modifiers={[restrictToHorizontalAxis, restrictToParentElement]}
+                onDragEnd={handleDragEnd}
+              >
+                <SortableContext items={closableTabs.map((t) => t.id)} strategy={horizontalListSortingStrategy}>
+                  {closableTabs.map((t) => (
+                    <SortableTabChip
+                      key={t.id}
+                      tab={t}
+                      active={t.id === activeTab}
+                      onClick={() => onSelect(t.id)}
+                      onClose={() => onClose(t.id)}
+                      onRename={(title) => onRename(t.id, title)}
+                    />
+                  ))}
+                </SortableContext>
+              </DndContext>
+            </div>
+          </div>
         </div>
+
+        {tabsOverflow && (
+          <button
+            type="button"
+            onClick={() => scrollTabs(1)}
+            disabled={!canScrollRight}
+            className="mb-1 flex h-8 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground disabled:opacity-30 disabled:hover:bg-transparent"
+            aria-label="Scroll tabs right"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
+        )}
+
+        <button
+          type="button"
+          onClick={() => onNew("terminal")}
+          className={`mb-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground ${
+            tabsOverflow ? "" : "mr-2"
+          }`}
+          aria-label="New Local Terminal"
+        >
+          <Plus className="h-4 w-4" />
+        </button>
+
+        {tabsOverflow && (
+          <TabListMenu tabs={tabs} activeTab={activeTab} onSelect={onSelect} onClose={onClose} />
+        )}
       </div>
 
       {/* Linux/Windows: hamburger app menu + window controls */}
@@ -708,6 +818,139 @@ function TitleBar({
         )
       )}
     </div>
+  );
+}
+
+function TabListMenu({
+  tabs,
+  activeTab,
+  onSelect,
+  onClose,
+}: {
+  tabs: AppTab[];
+  activeTab: string;
+  onSelect: (id: string) => void;
+  onClose: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredTabs = normalizedQuery
+    ? tabs.filter((tab) =>
+        `${tab.title} ${tab.connectionLabel ?? ""}`.toLocaleLowerCase().includes(normalizedQuery)
+      )
+    : tabs;
+
+  useEffect(() => {
+    if (!open) return;
+    const frame = requestAnimationFrame(() => searchRef.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [open]);
+
+  return (
+    <DropdownMenu
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setQuery("");
+      }}
+    >
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          className="mb-1 mr-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-[var(--color-surface-2)] hover:text-foreground data-[state=open]:bg-[var(--color-surface-2)] data-[state=open]:text-foreground"
+          aria-label="Show all tabs"
+          title="All tabs"
+        >
+          <ListFilter className="h-4 w-4" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        sideOffset={6}
+        className="flex max-h-[min(420px,var(--radix-dropdown-menu-content-available-height))] w-72 flex-col overflow-hidden p-0"
+        onCloseAutoFocus={(event) => event.preventDefault()}
+      >
+        <div className="shrink-0 border-b border-border p-2">
+          <div className="flex h-8 items-center gap-2 rounded-md border border-input bg-background px-2 focus-within:ring-1 focus-within:ring-ring">
+            <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <input
+              ref={searchRef}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              onKeyDown={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+              placeholder="Search tabs…"
+              aria-label="Search tabs"
+              className="min-w-0 flex-1 bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground"
+            />
+          </div>
+        </div>
+
+        <div className="min-h-0 overflow-y-auto p-1">
+          {filteredTabs.length ? (
+            filteredTabs.map((tab) => (
+              <DropdownMenuItem
+                key={tab.id}
+                onSelect={() => onSelect(tab.id)}
+                onPointerDown={(event) => {
+                  // میدل‌کلیک نباید autoscroll مرورگر رو فعال کنه
+                  if (event.button === 1) event.preventDefault();
+                }}
+                onPointerUp={(event) => {
+                  // با preventDefault، هندلر داخلی Radix اجرا نمی‌شه و
+                  // میدل‌کلیک باعث select شدن آیتم و بسته شدن منو نمی‌شه
+                  if (event.button === 1) event.preventDefault();
+                }}
+                onAuxClick={(event) => {
+                  // میدل‌کلیک روی گزینه = بستن همون تب، بدون این که منو بسته شه
+                  if (event.button === 1 && tab.closable) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onClose(tab.id);
+                  }
+                }}
+                className="group min-w-0 cursor-pointer py-2"
+              >
+                <TabIcon tab={tab} />
+                <span className="min-w-0 flex-1 truncate">{tab.title}</span>
+                {tab.id === activeTab && (
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-label="Active tab" />
+                )}
+                {tab.closable && (
+                  <button
+                    type="button"
+                    onPointerDown={(event) => {
+                      // جلوی select شدن آیتم توسط Radix رو می‌گیریم
+                      event.stopPropagation();
+                      event.preventDefault();
+                    }}
+                    onPointerUp={(event) => {
+                      // Radix روی pointerup آیتم، click مصنوعی می‌زنه و منو رو می‌بنده؛
+                      // نباید این رویداد از دکمه X به آیتم برسه
+                      event.stopPropagation();
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onClose(tab.id);
+                    }}
+                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-[var(--color-surface-2)] hover:text-foreground group-hover:opacity-100 group-data-[highlighted]:opacity-100"
+                    aria-label={`Close ${tab.title}`}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </DropdownMenuItem>
+            ))
+          ) : (
+            <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+              No tabs found
+            </div>
+          )}
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
@@ -822,6 +1065,19 @@ function WindowControls() {
 }
 
 /* ---------- Base tab chip (no DnD) ---------- */
+function TabIcon({ tab }: { tab: AppTab }) {
+  if (tab.kind === "terminal" && tab.hostId) {
+    return <Server className="h-3.5 w-3.5 shrink-0 text-[var(--color-brand-orange)]" />;
+  }
+  if (tab.kind === "terminal") {
+    return <TerminalSquare className="h-3.5 w-3.5 shrink-0 text-[var(--color-brand-green)]" />;
+  }
+  if (tab.kind === "sftp") {
+    return <Folder className="h-3.5 w-3.5 shrink-0 text-[var(--color-brand-cyan)]" />;
+  }
+  return <LayoutGrid className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />;
+}
+
 interface BaseTabChipProps {
   tab: AppTab;
   active: boolean;
@@ -856,19 +1112,9 @@ const BaseTabChip = forwardRef<HTMLDivElement, BaseTabChipProps>(function BaseTa
     setEditing(false);
   };
 
-  const icon =
-    tab.kind === "terminal" && tab.hostId ? (
-      <Server className="h-3.5 w-3.5 text-[var(--color-brand-orange)]" />
-    ) : tab.kind === "terminal" ? (
-      <TerminalSquare className="h-3.5 w-3.5 text-[var(--color-brand-green)]" />
-    ) : tab.kind === "sftp" ? (
-      <Folder className="h-3.5 w-3.5 text-[var(--color-brand-cyan)]" />
-    ) : (
-      <LayoutGrid className="h-3.5 w-3.5 text-muted-foreground" />
-    );
-
   return (
     <div
+      data-tab-id={tab.id}
       ref={(node) => {
         setNodeRef?.(node);
         if (typeof ref === "function") ref(node);
@@ -891,13 +1137,13 @@ const BaseTabChip = forwardRef<HTMLDivElement, BaseTabChipProps>(function BaseTa
         }
       }}
       className={[
-        "group relative flex h-9 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs font-medium outline-none border-t-2 transition-colors",
+        "group relative flex h-9 shrink-0 cursor-pointer items-center gap-2 rounded-t-md px-3 text-xs font-medium outline-none border-t-2 transition-colors",
         active
           ? "bg-[var(--color-tab-active)] text-foreground border-primary"
           : "bg-[var(--color-tab-inactive)] text-muted-foreground hover:text-foreground border-transparent",
       ].join(" ")}
     >
-      {icon}
+      <TabIcon tab={tab} />
       {editing ? (
         <input
           ref={inputRef}
@@ -1030,7 +1276,7 @@ function Sidebar({
         })}
       </nav>
       <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground text-center truncate">
-        {isCurrentlyCollapsed ? "v1.0.1" : "v1.0.1 · Termifai"}
+        {isCurrentlyCollapsed ? "v1.1.0" : "v1.1.0 · Termifai"}
       </div>
     </aside>
   );
