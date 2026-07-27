@@ -795,7 +795,7 @@ function TitleBar({
         </button>
 
         {tabsOverflow && (
-          <TabListMenu tabs={tabs} activeTab={activeTab} onSelect={onSelect} />
+          <TabListMenu tabs={tabs} activeTab={activeTab} onSelect={onSelect} onClose={onClose} />
         )}
       </div>
 
@@ -825,10 +825,12 @@ function TabListMenu({
   tabs,
   activeTab,
   onSelect,
+  onClose,
 }: {
   tabs: AppTab[];
   activeTab: string;
   onSelect: (id: string) => void;
+  onClose: (id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -892,12 +894,52 @@ function TabListMenu({
               <DropdownMenuItem
                 key={tab.id}
                 onSelect={() => onSelect(tab.id)}
-                className="min-w-0 cursor-pointer py-2"
+                onPointerDown={(event) => {
+                  // میدل‌کلیک نباید autoscroll مرورگر رو فعال کنه
+                  if (event.button === 1) event.preventDefault();
+                }}
+                onPointerUp={(event) => {
+                  // با preventDefault، هندلر داخلی Radix اجرا نمی‌شه و
+                  // میدل‌کلیک باعث select شدن آیتم و بسته شدن منو نمی‌شه
+                  if (event.button === 1) event.preventDefault();
+                }}
+                onAuxClick={(event) => {
+                  // میدل‌کلیک روی گزینه = بستن همون تب، بدون این که منو بسته شه
+                  if (event.button === 1 && tab.closable) {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    onClose(tab.id);
+                  }
+                }}
+                className="group min-w-0 cursor-pointer py-2"
               >
                 <TabIcon tab={tab} />
                 <span className="min-w-0 flex-1 truncate">{tab.title}</span>
                 {tab.id === activeTab && (
                   <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-primary" aria-label="Active tab" />
+                )}
+                {tab.closable && (
+                  <button
+                    type="button"
+                    onPointerDown={(event) => {
+                      // جلوی select شدن آیتم توسط Radix رو می‌گیریم
+                      event.stopPropagation();
+                      event.preventDefault();
+                    }}
+                    onPointerUp={(event) => {
+                      // Radix روی pointerup آیتم، click مصنوعی می‌زنه و منو رو می‌بنده؛
+                      // نباید این رویداد از دکمه X به آیتم برسه
+                      event.stopPropagation();
+                    }}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onClose(tab.id);
+                    }}
+                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:bg-[var(--color-surface-2)] hover:text-foreground group-hover:opacity-100 group-data-[highlighted]:opacity-100"
+                    aria-label={`Close ${tab.title}`}
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
                 )}
               </DropdownMenuItem>
             ))
