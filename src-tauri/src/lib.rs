@@ -2535,6 +2535,9 @@ pub fn run() {
         )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
+        // Clipboard reads must go through the native pasteboard API: WebKit's
+        // navigator.clipboard.readText() pops macOS's per-read "Paste" balloon.
+        .plugin(tauri_plugin_clipboard_manager::init())
         .invoke_handler(tauri::generate_handler![
             take_pending_open_folders,
             create_session,
