@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import {
   closeSession,
@@ -753,6 +754,11 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       // without it.
       allowProposedApi: true,
     });
+
+    // جدول عرض یونیکد ۶ اموجی‌ها رو تک‌سلولی می‌بینه؛ نسخه ۱۱ عرض درست (۲ سلول) می‌ده
+    // تا گلیف پهن روی حرف بعدی نره (مثل 🚀Server بدون فاصله)
+    term.loadAddon(new Unicode11Addon());
+    term.unicode.activeVersion = "11";
 
     const fit = new FitAddon();
     fitAddonRef.current = fit;
