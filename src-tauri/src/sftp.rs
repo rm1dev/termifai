@@ -460,10 +460,18 @@ impl SftpEntry {
             local_file
                 .flush()
                 .map_err(|e| format!("flush tmp: {}", e))?;
+            // EOF زودرس (فایل remote وسط کار truncate شده، یا کانال نصفه بسته شده)
+            // نباید به‌عنوان موفقیت rename بشه — فایل ناقص رو جای کامل جا نزن.
+            if total_bytes > 0 && bytes_transferred != total_bytes {
+                return Err(format!(
+                    "incomplete download: got {} of {} bytes",
+                    bytes_transferred, total_bytes
+                ));
+            }
             Ok::<(), String>(())
         })();
 
-        // خطای شبکه/Cancel: tmp+marker برای resume می‌مونن
+        // خطای شبکه/Cancel/incomplete: tmp+marker برای resume می‌مونن
         result?;
 
         std::fs::rename(&tmp_path, local_path)
@@ -595,6 +603,14 @@ impl SftpEntry {
                     total_bytes,
                 });
             }
+        }
+
+        // فایل local وسط آپلود truncate شده باشه، EOF زودرس می‌آد — موفقیت دروغین نده.
+        if total_bytes > 0 && bytes_transferred != total_bytes {
+            return Err(format!(
+                "incomplete upload: wrote {} of {} bytes",
+                bytes_transferred, total_bytes
+            ));
         }
 
         clear_upload_marker(local_path);
