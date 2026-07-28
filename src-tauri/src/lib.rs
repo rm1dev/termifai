@@ -576,6 +576,11 @@ fn reorder_snippets(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), Strin
 }
 
 #[tauri::command]
+fn reorder_snippet_groups(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String> {
+    snippets::reorder_snippet_groups(&app, ids)
+}
+
+#[tauri::command]
 fn save_snippet_group(
     app: tauri::AppHandle,
     request: snippets::SaveSnippetGroupRequest,
@@ -2585,6 +2590,7 @@ pub fn run() {
             save_snippet,
             remove_snippets,
             reorder_snippets,
+            reorder_snippet_groups,
             save_snippet_group,
             remove_snippet_group,
             run_snippet_script,

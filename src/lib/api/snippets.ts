@@ -30,6 +30,10 @@ export function reorderSnippets(ids: string[]): Promise<void> {
   return call<void>("reorder_snippets", { ids });
 }
 
+export function reorderSnippetGroups(ids: string[]): Promise<void> {
+  return call<void>("reorder_snippet_groups", { ids });
+}
+
 export function saveSnippetGroup(
   name: string,
   parentId: string | null,

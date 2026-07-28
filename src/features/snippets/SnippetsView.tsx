@@ -42,6 +42,7 @@ import {
   listSnippets,
   removeSnippetGroup,
   removeSnippets,
+  reorderSnippetGroups,
   reorderSnippets,
   saveSnippet,
   saveSnippetGroup,
@@ -163,6 +164,29 @@ export function SnippetsView() {
     }
   };
 
+  const reorderGroups = async (rootOrder: string[]) => {
+    const groupsById = new Map(groups.map((group) => [group.id, group]));
+    let rootIndex = 0;
+    const reorderedGroups = groups.map((group) => (
+      !group.parentId ? groupsById.get(rootOrder[rootIndex++])! : group
+    ));
+    setGroups(reorderedGroups);
+    try {
+      await reorderSnippetGroups(rootOrder);
+      notifySnippetsChanged();
+    } catch (err) {
+      console.error("Failed to reorder snippet groups:", err);
+      try {
+        const data = await listSnippets();
+        setSnippets(data.snippets);
+        setGroups(data.groups);
+      } catch (reloadErr) {
+        console.error("Failed to reload snippets after group reorder:", reloadErr);
+      }
+    }
+  };
+
+
   const selectedIds = Array.from(selected);
 
   const getSnippetContent = (s: Snippet) => s.body || s.command || s.script || "";
@@ -173,6 +197,9 @@ export function SnippetsView() {
     return s.name.toLowerCase().includes(q) || getSnippetContent(s).toLowerCase().includes(q);
   });
 
+  const dragSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+  );
   const rootSnippets = visibleSnippets.filter((s) => !s.groupId);
   const rootGroups = groups.filter((g) => !g.parentId);
   const isSearching = query.trim().length > 0;
@@ -265,27 +292,42 @@ export function SnippetsView() {
             />
           ) : (
             <>
-              {rootGroups.map((g) => (
-                <SnippetGroupNode
-                  key={g.id}
-                  group={g}
-                  depth={0}
-                  groups={groups}
-                  snippets={visibleSnippets}
-                  selected={selected}
-                  collapsed={collapsed}
-                  onToggle={toggleCollapse}
-                  toggleSelect={toggleSelect}
-                  getSnippetContent={getSnippetContent}
-                  onAddSubgroup={(parentId) => setGroupModal({ open: true, parentId, group: null })}
-                  onAddSnippet={(groupId) => setEditor({ open: true, snippet: null, groupId })}
-                  onEditGroup={(group) => setGroupModal({ open: true, parentId: group.parentId, group })}
-                  onDeleteGroup={(id) => void removeGroup(id)}
-                  onEdit={(s) => setEditor({ open: true, snippet: s })}
-                  onRemove={(id) => setRemoving([id])}
-                  onReorder={(ids) => void reorder(ids)}
-                />
-              ))}
+              <DndContext
+                sensors={dragSensors}
+                collisionDetection={closestCenter}
+                modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+                onDragEnd={(e: DragEndEvent) => {
+                  const { active, over } = e;
+                  if (!over || active.id === over.id) return;
+                  const ids = rootGroups.map((group) => group.id);
+                  const from = ids.indexOf(active.id as string);
+                  const to = ids.indexOf(over.id as string);
+                  if (from !== -1 && to !== -1) void reorderGroups(arrayMove(ids, from, to));
+                }}
+              >
+                <SortableContext items={rootGroups.map((group) => group.id)} strategy={verticalListSortingStrategy}>
+                  {rootGroups.map((g) => (
+                    <SortableSnippetGroupNode
+                      key={g.id}
+                      group={g}
+                      groups={groups}
+                      snippets={visibleSnippets}
+                      selected={selected}
+                      collapsed={collapsed}
+                      onToggle={toggleCollapse}
+                      toggleSelect={toggleSelect}
+                      getSnippetContent={getSnippetContent}
+                      onAddSubgroup={(parentId) => setGroupModal({ open: true, parentId, group: null })}
+                      onAddSnippet={(groupId) => setEditor({ open: true, snippet: null, groupId })}
+                      onEditGroup={(group) => setGroupModal({ open: true, parentId: group.parentId, group })}
+                      onDeleteGroup={(id) => void removeGroup(id)}
+                      onEdit={(s) => setEditor({ open: true, snippet: s })}
+                      onRemove={(id) => setRemoving([id])}
+                      onReorder={(ids) => void reorder(ids)}
+                    />
+                  ))}
+                </SortableContext>
+              </DndContext>
               <SnippetsList
                 snippets={rootSnippets}
                 selected={selected}
@@ -359,10 +401,7 @@ function descendantGroupIds(groups: SnippetGroup[], id: string): string[] {
 }
 
 /* ---- Group rendering (recursive) ---- */
-function SnippetGroupNode({
-  group, depth, groups, snippets, selected, collapsed, onToggle, toggleSelect, getSnippetContent,
-  onAddSubgroup, onAddSnippet, onEditGroup, onDeleteGroup, onEdit, onRemove, onReorder,
-}: {
+type SnippetGroupNodeProps = {
   group: SnippetGroup;
   depth: number;
   groups: SnippetGroup[];
@@ -379,7 +418,13 @@ function SnippetGroupNode({
   onEdit: (s: Snippet) => void;
   onRemove: (id: string) => void;
   onReorder: (ids: string[]) => void;
-}) {
+  dragHandle?: React.ReactNode;
+};
+
+function SnippetGroupNode({
+  group, depth, groups, snippets, selected, collapsed, onToggle, toggleSelect, getSnippetContent,
+  onAddSubgroup, onAddSnippet, onEditGroup, onDeleteGroup, onEdit, onRemove, onReorder, dragHandle,
+}: SnippetGroupNodeProps) {
   const isOpen = !collapsed[group.id];
   const children = groups.filter((g) => g.parentId === group.id);
   const groupSnippets = snippets.filter((s) => s.groupId === group.id);
@@ -387,6 +432,7 @@ function SnippetGroupNode({
   return (
     <div className="mb-2" style={{ marginLeft: depth * 16 }}>
       <div className="group flex items-center gap-1.5 rounded-md px-1.5 py-1 hover:bg-[var(--color-surface)]">
+        {dragHandle}
         <button
           onClick={() => onToggle(group.id)}
           className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
@@ -466,6 +512,38 @@ function SnippetGroupNode({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function SortableSnippetGroupNode(props: Omit<SnippetGroupNodeProps, "depth" | "dragHandle">) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: props.group.id });
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform ? { ...transform, x: 0, scaleX: 1, scaleY: 1 } : null),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : undefined,
+    position: "relative",
+    background: isDragging ? "var(--color-surface-2)" : undefined,
+  };
+
+  return (
+    <div ref={setNodeRef} style={style}>
+      <SnippetGroupNode
+        {...props}
+        depth={0}
+        dragHandle={
+          <button
+            type="button"
+            {...attributes}
+            {...listeners}
+            onClick={(e) => e.stopPropagation()}
+            className="flex h-6 w-5 shrink-0 cursor-grab items-center justify-center text-muted-foreground/50 opacity-0 transition-opacity hover:text-muted-foreground group-hover:opacity-100 active:cursor-grabbing"
+          >
+            <GripVertical className="h-3.5 w-3.5" />
+          </button>
+        }
+      />
     </div>
   );
 }
