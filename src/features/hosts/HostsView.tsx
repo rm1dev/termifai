@@ -589,7 +589,7 @@ function HostsList({
           tabIndex={0}
           onClick={() => onConnectHost(h)}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onConnectHost(h); } }}
-          className="group flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
+          className="group relative flex cursor-pointer items-center gap-3 overflow-hidden rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
         >
           <OsBadge os={h.os} />
           <div className="min-w-0 flex-1">
