@@ -304,6 +304,82 @@ pub fn reorder_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String>
     Ok(())
 }
 
+/// Replaces root-group slots with submitted root-group order, preserving every
+/// nested group and validating all input before mutating the vault.
+pub fn reorder_snippet_groups(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut validation_error = None;
+    state
+        .snippets_store
+        .update_with_migration(migrate_snippets_vault, |vault| {
+            let mut reordered = vault.groups.clone();
+            match reorder_group_vector(&mut reordered, &ids) {
+                Ok(()) => vault.groups = reordered,
+                Err(error) => validation_error = Some(error),
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    if let Some(error) = validation_error {
+        return Err(error);
+    }
+    crate::sync::mark_dirty(app);
+    Ok(())
+}
+
+fn reorder_group_vector(groups: &mut Vec<SnippetGroup>, ids: &[String]) -> Result<(), String> {
+    let root_ids: Vec<&str> = groups
+        .iter()
+        .filter(|group| group.parent_id.is_none())
+        .map(|group| group.id.as_str())
+        .collect();
+
+    if ids.len() != root_ids.len() {
+        return Err(format!(
+            "Invalid group order: expected {} root group IDs, received {}",
+            root_ids.len(),
+            ids.len()
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    for id in ids {
+        if !seen.insert(id.as_str()) {
+            return Err(format!("Invalid group order: duplicate group ID '{id}'"));
+        }
+        let Some(group) = groups.iter().find(|group| group.id == *id) else {
+            return Err(format!("Snippet group '{id}' does not exist"));
+        };
+        if group.parent_id.is_some() {
+            return Err(format!(
+                "Invalid group order: group '{id}' is not a root group"
+            ));
+        }
+    }
+
+    if let Some(id) = root_ids.iter().find(|id| !seen.contains(**id)) {
+        return Err(format!("Invalid group order: missing root group ID '{id}'"));
+    }
+
+    let reordered_roots: Vec<SnippetGroup> = ids
+        .iter()
+        .map(|id| {
+            groups
+                .iter()
+                .find(|group| group.id == *id)
+                .expect("validated root group ID")
+                .clone()
+        })
+        .collect();
+    for (slot, source) in groups
+        .iter_mut()
+        .filter(|group| group.parent_id.is_none())
+        .zip(reordered_roots)
+    {
+        *slot = source;
+    }
+    Ok(())
+}
+
 pub fn save_snippet_group(
     app: &AppHandle,
     request: SaveSnippetGroupRequest,
