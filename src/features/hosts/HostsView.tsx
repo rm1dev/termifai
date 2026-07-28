@@ -219,7 +219,7 @@ export function HostsView({
           <div className="relative">
             <button
               onClick={() => setViewOpen((v) => !v)}
-              className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
+              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-md text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
               title={viewMode === "grid" ? "Grid view" : "List view"}
             >
               {viewMode === "grid" ? <LayoutGrid className="h-4 w-4" /> : <List className="h-4 w-4" />}
@@ -536,7 +536,7 @@ function HostsList({
             tabIndex={0}
             onClick={() => onConnectHost(h)}
             onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onConnectHost(h); } }}
-            className="group flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
+            className="group relative flex cursor-pointer items-center gap-3 overflow-hidden rounded-lg border border-border bg-[var(--color-surface)] p-3 text-left transition hover:border-[var(--color-brand-orange)]/40 hover:bg-[var(--color-surface-2)]"
           >
             <OsBadge os={h.os} />
             <div className="min-w-0 flex-1">
@@ -550,12 +550,12 @@ function HostsList({
               </div>
               <div className="truncate text-xs text-muted-foreground">ssh, {h.user}</div>
             </div>
-            <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-0.5 border-l border-border/60 bg-[color-mix(in_oklab,var(--color-surface)_82%,transparent)] px-3 opacity-0 shadow-[-12px_0_20px_-16px_color-mix(in_oklab,var(--background)_80%,transparent)] backdrop-blur-md transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
               {onOpenSftp && (
                 <button
                   title="Open SFTP"
                   onClick={(e) => { e.stopPropagation(); onOpenSftp(h); }}
-                  className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-[var(--color-brand-cyan)]"
+                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-[var(--color-brand-cyan)]"
                 >
                   <Folder className="h-3.5 w-3.5" />
                 </button>
@@ -563,18 +563,17 @@ function HostsList({
               <button
                 title="Edit"
                 onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
-                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-foreground"
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-foreground"
               >
                 <Settings className="h-3.5 w-3.5" />
               </button>
               <button
                 title="Delete"
                 onClick={(e) => { e.stopPropagation(); onDeleteHost(h.id); }}
-                className="flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-[oklch(0.72_0.18_25)]"
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface)] hover:text-[oklch(0.72_0.18_25)]"
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
-              <PanelRightOpen className="h-4 w-4 text-muted-foreground" />
             </div>
           </div>
         ))}
@@ -604,12 +603,12 @@ function HostsList({
             </div>
             <div className="truncate text-xs text-muted-foreground">{h.user}@{h.hostname}</div>
           </div>
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center gap-2 border-l border-border/60 bg-[color-mix(in_oklab,var(--color-surface)_82%,transparent)] px-3 text-xs text-muted-foreground opacity-0 shadow-[-12px_0_20px_-16px_color-mix(in_oklab,var(--background)_80%,transparent)] backdrop-blur-md transition-opacity group-hover:pointer-events-auto group-hover:opacity-100">
             {onOpenSftp && (
               <button
                 title="Open SFTP"
                 onClick={(e) => { e.stopPropagation(); onOpenSftp(h); }}
-                className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-[var(--color-brand-cyan)] group-hover:opacity-100"
+                className="flex h-7 w-7 cursor-pointer items-center justify-center rounded hover:bg-[var(--color-surface)] hover:text-[var(--color-brand-cyan)]"
               >
                 <Folder className="h-3.5 w-3.5" />
               </button>
@@ -617,18 +616,17 @@ function HostsList({
             <button
               title="Edit"
               onClick={(e) => { e.stopPropagation(); onEditHost(h); }}
-              className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-foreground group-hover:opacity-100"
+              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded hover:bg-[var(--color-surface)] hover:text-foreground"
             >
               <Settings className="h-3.5 w-3.5" />
             </button>
             <button
               title="Delete"
               onClick={(e) => { e.stopPropagation(); onDeleteHost(h.id); }}
-              className="flex h-7 w-7 items-center justify-center rounded opacity-0 transition-opacity hover:bg-[var(--color-surface)] hover:text-[oklch(0.72_0.18_25)] group-hover:opacity-100"
+              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded hover:bg-[var(--color-surface)] hover:text-[oklch(0.72_0.18_25)]"
             >
               <Trash2 className="h-3.5 w-3.5" />
             </button>
-            <PanelRightOpen className="h-4 w-4 opacity-0 transition-opacity group-hover:opacity-100" />
             <span className="rounded border border-border px-1.5 py-0.5">{h.os}</span>
           </div>
         </div>
