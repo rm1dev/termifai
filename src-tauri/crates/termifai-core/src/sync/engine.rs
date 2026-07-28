@@ -361,7 +361,13 @@ fn load_remote_payload(
                     pieces.insert(kind, piece);
                     downloaded.push(name.to_string());
                 }
-                Err(SyncError::NotFound) => {}
+                // مانیفست می‌گه این collection هست؛ NotFound یعنی partial upload /
+                // lag بک‌اند — خالی فرض کردنش tombstone/host رو غلط merge می‌کنه.
+                Err(SyncError::NotFound) => {
+                    return Err(SyncError::Backend(format!(
+                        "collection '{name}' listed in manifest but blob is missing"
+                    )));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -445,7 +451,11 @@ pub fn fetch_remote_payload(
                 Ok(bytes) => {
                     pieces.insert(kind, decrypt_collection(&key, kind, &bytes)?);
                 }
-                Err(SyncError::NotFound) => {}
+                Err(SyncError::NotFound) => {
+                    return Err(SyncError::Backend(format!(
+                        "collection '{name}' listed in manifest but blob is missing"
+                    )));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -680,6 +690,33 @@ mod tests {
         assert_eq!(manifest.blob_version, 1);
         assert_eq!(payload.hosts.len(), 1);
         assert_eq!(payload.hosts[0].password.as_deref(), Some("s3cret"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_collection_blob_listed_in_manifest_aborts_sync() {
+        let dir = tmp_dir("missing-col-blob");
+        let backend = LocalDirBackend::new(&dir);
+        let device_a = snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]);
+        run_sync(&backend, device_a, "hunter2", "default").unwrap();
+
+        // مانیفست هنوز hosts رو لیست می‌کنه ولی blob نیست — نباید empty merge بشه
+        let hosts_path = dir.join(CollectionKind::Hosts.file_name());
+        std::fs::remove_file(&hosts_path).unwrap();
+
+        let device_b = snapshot("dev-b", vec![host("h2", "other", "2026-01-02T00:00:00Z")]);
+        let result = run_sync(&backend, device_b, "hunter2", "default");
+        assert!(
+            matches!(&result, Err(SyncError::Backend(msg)) if msg.contains("listed in manifest")),
+            "expected Backend error for missing collection blob"
+        );
+
+        let restore = fetch_remote_payload(&backend, "hunter2");
+        assert!(
+            matches!(&restore, Err(SyncError::Backend(msg)) if msg.contains("listed in manifest")),
+            "restore path must also refuse a partial remote"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
