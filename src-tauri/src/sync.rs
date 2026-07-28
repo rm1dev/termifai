@@ -986,10 +986,18 @@ fn apply_outcome(
                     continue;
                 }
             }
+            // take() قبلاً پسورد رو برداشته؛ اگه اینجا encrypt نشه و None بنویسیم،
+            // پسورد هاست برای همیشه پاک می‌شه. قفل بودن vault یا خطای encrypt باید
+            // کل apply رو abort کنه، نه اینکه بی‌سر و صدا passwordless ذخیره بشه.
             let guard = crate::vault::current_key();
-            if let Some(key) = guard.as_ref() {
-                host.password = termifai_core::crypto::encrypt_field(key, &plaintext).ok();
-            }
+            let key = guard.as_ref().ok_or_else(|| {
+                "Vault is locked — cannot apply synced host passwords".to_string()
+            })?;
+            host.password = Some(
+                termifai_core::crypto::encrypt_field(key, &plaintext).map_err(|e| {
+                    format!("Failed to encrypt synced host password: {e:?}")
+                })?,
+            );
         }
     }
 
