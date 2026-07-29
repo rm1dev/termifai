@@ -1,6 +1,6 @@
 import { useEffect, useRef, useLayoutEffect, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
-import { ClipboardAddon } from "@xterm/addon-clipboard";
+import { Base64, ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
@@ -17,6 +17,7 @@ import {
 } from "@/lib/api/terminal";
 import { subscribe, type UnlistenFn } from "@/lib/api/transport";
 import { readClipboardText } from "@/lib/api/clipboard";
+import { writeOnlyOsc52ClipboardProvider } from "@/lib/osc52-clipboard";
 import { open as openExternalUrl } from "@tauri-apps/plugin-shell";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { quotePathForShell } from "@/lib/shell-quote";
@@ -795,9 +796,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         }
       )
     );
-    // OSC52 clipboard support: remote programs (tmux, nvim, …) can push
-    // copied text to the system clipboard through this escape sequence.
-    term.loadAddon(new ClipboardAddon());
+    // OSC52: ریموت می‌تونه به کلیپ‌بورد بنویسه (yank)، ولی کوئری خوندن
+    // (`\e]52;c;?\a`) عمداً رد می‌شه تا محتوای لوکال به PTY نره.
+    // سازنده Addon: (base64, provider) — provider تنها آرگومان اول نیست.
+    term.loadAddon(new ClipboardAddon(new Base64(), writeOnlyOsc52ClipboardProvider));
     // باگ شمارش overlapping regex در addon-search@0.16 رو قبل از ساخت پچ کن
     patchSearchAddonNonOverlappingHighlights();
     const searchAddon = new SearchAddon();

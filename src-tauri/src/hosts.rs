@@ -6,7 +6,10 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use termifai_core::model::hosts::migrate_hosts_vault;
-pub use termifai_core::model::hosts::{AuthMethod, Host, HostGroup, HostsVault, OsKind};
+pub use termifai_core::model::hosts::{
+    descendant_group_ids, group_deletion_includes_host, AuthMethod, Host, HostGroup, HostsVault,
+    OsKind,
+};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -337,17 +340,24 @@ pub fn save_host_group(
 }
 
 pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
+    // همون گارد remove_hosts: هاست sync server نباید با حذف گروه پاک بشه
+    let sync_state = crate::sync::load_state(app)?;
+    let sync_host_id = match &sync_state.backend {
+        Some(termifai_core::model::sync_state::SyncBackendConfig::Sftp { host_id, .. }) => {
+            Some(host_id.clone())
+        }
+        _ => None,
+    };
+
     let state = app.state::<AppState>();
     let mut removed_group_ids: Vec<String> = Vec::new();
     let mut removed_host_ids: Vec<String> = Vec::new();
+    let mut blocked_sync_host = false;
     state
         .hosts_store
         .update_with_migration(migrate_hosts_vault, |vault| {
             let descendants = descendant_group_ids(&vault.groups, &id);
-            removed_group_ids = std::iter::once(id.clone())
-                .chain(descendants.iter().cloned())
-                .collect();
-            removed_host_ids = vault
+            let candidate_host_ids: Vec<String> = vault
                 .hosts
                 .iter()
                 .filter(|host| {
@@ -358,6 +368,18 @@ pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
                 })
                 .map(|host| host.id.clone())
                 .collect();
+
+            if let Some(sync_id) = &sync_host_id {
+                if group_deletion_includes_host(vault, &id, sync_id) {
+                    blocked_sync_host = true;
+                    return;
+                }
+            }
+
+            removed_group_ids = std::iter::once(id.clone())
+                .chain(descendants.iter().cloned())
+                .collect();
+            removed_host_ids = candidate_host_ids;
 
             vault
                 .groups
@@ -370,6 +392,15 @@ pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
             });
         })
         .map_err(|e| e.to_string())?;
+
+    if blocked_sync_host {
+        return Err(
+            "Cannot delete this group — it contains the host configured as the sync server. \
+             Disconnect sync first."
+                .to_string(),
+        );
+    }
+
     crate::tombstones::record(
         app,
         crate::tombstones::EntityKind::Group,
@@ -602,26 +633,6 @@ where
     } else {
         items.insert(0, item);
     }
-}
-
-fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
-    let mut descendants = Vec::new();
-    let mut stack = vec![id.to_string()];
-
-    while let Some(parent_id) = stack.pop() {
-        for group in groups.iter().filter(|group| {
-            group
-                .parent_id
-                .as_ref()
-                .map(|current| current == &parent_id)
-                .unwrap_or(false)
-        }) {
-            descendants.push(group.id.clone());
-            stack.push(group.id.clone());
-        }
-    }
-
-    descendants
 }
 
 /// Encrypt a to-be-saved password with the unlocked vault key. If the value is

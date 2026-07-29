@@ -1107,28 +1107,30 @@ impl SftpEntry {
                             })
                             .unwrap_or(false);
 
-                if !has_our_tmp {
-                    let proceed = conflicts.resolve(&ConflictInfo {
+                // حتی با tmp قابل resume هم باید conflict بپرسیم؛ وگرنه rename
+                // نهایی فایل لوکال کاربر رو بی‌صدا overwrite می‌کنه.
+                let proceed = conflicts.resolve(&ConflictInfo {
+                    session_id: session_id.to_string(),
+                    file_name: pathbase(rp),
+                    dest_path: lp_str.clone(),
+                    kind: "file".to_string(),
+                    direction: "download".to_string(),
+                    existing_size: dest_size,
+                    existing_modified: dest_mtime.map(format_unix_timestamp),
+                    incoming_size: Some(*size),
+                    incoming_modified: remote_mtime.map(format_unix_timestamp),
+                })?;
+                if !proceed {
+                    offset += size;
+                    on_progress(TransferProgress {
                         session_id: session_id.to_string(),
                         file_name: pathbase(rp),
-                        dest_path: lp_str.clone(),
-                        kind: "file".to_string(),
-                        direction: "download".to_string(),
-                        existing_size: dest_size,
-                        existing_modified: dest_mtime.map(format_unix_timestamp),
-                        incoming_size: Some(*size),
-                        incoming_modified: remote_mtime.map(format_unix_timestamp),
-                    })?;
-                    if !proceed {
-                        offset += size;
-                        on_progress(TransferProgress {
-                            session_id: session_id.to_string(),
-                            file_name: pathbase(rp),
-                            bytes_transferred: offset,
-                            total_bytes: grand_total,
-                        });
-                        continue;
-                    }
+                        bytes_transferred: offset,
+                        total_bytes: grand_total,
+                    });
+                    continue;
+                }
+                if !has_our_tmp {
                     let _ = std::fs::remove_file(lp);
                     clear_download_resume_files(&lp_str);
                 }
