@@ -304,8 +304,8 @@ pub fn reorder_snippets(app: &AppHandle, ids: Vec<String>) -> Result<(), String>
     Ok(())
 }
 
-/// Replaces root-group slots with submitted root-group order, preserving every
-/// nested group and validating all input before mutating the vault.
+/// Replaces group slots with submitted group order, preserving hierarchy
+/// and validating all input before mutating the vault.
 pub fn reorder_snippet_groups(app: &AppHandle, ids: Vec<String>) -> Result<(), String> {
     let state = app.state::<AppState>();
     let mut validation_error = None;
@@ -326,19 +326,9 @@ pub fn reorder_snippet_groups(app: &AppHandle, ids: Vec<String>) -> Result<(), S
     Ok(())
 }
 
-fn reorder_group_vector(groups: &mut Vec<SnippetGroup>, ids: &[String]) -> Result<(), String> {
-    let root_ids: Vec<&str> = groups
-        .iter()
-        .filter(|group| group.parent_id.is_none())
-        .map(|group| group.id.as_str())
-        .collect();
-
-    if ids.len() != root_ids.len() {
-        return Err(format!(
-            "Invalid group order: expected {} root group IDs, received {}",
-            root_ids.len(),
-            ids.len()
-        ));
+fn reorder_group_vector(groups: &mut [SnippetGroup], ids: &[String]) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
     }
 
     let mut seen = std::collections::HashSet::with_capacity(ids.len());
@@ -346,34 +336,59 @@ fn reorder_group_vector(groups: &mut Vec<SnippetGroup>, ids: &[String]) -> Resul
         if !seen.insert(id.as_str()) {
             return Err(format!("Invalid group order: duplicate group ID '{id}'"));
         }
-        let Some(group) = groups.iter().find(|group| group.id == *id) else {
+        if !groups.iter().any(|group| group.id == *id) {
             return Err(format!("Snippet group '{id}' does not exist"));
-        };
-        if group.parent_id.is_some() {
+        }
+    }
+
+    let first_group = groups.iter().find(|group| group.id == ids[0]).unwrap();
+    let target_parent_id = first_group.parent_id.clone();
+
+    for id in ids {
+        let group = groups.iter().find(|group| group.id == *id).unwrap();
+        if group.parent_id != target_parent_id {
             return Err(format!(
-                "Invalid group order: group '{id}' is not a root group"
+                "Invalid group order: group '{id}' does not share the same parent as group '{}'",
+                ids[0]
             ));
         }
     }
 
-    if let Some(id) = root_ids.iter().find(|id| !seen.contains(**id)) {
-        return Err(format!("Invalid group order: missing root group ID '{id}'"));
+    let sibling_ids: Vec<&str> = groups
+        .iter()
+        .filter(|group| group.parent_id == target_parent_id)
+        .map(|group| group.id.as_str())
+        .collect();
+
+    if ids.len() != sibling_ids.len() {
+        return Err(format!(
+            "Invalid group order: expected {} group IDs for parent, received {}",
+            sibling_ids.len(),
+            ids.len()
+        ));
     }
 
-    let reordered_roots: Vec<SnippetGroup> = ids
+    if let Some(missing_id) = sibling_ids.iter().find(|id| !seen.contains(**id)) {
+        return Err(format!(
+            "Invalid group order: missing group ID '{missing_id}'"
+        ));
+    }
+
+    let reordered_siblings: Vec<SnippetGroup> = ids
         .iter()
         .map(|id| {
             groups
                 .iter()
                 .find(|group| group.id == *id)
-                .expect("validated root group ID")
+                .expect("validated group ID")
                 .clone()
         })
         .collect();
+
     for (slot, source) in groups
         .iter_mut()
-        .filter(|group| group.parent_id.is_none())
-        .zip(reordered_roots)
+        .filter(|group| group.parent_id == target_parent_id)
+        .zip(reordered_siblings)
     {
         *slot = source;
     }
@@ -631,5 +646,35 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reorder_group_vector_supports_subgroups() {
+        let mut groups = vec![
+            SnippetGroup {
+                id: "root1".to_string(),
+                name: "Root 1".to_string(),
+                parent_id: None,
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            SnippetGroup {
+                id: "sub1".to_string(),
+                name: "Sub 1".to_string(),
+                parent_id: Some("root1".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            SnippetGroup {
+                id: "sub2".to_string(),
+                name: "Sub 2".to_string(),
+                parent_id: Some("root1".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+        ];
+
+        // Reorder subgroups under root1
+        let res = reorder_group_vector(&mut groups, &["sub2".to_string(), "sub1".to_string()]);
+        assert!(res.is_ok());
+        assert_eq!(groups[1].id, "sub2");
+        assert_eq!(groups[2].id, "sub1");
     }
 }

@@ -164,15 +164,21 @@ export function SnippetsView() {
     }
   };
 
-  const reorderGroups = async (rootOrder: string[]) => {
+  const reorderGroups = async (siblingOrder: string[]) => {
+    if (siblingOrder.length === 0) return;
+    const firstId = siblingOrder[0];
+    const firstGroup = groups.find((group) => group.id === firstId);
+    if (!firstGroup) return;
+
+    const parentId = firstGroup.parentId;
     const groupsById = new Map(groups.map((group) => [group.id, group]));
-    let rootIndex = 0;
+    let siblingIdx = 0;
     const reorderedGroups = groups.map((group) => (
-      !group.parentId ? groupsById.get(rootOrder[rootIndex++])! : group
+      group.parentId === parentId ? groupsById.get(siblingOrder[siblingIdx++])! : group
     ));
     setGroups(reorderedGroups);
     try {
-      await reorderSnippetGroups(rootOrder);
+      await reorderSnippetGroups(siblingOrder);
       notifySnippetsChanged();
     } catch (err) {
       console.error("Failed to reorder snippet groups:", err);
@@ -299,10 +305,15 @@ export function SnippetsView() {
                 onDragEnd={(e: DragEndEvent) => {
                   const { active, over } = e;
                   if (!over || active.id === over.id) return;
-                  const ids = rootGroups.map((group) => group.id);
-                  const from = ids.indexOf(active.id as string);
-                  const to = ids.indexOf(over.id as string);
-                  if (from !== -1 && to !== -1) void reorderGroups(arrayMove(ids, from, to));
+                  const activeGroup = groups.find((g) => g.id === active.id);
+                  const overGroup = groups.find((g) => g.id === over.id);
+                  if (activeGroup && overGroup && activeGroup.parentId === overGroup.parentId) {
+                    const siblingGroups = groups.filter((g) => g.parentId === activeGroup.parentId);
+                    const ids = siblingGroups.map((g) => g.id);
+                    const from = ids.indexOf(active.id as string);
+                    const to = ids.indexOf(over.id as string);
+                    if (from !== -1 && to !== -1) void reorderGroups(arrayMove(ids, from, to));
+                  }
                 }}
               >
                 <SortableContext items={rootGroups.map((group) => group.id)} strategy={verticalListSortingStrategy}>
@@ -342,7 +353,7 @@ export function SnippetsView() {
         </div>
       )}
 
-      {(editor.open) && (
+      {editor.open && (
         <SnippetModal
           snippet={editor.snippet ?? null}
           groups={groups}
@@ -351,7 +362,6 @@ export function SnippetsView() {
           onSubmit={(s) => { void upsert(s); setEditor({ open: false }); }}
         />
       )}
-
       {groupModal.open && (
         <SnippetGroupModal
           groups={groups}
@@ -361,7 +371,6 @@ export function SnippetsView() {
           onSubmit={(name, parentId) => void upsertGroup(name, parentId, groupModal.group?.id)}
         />
       )}
-
       {removing && (
         <RemoveSnippetModal
           count={removing.length}
@@ -478,27 +487,31 @@ function SnippetGroupNode({
 
       {isOpen && (
         <div className="mt-1.5 pl-4">
-          {children.map((c) => (
-            <SnippetGroupNode
-              key={c.id}
-              group={c}
-              depth={depth + 1}
-              groups={groups}
-              snippets={snippets}
-              selected={selected}
-              collapsed={collapsed}
-              onToggle={onToggle}
-              toggleSelect={toggleSelect}
-              getSnippetContent={getSnippetContent}
-              onAddSubgroup={onAddSubgroup}
-              onAddSnippet={onAddSnippet}
-              onEditGroup={onEditGroup}
-              onDeleteGroup={onDeleteGroup}
-              onEdit={onEdit}
-              onRemove={onRemove}
-              onReorder={onReorder}
-            />
-          ))}
+          {children.length > 0 && (
+            <SortableContext items={children.map((c) => c.id)} strategy={verticalListSortingStrategy}>
+              {children.map((c) => (
+                <SortableSnippetGroupNode
+                  key={c.id}
+                  group={c}
+                  depth={depth + 1}
+                  groups={groups}
+                  snippets={snippets}
+                  selected={selected}
+                  collapsed={collapsed}
+                  onToggle={onToggle}
+                  toggleSelect={toggleSelect}
+                  getSnippetContent={getSnippetContent}
+                  onAddSubgroup={onAddSubgroup}
+                  onAddSnippet={onAddSnippet}
+                  onEditGroup={onEditGroup}
+                  onDeleteGroup={onDeleteGroup}
+                  onEdit={onEdit}
+                  onRemove={onRemove}
+                  onReorder={onReorder}
+                />
+              ))}
+            </SortableContext>
+          )}
           {groupSnippets.length > 0 && (
             <SnippetsList
               snippets={groupSnippets}
@@ -516,7 +529,7 @@ function SnippetGroupNode({
   );
 }
 
-function SortableSnippetGroupNode(props: Omit<SnippetGroupNodeProps, "depth" | "dragHandle">) {
+function SortableSnippetGroupNode(props: Omit<SnippetGroupNodeProps, "depth" | "dragHandle"> & { depth?: number }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: props.group.id });
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform ? { ...transform, x: 0, scaleX: 1, scaleY: 1 } : null),
@@ -531,7 +544,7 @@ function SortableSnippetGroupNode(props: Omit<SnippetGroupNodeProps, "depth" | "
     <div ref={setNodeRef} style={style}>
       <SnippetGroupNode
         {...props}
-        depth={0}
+        depth={props.depth ?? 0}
         dragHandle={
           <button
             type="button"
