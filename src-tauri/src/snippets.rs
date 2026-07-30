@@ -60,21 +60,40 @@ fn get_snippets_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(snippets_dir)
 }
 
-fn script_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
-    dir.join(format!("{}.sh", id))
+fn script_path(dir: &std::path::Path, id: &str) -> Result<std::path::PathBuf, String> {
+    validate_snippet_id(id)?;
+    Ok(dir.join(format!("{}.sh", id)))
+}
+
+/// Snippet ids become on-disk `.sh` filenames — allow only a safe charset so
+/// sync/apply cannot write outside the snippets directory via `../` ids.
+fn validate_snippet_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("Snippet id cannot be empty".to_string());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!("Invalid snippet id '{}'", id));
+    }
+    Ok(())
 }
 
 fn read_script_file(dir: &std::path::Path, id: &str) -> Option<String> {
-    std::fs::read_to_string(script_path(dir, id)).ok()
+    let path = script_path(dir, id).ok()?;
+    std::fs::read_to_string(path).ok()
 }
 
 fn write_script_file(dir: &std::path::Path, id: &str, content: &str) -> Result<(), String> {
-    std::fs::write(script_path(dir, id), content)
-        .map_err(|e| format!("Failed to write script file: {}", e))
+    let path = script_path(dir, id)?;
+    std::fs::write(path, content).map_err(|e| format!("Failed to write script file: {}", e))
 }
 
 fn delete_script_file(dir: &std::path::Path, id: &str) {
-    let _ = std::fs::remove_file(script_path(dir, id));
+    if let Ok(path) = script_path(dir, id) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Applies a merged snippet set from sync: writes/updates `.sh` files for
@@ -86,6 +105,11 @@ pub fn apply_synced_snippets(
     groups: Vec<SnippetGroup>,
 ) -> Result<(), String> {
     let dir = get_snippets_dir(app)?;
+    // Validate ids up front so a malicious/corrupt sync payload cannot escape
+    // the snippets dir — and so we never delete orphans before failing.
+    for snippet in &snippets {
+        validate_snippet_id(&snippet.id)?;
+    }
     let keep_ids: std::collections::HashSet<&str> =
         snippets.iter().map(|s| s.id.as_str()).collect();
 
@@ -200,6 +224,7 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
         .id
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
+    validate_snippet_id(&id)?;
 
     let dir = get_snippets_dir(app)?;
     if matches!(request.kind, SnippetKind::Script) {
@@ -617,7 +642,10 @@ mod tests {
     #[test]
     fn script_path_uses_id_and_sh_extension() {
         let dir = temp_dir();
-        assert_eq!(script_path(&dir, "s-1"), dir.join("s-1.sh"));
+        assert_eq!(script_path(&dir, "s-1").unwrap(), dir.join("s-1.sh"));
+        assert!(script_path(&dir, "../etc/passwd").is_err());
+        assert!(script_path(&dir, "s/evil").is_err());
+        assert!(validate_snippet_id("s-123_abc").is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 
