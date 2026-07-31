@@ -26,8 +26,8 @@ use pty_manager::{PtyManager, TabInfo};
 use serde::Serialize;
 use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
 use sftp_transfer::{
-    backoff_delay_secs, is_retryable_network_error, TransferStatusEvent, TransferStatusKind,
-    MAX_RECONNECT_ATTEMPTS,
+    backoff_delay_secs, claim_transfer_slot, is_retryable_network_error, TransferStatusEvent,
+    TransferStatusKind, MAX_RECONNECT_ATTEMPTS,
 };
 
 #[derive(Serialize, Clone)]
@@ -171,6 +171,19 @@ fn resize_session(
 
 #[tauri::command]
 fn close_session(state: State<AppState>, session_id: String) -> Result<(), String> {
+    // اگه snippet-run یه SFTP کمکی با همین session_id باز کرده، با بستن تب باید بره
+    if let Some(flag) = state
+        .transfer_cancel_flags
+        .lock()
+        .unwrap()
+        .get(&session_id)
+    {
+        flag.store(true, Ordering::Relaxed);
+    }
+    {
+        let mut sftp_mgr = state.sftp_manager.lock().unwrap();
+        let _ = sftp_mgr.disconnect(&session_id);
+    }
     let manager = state.pty_manager.lock().unwrap();
     manager.close_session(&session_id)
 }
@@ -1093,13 +1106,16 @@ fn wait_for_manual_resume(
     }
 }
 
-fn spawn_sftp_transfer(app: tauri::AppHandle, session_id: String, op: SftpTransferOp) {
+fn spawn_sftp_transfer(
+    app: tauri::AppHandle,
+    session_id: String,
+    op: SftpTransferOp,
+) -> Result<(), String> {
+    // یه سشن فقط یه transfer فعال می‌تونه داشته باشه — وگرنه cancel/done قاطی می‌شن
     let cancel_flag = {
         let state = app.state::<AppState>();
         let mut flags = state.transfer_cancel_flags.lock().unwrap();
-        let flag = Arc::new(AtomicBool::new(false));
-        flags.insert(session_id.clone(), Arc::clone(&flag));
-        flag
+        claim_transfer_slot(&mut flags, &session_id)?
     };
     tokio::spawn(async move {
         let app_bg = app.clone();
@@ -1193,6 +1209,7 @@ fn spawn_sftp_transfer(app: tauri::AppHandle, session_id: String, op: SftpTransf
         }
         let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
     });
+    Ok(())
 }
 
 #[tauri::command]
@@ -1209,8 +1226,7 @@ async fn sftp_download(
             remote_path,
             local_path,
         },
-    );
-    Ok(())
+    )
 }
 
 #[tauri::command]
@@ -1229,8 +1245,7 @@ async fn sftp_upload(
             remote_path,
             overwrite,
         },
-    );
-    Ok(())
+    )
 }
 
 #[tauri::command]

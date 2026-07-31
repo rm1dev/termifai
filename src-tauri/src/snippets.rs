@@ -77,47 +77,63 @@ fn delete_script_file(dir: &std::path::Path, id: &str) {
     let _ = std::fs::remove_file(script_path(dir, id));
 }
 
-/// Applies a merged snippet set from sync: writes/updates `.sh` files for
-/// Script snippets, drops orphaned script files, and stores metadata with
-/// `script: None` (body lives on disk, same as `save_snippet`).
-pub fn apply_synced_snippets(
-    app: &AppHandle,
+/// Writes/updates `.sh` bodies for Script snippets and clears inline script
+/// fields for vault storage. Returns the set of script ids that must stay on
+/// disk after the vault commit succeeds. Does **not** delete anything — orphans
+/// are purged only after metadata is durable (see [`apply_synced_snippets`]).
+fn write_synced_script_bodies(
+    dir: &std::path::Path,
     snippets: Vec<Snippet>,
-    groups: Vec<SnippetGroup>,
-) -> Result<(), String> {
-    let dir = get_snippets_dir(app)?;
-    let keep_ids: std::collections::HashSet<&str> =
-        snippets.iter().map(|s| s.id.as_str()).collect();
+) -> Result<(Vec<Snippet>, std::collections::HashSet<String>), String> {
+    let mut keep_script_ids = std::collections::HashSet::new();
+    let mut vault_snippets = Vec::with_capacity(snippets.len());
+    for mut snippet in snippets {
+        if matches!(snippet.kind, SnippetKind::Script) {
+            if let Some(content) = snippet.script.take() {
+                write_script_file(dir, &snippet.id, &content)?;
+            }
+            keep_script_ids.insert(snippet.id.clone());
+        } else {
+            snippet.script = None;
+        }
+        // مثل save_snippet — محتوای اسکریپت تو DB نمی‌مونه
+        snippet.script = None;
+        vault_snippets.push(snippet);
+    }
+    Ok((vault_snippets, keep_script_ids))
+}
 
-    // پاک کردن فایل اسکریپت‌هایی که دیگه تو لیست merged نیستن
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+/// Deletes `.sh` files that are no longer Script snippets in the committed vault.
+fn purge_orphan_script_files(
+    dir: &std::path::Path,
+    keep_script_ids: &std::collections::HashSet<String>,
+) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("sh") {
                 continue;
             }
             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if !keep_ids.contains(stem) {
+                if !keep_script_ids.contains(stem) {
                     let _ = std::fs::remove_file(&path);
                 }
             }
         }
     }
+}
 
-    let mut vault_snippets = Vec::with_capacity(snippets.len());
-    for mut snippet in snippets {
-        if matches!(snippet.kind, SnippetKind::Script) {
-            if let Some(content) = snippet.script.take() {
-                write_script_file(&dir, &snippet.id, &content)?;
-            }
-        } else {
-            snippet.script = None;
-            delete_script_file(&dir, &snippet.id);
-        }
-        // مثل save_snippet — محتوای اسکریپت تو DB نمی‌مونه
-        snippet.script = None;
-        vault_snippets.push(snippet);
-    }
+/// Applies a merged snippet set from sync: writes/updates `.sh` files for
+/// Script snippets, commits vault metadata, then drops orphaned script files.
+/// Orphan deletes happen **after** a successful vault write so a failed sync
+/// apply cannot wipe script bodies while the local vault still references them.
+pub fn apply_synced_snippets(
+    app: &AppHandle,
+    snippets: Vec<Snippet>,
+    groups: Vec<SnippetGroup>,
+) -> Result<(), String> {
+    let dir = get_snippets_dir(app)?;
+    let (vault_snippets, keep_script_ids) = write_synced_script_bodies(&dir, snippets)?;
 
     let state = app.state::<AppState>();
     state
@@ -127,6 +143,9 @@ pub fn apply_synced_snippets(
             vault.groups = groups.clone();
         })
         .map_err(|e| e.to_string())?;
+
+    // فقط بعد از commit موفق پاک می‌کنیم — وگرنه با failure، دیتای لوکال می‌پره
+    purge_orphan_script_files(&dir, &keep_script_ids);
     Ok(())
 }
 
@@ -676,5 +695,57 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(groups[1].id, "sub2");
         assert_eq!(groups[2].id, "sub1");
+    }
+
+    #[test]
+    fn write_synced_script_bodies_keeps_disk_until_purge() {
+        // اگه vault commit بترکه، نباید از قبل orphan پاک شده باشه
+        let dir = temp_dir();
+        write_script_file(&dir, "keep-me", "echo keep").unwrap();
+        write_script_file(&dir, "orphan", "echo orphan").unwrap();
+
+        let snippets = vec![Snippet {
+            id: "keep-me".to_string(),
+            kind: SnippetKind::Script,
+            name: "Keep".to_string(),
+            body: None,
+            command: None,
+            script: Some("echo keep-v2".to_string()),
+            variables: vec![],
+            group_id: None,
+            keyword: None,
+            os_targets: vec![],
+            created_at: None,
+            updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+        }];
+
+        let (vault_snippets, keep_ids) = write_synced_script_bodies(&dir, snippets).unwrap();
+        assert_eq!(vault_snippets.len(), 1);
+        assert!(vault_snippets[0].script.is_none());
+        assert!(keep_ids.contains("keep-me"));
+        assert_eq!(
+            read_script_file(&dir, "keep-me").as_deref(),
+            Some("echo keep-v2")
+        );
+        // orphan هنوز روی دیسک هست تا بعد از commit موفق purge بشه
+        assert_eq!(
+            read_script_file(&dir, "orphan").as_deref(),
+            Some("echo orphan")
+        );
+
+        purge_orphan_script_files(&dir, &keep_ids);
+        assert!(read_script_file(&dir, "keep-me").is_some());
+        assert!(read_script_file(&dir, "orphan").is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn purge_orphan_script_files_removes_former_scripts() {
+        let dir = temp_dir();
+        write_script_file(&dir, "was-script", "echo hi").unwrap();
+        let keep = std::collections::HashSet::new();
+        purge_orphan_script_files(&dir, &keep);
+        assert!(read_script_file(&dir, "was-script").is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
