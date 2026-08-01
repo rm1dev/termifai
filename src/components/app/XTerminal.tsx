@@ -1149,6 +1149,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       // back asynchronously) exactly equals a known keyword, expand it right
       // away without waiting for a boundary character. Only eligible on
       // kind === "text" snippets with no variables.
+      // تو صفحهٔ جایگزین (vim/nano/…) اصلاً دست نزن — DEL+body فایل رو خراب می‌کنه.
+      if (term.buffer.active.type === "alternate") {
+        return;
+      }
       const lineText = lineTrackerRef.current.text;
       const match = /(\S+)$/.exec(lineText);
       const word = match?.[1];

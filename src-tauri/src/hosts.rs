@@ -324,6 +324,10 @@ pub fn save_host_group(
                 error = Some(e);
                 return;
             }
+            if would_create_group_cycle(&vault.groups, &id, parent_id.as_deref()) {
+                error = Some("Group cannot be nested under its own descendant".to_string());
+                return;
+            }
             upsert_by_id(&mut vault.groups, group.clone(), |item| &item.id);
         })
         .map_err(|e| e.to_string())?;
@@ -604,11 +608,33 @@ where
     }
 }
 
+fn would_create_group_cycle(groups: &[HostGroup], id: &str, parent_id: Option<&str>) -> bool {
+    let mut current = parent_id;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = current {
+        if pid == id {
+            return true;
+        }
+        if !seen.insert(pid) {
+            return true;
+        }
+        current = groups
+            .iter()
+            .find(|g| g.id == pid)
+            .and_then(|g| g.parent_id.as_deref());
+    }
+    false
+}
+
 fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
     let mut descendants = Vec::new();
     let mut stack = vec![id.to_string()];
+    let mut visited = std::collections::HashSet::new();
 
     while let Some(parent_id) = stack.pop() {
+        if !visited.insert(parent_id.clone()) {
+            continue;
+        }
         for group in groups.iter().filter(|group| {
             group
                 .parent_id
