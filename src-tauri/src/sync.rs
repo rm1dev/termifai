@@ -1269,18 +1269,32 @@ impl SyncBackend for SftpSyncBackend {
         Ok(contents)
     }
 
-    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+    fn fetch_collection(
+        &self,
+        name: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>, SyncError> {
         let session = self.connect().map_err(SyncError::Backend)?;
         let sftp = session
             .sftp()
             .map_err(|e| SyncError::Backend(e.to_string()))?;
         let remote_dir = self.resolve_remote_dir(&sftp)?;
+        use std::io::Read;
+        if let Some(sha) = expected_sha256.filter(|s| !s.is_empty()) {
+            let addressed = sync::collections::collection_file_name(name, Some(sha));
+            let path = remote_dir.join(addressed);
+            if let Ok(mut file) = sftp.open(&path) {
+                let mut contents = Vec::new();
+                file.read_to_end(&mut contents)
+                    .map_err(|e| SyncError::Io(e.to_string()))?;
+                return Ok(contents);
+            }
+        }
         let file_name = CollectionKind::from_str(name)
             .map(|k| k.file_name())
             .unwrap_or_else(|| format!("col-{name}.blob"));
         let path = remote_dir.join(file_name);
         let mut file = sftp.open(&path).map_err(|_| SyncError::NotFound)?;
-        use std::io::Read;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
             .map_err(|e| SyncError::Io(e.to_string()))?;
@@ -1409,6 +1423,22 @@ impl SyncBackend for SftpSyncBackend {
 
         use std::io::Write;
         for (name, bytes) in changed {
+            let sha = sync::sha256_hex(bytes);
+            let addressed_name = sync::collections::collection_file_name(name, Some(&sha));
+            let addressed_path = remote_dir.join(&addressed_name);
+            let addressed_tmp = remote_dir.join(format!("{addressed_name}.tmp"));
+            {
+                let mut f = sftp
+                    .create(&addressed_tmp)
+                    .map_err(|e| SyncError::Backend(e.to_string()))?;
+                f.write_all(bytes)
+                    .map_err(|e| SyncError::Io(e.to_string()))?;
+            }
+            let _ = sftp.unlink(&addressed_path);
+            sftp.rename(&addressed_tmp, &addressed_path, None)
+                .map_err(|e| SyncError::Backend(e.to_string()))?;
+
+            // alias پایدار برای کلاینت قدیمی
             let file_name = CollectionKind::from_str(name)
                 .map(|k| k.file_name())
                 .unwrap_or_else(|| format!("col-{name}.blob"));

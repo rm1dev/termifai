@@ -2,7 +2,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use crate::sync::backend::{SyncBackend, SyncError, TokenStore};
 use crate::sync::collections::CollectionKind;
-use crate::sync::payload::Manifest;
+use crate::sync::payload::{sha256_hex, Manifest};
 
 pub struct DropboxBackend {
     token_store: Arc<dyn TokenStore>,
@@ -20,6 +20,46 @@ impl DropboxBackend {
 
     fn get_token(&self) -> Result<String, SyncError> {
         crate::sync::oauth::get_valid_access_token(self.token_store.as_ref(), "dropbox")
+    }
+
+    fn download_path(&self, token: &str, path: &str) -> Result<Vec<u8>, SyncError> {
+        let url = "https://content.dropboxapi.com/2/files/download";
+
+        #[derive(Serialize)]
+        struct DownloadArg {
+            path: String,
+        }
+        let arg = DownloadArg {
+            path: path.to_string(),
+        };
+        let arg_str = serde_json::to_string(&arg)?;
+
+        let res = self
+            .client
+            .post(url)
+            .bearer_auth(token)
+            .header("Dropbox-API-Arg", arg_str)
+            .send()
+            .map_err(|e| SyncError::Backend(format!("Dropbox download failed: {e}")))?;
+
+        let status = res.status();
+        if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::NOT_FOUND {
+            return Err(SyncError::NotFound);
+        }
+        if !status.is_success() {
+            let err_text = res.text().unwrap_or_default();
+            if err_text.contains("path/not_found") {
+                return Err(SyncError::NotFound);
+            }
+            return Err(SyncError::Backend(format!(
+                "Dropbox download failed: {} - {}",
+                status, err_text
+            )));
+        }
+        Ok(res
+            .bytes()
+            .map_err(|e| SyncError::Backend(e.to_string()))?
+            .to_vec())
     }
 
     fn fetch_manifest_with_rev(&self) -> Result<Option<(Manifest, String)>, SyncError> {
@@ -253,10 +293,13 @@ impl SyncBackend for DropboxBackend {
             (Some(_), None) => return Err(SyncError::Conflict),
         };
 
+        // اول استیج؛ فقط بعد از CAS موفق منیفست فایل پایدار رو عوض می‌کنیم
+        // تا بازندهٔ race دادهٔ برنده رو خراب نکنه
+        let staging_path = format!("/vault.blob.staging-{}", sha256_hex(blob));
         upload_file(
             &self.client,
             &token,
-            "/vault.blob",
+            &staging_path,
             blob,
             WriteMode::Overwrite,
         )?;
@@ -267,55 +310,66 @@ impl SyncBackend for DropboxBackend {
             None => WriteMode::Add,
         };
 
-        upload_file(
+        if let Err(e) = upload_file(
             &self.client,
             &token,
             "/manifest.json",
             &manifest_bytes,
             mode,
-        )?;
+        ) {
+            let _ = delete_file(&self.client, &token, &staging_path);
+            return Err(e);
+        }
+
+        if let Err(e) = upload_file(
+            &self.client,
+            &token,
+            "/vault.blob",
+            blob,
+            WriteMode::Overwrite,
+        ) {
+            let _ = delete_file(&self.client, &token, &staging_path);
+            return Err(e);
+        }
+        let _ = delete_file(&self.client, &token, &staging_path);
 
         Ok(())
     }
 
-    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+    fn fetch_collection(
+        &self,
+        name: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>, SyncError> {
         let token = self.get_token()?;
-        let file_name = CollectionKind::from_str(name)
+        // اول immutable address؛ اگه نبود برگرد رو alias پایدار قدیمی
+        let mut candidates = Vec::new();
+        if expected_sha256.is_some() {
+            candidates.push(format!(
+                "/{}",
+                crate::sync::collections::collection_file_name(name, expected_sha256)
+            ));
+        }
+        let stable = CollectionKind::from_str(name)
             .map(|k| k.file_name())
             .unwrap_or_else(|| format!("col-{name}.blob"));
-        let path = format!("/{file_name}");
-        let url = "https://content.dropboxapi.com/2/files/download";
-
-        #[derive(Serialize)]
-        struct DownloadArg {
-            path: String,
+        let stable_path = format!("/{stable}");
+        if candidates.last().map(String::as_str) != Some(stable_path.as_str()) {
+            candidates.push(stable_path);
         }
-        let arg = DownloadArg { path };
-        let arg_str = serde_json::to_string(&arg)?;
 
-        let res = self
-            .client
-            .post(url)
-            .bearer_auth(&token)
-            .header("Dropbox-API-Arg", arg_str)
-            .send()
-            .map_err(|e| SyncError::Backend(format!("Dropbox collection download failed: {e}")))?;
-
-        let status = res.status();
-        if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::NOT_FOUND {
-            return Err(SyncError::NotFound);
-        }
-        if !status.is_success() {
-            let err_text = res.text().unwrap_or_default();
-            if err_text.contains("path/not_found") {
-                return Err(SyncError::NotFound);
+        let mut last_err = SyncError::NotFound;
+        for path in candidates {
+            match self.download_path(&token, &path) {
+                Ok(bytes) => return Ok(bytes),
+                Err(SyncError::NotFound) => {
+                    last_err = SyncError::NotFound;
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-            return Err(SyncError::Backend(format!(
-                "Dropbox collection download failed: {} - {}",
-                status, err_text
-            )));
         }
-        Ok(res.bytes().map_err(|e| SyncError::Backend(e.to_string()))?.to_vec())
+        Err(last_err)
     }
 
     fn store_delta(
@@ -338,14 +392,19 @@ impl SyncBackend for DropboxBackend {
             (Some(_), None) => return Err(SyncError::Conflict),
         };
 
+        // باگ قبلی: Overwrite روی col-*.blob مشترک قبل از CAS منیفست
+        // → بازنده blob برنده رو پاک می‌کرد و silent data loss می‌داد.
+        // حالا هر نسخه اسم hash داره؛ CAS فقط منیفست رو atomic عوض می‌کنه.
         for (name, bytes) in changed {
-            let file_name = CollectionKind::from_str(name)
-                .map(|k| k.file_name())
-                .unwrap_or_else(|| format!("col-{name}.blob"));
+            let sha = sha256_hex(bytes);
+            let addressed = format!(
+                "/{}",
+                crate::sync::collections::collection_file_name(name, Some(&sha))
+            );
             upload_file(
                 &self.client,
                 &token,
-                &format!("/{file_name}"),
+                &addressed,
                 bytes,
                 WriteMode::Overwrite,
             )?;
@@ -363,6 +422,21 @@ impl SyncBackend for DropboxBackend {
             &manifest_bytes,
             mode,
         )?;
+
+        // alias پایدار best-effort برای کلاینت قدیمی؛ source of truth همون addressed + manifestه
+        for (name, bytes) in changed {
+            let stable = CollectionKind::from_str(name)
+                .map(|k| k.file_name())
+                .unwrap_or_else(|| format!("col-{name}.blob"));
+            let _ = upload_file(
+                &self.client,
+                &token,
+                &format!("/{stable}"),
+                bytes,
+                WriteMode::Overwrite,
+            );
+        }
+
         let _ = delete_file(&self.client, &token, "/vault.blob");
         Ok(())
     }
