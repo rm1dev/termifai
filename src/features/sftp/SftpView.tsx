@@ -312,7 +312,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
   const [remoteFiles, setRemoteFiles] = useState<RemoteFileEntry[]>([]);
   const [remoteLoading, setRemoteLoading] = useState(false);
   const [remoteError, setRemoteError] = useState<string | null>(null);
-  const [watchedFile, setWatchedFile] = useState<{ tmpPath: string; remotePath: string; changed: boolean } | null>(null);
+  const [watchedFiles, setWatchedFiles] = useState<
+    { tmpPath: string; remotePath: string; changed: boolean }[]
+  >([]);
+  // مسیرهای tmp باز برای cleanup وقتی تب بسته می‌شه
+  const watchedTmpPathsRef = useRef<Set<string>>(new Set());
   const [showDisconnectConfirm, setShowDisconnectConfirm] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<{ targets: string[]; isLocal: boolean; label: string } | null>(null);
   const [newFolderTarget, setNewFolderTarget] = useState<"local" | "remote" | null>(null);
@@ -722,16 +726,20 @@ export function SftpView({ tab }: { tab: AppTab }) {
     };
   }, []);
 
-  // Listen for file-changed events (remote watch)
+  // Listen for file-changed events (remote watch) — چند فایل همزمان، نه یکی
   useEffect(() => {
     if (!sftpSessionId) return;
     const unlisten = subscribe<{ tmp_path: string; remote_path: string }>(
       `sftp:${sftpSessionId}:file-changed`,
       (ev) => {
-        setWatchedFile({
-          tmpPath: ev.payload.tmp_path,
-          remotePath: ev.payload.remote_path,
-          changed: true,
+        setWatchedFiles((prev) => {
+          const next = prev.filter((w) => w.tmpPath !== ev.payload.tmp_path);
+          next.push({
+            tmpPath: ev.payload.tmp_path,
+            remotePath: ev.payload.remote_path,
+            changed: true,
+          });
+          return next;
         });
       }
     );
@@ -871,9 +879,18 @@ export function SftpView({ tab }: { tab: AppTab }) {
     void sftpCall("sftp_open_with_local", { path, app });
   };
 
+  const trackRemoteWatch = (tmpPath: string, remotePath: string) => {
+    watchedTmpPathsRef.current.add(tmpPath);
+    setWatchedFiles((prev) => {
+      if (prev.some((w) => w.tmpPath === tmpPath)) return prev;
+      return [...prev, { tmpPath, remotePath, changed: false }];
+    });
+  };
+
   const handleOpenRemote = async (path: string) => {
     const tmpPath = await sftpCall<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: path });
     await sftpCall("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath, remotePath: path });
+    trackRemoteWatch(tmpPath, path);
   };
 
   const handleCopyLocal = (paths: string[]) => setLocalClipboard(paths);
@@ -920,6 +937,12 @@ export function SftpView({ tab }: { tab: AppTab }) {
   const connectCleanupRef = useRef<(() => void) | null>(null);
 
   const performDisconnect = () => {
+    void sftpCall("sftp_cancel_transfer", { sessionId: sftpSessionId }).catch(() => {});
+    for (const tmpPath of watchedTmpPathsRef.current) {
+      void sftpCall("sftp_stop_watch", { tmpPath }).catch(() => {});
+    }
+    watchedTmpPathsRef.current.clear();
+    setWatchedFiles([]);
     void sftpCall("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
     setIsConnected(false);
     setPickedHostId(undefined);
@@ -1005,6 +1028,12 @@ export function SftpView({ tab }: { tab: AppTab }) {
     return () => {
       connectCleanupRef.current?.();
       connectCleanupRef.current = null;
+      // اول کنسل کن، بعد قطع — وگرنه آپلود مخفی تا ته می‌ره و مقصد رو عوض می‌کنه
+      void sftpCall("sftp_cancel_transfer", { sessionId: sftpSessionId }).catch(() => {});
+      for (const tmpPath of watchedTmpPathsRef.current) {
+        void sftpCall("sftp_stop_watch", { tmpPath }).catch(() => {});
+      }
+      watchedTmpPathsRef.current.clear();
       void sftpCall("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1642,9 +1671,12 @@ export function SftpView({ tab }: { tab: AppTab }) {
           </>
         )}
 
-        {/* Remote file watch bar */}
-        {watchedFile?.changed && (
-          <div className="flex h-10 flex-shrink-0 items-center justify-between border-t border-border bg-[var(--color-surface)] px-4">
+        {/* Remote file watch bar — هر فایل تغییرکرده جدا می‌مونه */}
+        {watchedFiles.filter((w) => w.changed).map((watchedFile) => (
+          <div
+            key={watchedFile.tmpPath}
+            className="flex h-10 flex-shrink-0 items-center justify-between border-t border-border bg-[var(--color-surface)] px-4"
+          >
             <span className="text-xs text-muted-foreground">
               <span className="mr-1 text-foreground">{watchedFile.remotePath.split("/").pop()}</span>
               was modified locally
@@ -1654,7 +1686,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
                 className="rounded px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground"
                 onClick={() => {
                   void sftpCall("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
-                  setWatchedFile(null);
+                  watchedTmpPathsRef.current.delete(watchedFile.tmpPath);
+                  setWatchedFiles((prev) => prev.filter((w) => w.tmpPath !== watchedFile.tmpPath));
                 }}
               >
                 Reject
@@ -1670,7 +1703,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
                       overwrite: true,
                     });
                     await sftpCall("sftp_stop_watch", { tmpPath: watchedFile.tmpPath });
-                    setWatchedFile(null);
+                    watchedTmpPathsRef.current.delete(watchedFile.tmpPath);
+                    setWatchedFiles((prev) => prev.filter((w) => w.tmpPath !== watchedFile.tmpPath));
                     if (remotePath) await loadRemoteDir(remotePath);
                   } catch (e) { toast.error(String(e)); }
                 }}
@@ -1679,7 +1713,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
               </button>
             </div>
           </div>
-        )}
+        ))}
       </div>
       </div>
 
@@ -1715,7 +1749,14 @@ export function SftpView({ tab }: { tab: AppTab }) {
                   if (openWithTarget.isLocal) handleOpenWithLocal(openWithTarget.path, openWithApp.trim());
                   else void sftpCall("sftp_open_remote", { sessionId: sftpSessionId, remotePath: openWithTarget.path })
                     .then((tmp) => sftpCall("sftp_open_with_local", { path: tmp as string, app: openWithApp.trim() }).then(() => tmp))
-                    .then((tmp) => sftpCall("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: openWithTarget.path }))
+                    .then((tmp) => {
+                      const tmpPath = tmp as string;
+                      return sftpCall("sftp_watch_remote", {
+                        sessionId: sftpSessionId,
+                        tmpPath,
+                        remotePath: openWithTarget.path,
+                      }).then(() => trackRemoteWatch(tmpPath, openWithTarget.path));
+                    })
                     .catch((e: unknown) => toast.error(String(e)));
                   setOpenWithTarget(null);
                   setOpenWithApp("");
@@ -1736,7 +1777,14 @@ export function SftpView({ tab }: { tab: AppTab }) {
                       const target = openWithTarget;
                       sftpCall<string>("sftp_open_remote", { sessionId: sftpSessionId, remotePath: target.path })
                         .then((tmp) => sftpCall("sftp_open_with_local", { path: tmp, app }).then(() => tmp))
-                        .then((tmp) => sftpCall("sftp_watch_remote", { sessionId: sftpSessionId, tmpPath: tmp as string, remotePath: target.path }))
+                        .then((tmp) => {
+                          const tmpPath = tmp as string;
+                          return sftpCall("sftp_watch_remote", {
+                            sessionId: sftpSessionId,
+                            tmpPath,
+                            remotePath: target.path,
+                          }).then(() => trackRemoteWatch(tmpPath, target.path));
+                        })
                         .catch((e: unknown) => toast.error(String(e)));
                     }
                   }
