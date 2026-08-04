@@ -349,6 +349,11 @@ fn remove_ssh_keys(app: tauri::AppHandle, ids: Vec<String>) -> Result<(), String
 }
 
 #[tauri::command]
+fn remove_known_host(host_or_ip: String) -> Result<(), String> {
+    ssh_keys::remove_known_host(&host_or_ip)
+}
+
+#[tauri::command]
 fn list_hosts(app: tauri::AppHandle) -> Result<HostsVault, String> {
     hosts::list_hosts(&app)
 }
@@ -2560,6 +2565,7 @@ pub fn run() {
             generate_ssh_key,
             import_ssh_key,
             remove_ssh_keys,
+            remove_known_host,
             list_hosts,
             save_host,
             remove_hosts,
