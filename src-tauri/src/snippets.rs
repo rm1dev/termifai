@@ -119,6 +119,9 @@ pub fn apply_synced_snippets(
         vault_snippets.push(snippet);
     }
 
+    // اگه گروهی tombstone شده ولی snippet هنوز group_id داره، بیارش به root
+    clear_orphan_group_ids(&mut vault_snippets, &groups);
+
     let state = app.state::<AppState>();
     state
         .snippets_store
@@ -473,6 +476,8 @@ pub fn remove_snippet_group(app: &AppHandle, id: String) -> Result<(), String> {
                     .unwrap_or(false)
                 {
                     snippet.group_id = None;
+                    // بدون bump، LWW موقع sync ممکنه نسخهٔ قدیمی با group_id حذف‌شده برنده بشه
+                    snippet.updated_at = Some(now_iso());
                 }
             }
         })
@@ -504,6 +509,20 @@ fn descendant_group_ids(groups: &[SnippetGroup], id: &str) -> Vec<String> {
     }
 
     descendants
+}
+
+/// Snippets whose `group_id` points at a deleted/missing group vanish from the
+/// normal tree (neither root nor under any folder). Clear those pointers so
+/// they surface at root after sync races.
+fn clear_orphan_group_ids(snippets: &mut [Snippet], groups: &[SnippetGroup]) {
+    let known: std::collections::HashSet<&str> = groups.iter().map(|g| g.id.as_str()).collect();
+    for snippet in snippets.iter_mut() {
+        if let Some(group_id) = snippet.group_id.as_deref() {
+            if !known.contains(group_id) {
+                snippet.group_id = None;
+            }
+        }
+    }
 }
 
 fn upsert_group_by_id(items: &mut Vec<SnippetGroup>, item: SnippetGroup) {
@@ -676,5 +695,49 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(groups[1].id, "sub2");
         assert_eq!(groups[2].id, "sub1");
+    }
+
+    #[test]
+    fn clear_orphan_group_ids_moves_snippets_to_root() {
+        let groups = vec![SnippetGroup {
+            id: "alive".to_string(),
+            name: "Alive".to_string(),
+            parent_id: None,
+            updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+        }];
+        let mut snippets = vec![
+            Snippet {
+                id: "s1".to_string(),
+                kind: SnippetKind::Text,
+                name: "orphan".to_string(),
+                body: Some("x".to_string()),
+                command: None,
+                script: None,
+                variables: vec![],
+                group_id: Some("deleted".to_string()),
+                keyword: None,
+                os_targets: vec![],
+                created_at: Some("2026-01-01T00:00:00Z".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            Snippet {
+                id: "s2".to_string(),
+                kind: SnippetKind::Text,
+                name: "ok".to_string(),
+                body: Some("y".to_string()),
+                command: None,
+                script: None,
+                variables: vec![],
+                group_id: Some("alive".to_string()),
+                keyword: None,
+                os_targets: vec![],
+                created_at: Some("2026-01-01T00:00:00Z".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+        ];
+
+        clear_orphan_group_ids(&mut snippets, &groups);
+        assert!(snippets[0].group_id.is_none());
+        assert_eq!(snippets[1].group_id.as_deref(), Some("alive"));
     }
 }

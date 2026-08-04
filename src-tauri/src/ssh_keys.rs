@@ -121,8 +121,8 @@ pub fn import_ssh_key(app: &AppHandle, request: ImportSshKeyRequest) -> Result<S
     ensure_dir(&keys_dir(app)?)?;
     ensure_available_filename(&key_path)?;
     ensure_available_filename(&public_key_path)?;
-    fs::write(&key_path, private_key).map_err(|e| format!("Failed to write private key: {}", e))?;
-    set_private_key_permissions(&key_path)?;
+    // از همون اول با 0600 بنویس تا کلید خصوصی لحظه‌ای world-readable نشه
+    write_private_key_file(&key_path, &private_key)?;
 
     if let Some(public_key) = request.public_key {
         fs::write(
@@ -272,14 +272,17 @@ pub fn import_synced_key(app: &AppHandle, key: &SshKey) -> Result<(), String> {
         return Ok(()); // already imported on a previous sync cycle
     }
 
-    fs::write(&key_path, ensure_trailing_newline(pem.trim())?)
-        .map_err(|e| format!("Failed to write synced private key: {}", e))?;
-    set_private_key_permissions(&key_path)?;
-    fs::write(
+    if let Err(err) = write_private_key_file(&key_path, &ensure_trailing_newline(pem.trim())?) {
+        cleanup_key_files(&key_path, &public_key_path);
+        return Err(err);
+    }
+    if let Err(err) = fs::write(
         &public_key_path,
         ensure_trailing_newline(key.public_key.trim())?,
-    )
-    .map_err(|e| format!("Failed to write synced public key: {}", e))?;
+    ) {
+        cleanup_key_files(&key_path, &public_key_path);
+        return Err(format!("Failed to write synced public key: {}", err));
+    }
 
     let mut local_key = key.clone();
     local_key.private_key_pem = None;
@@ -434,6 +437,36 @@ fn now_iso() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
+/// Create/truncate a private key file with mode 0600 from the first byte written.
+/// `fs::write` + later chmod leaves a world-readable window (and a permanent
+/// leak if chmod fails after the write succeeded).
+fn write_private_key_file(path: &Path, contents: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("Failed to write private key: {}", e))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| format!("Failed to write private key: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("Failed to write private key: {}", e))?;
+        // اگر فایل از قبل با پرمیشن شل‌تر وجود داشت، mode موقع create اعمال نمی‌شه
+        set_private_key_permissions(path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents).map_err(|e| format!("Failed to write private key: {}", e))?;
+        Ok(())
+    }
+}
+
 #[cfg(unix)]
 fn set_private_key_permissions(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
@@ -445,4 +478,21 @@ fn set_private_key_permissions(path: &Path) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_private_key_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn write_private_key_file_creates_owner_only_mode() {
+        let dir = std::env::temp_dir().join(format!("termifai_key_perm_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("id_test");
+        write_private_key_file(&path, "-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "private key must be 0600, got {mode:#o}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

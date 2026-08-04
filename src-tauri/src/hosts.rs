@@ -401,7 +401,8 @@ pub fn test_host_connection(
         .map_err(|e| format!("Failed to resolve host: {}", e))?;
 
     let timeout_secs = request.timeout_secs.unwrap_or(8).clamp(2, 30);
-    let target = format!("{}@{}", user, hostname);
+    // جلوگیری از تزریق آپشن OpenSSH از طریق user/hostname (مثل -oProxyCommand=…)
+    validate_ssh_cli_identity(user, hostname)?;
     let mut command = portable_pty::CommandBuilder::new("ssh");
     command.arg("-o");
     command.arg("BatchMode=no");
@@ -426,7 +427,7 @@ pub fn test_host_connection(
         command.arg(key_path);
     }
 
-    command.arg(target);
+    push_ssh_cli_destination(&mut command, user, hostname);
     command.arg("echo");
     command.arg("termifai-ssh-ok");
 
@@ -572,16 +573,65 @@ fn validate_host(request: &SaveHostRequest) -> Result<(), String> {
     if request.name.trim().is_empty() {
         return Err("Host name is required".to_string());
     }
-    if request.hostname.trim().is_empty() {
-        return Err("Hostname is required".to_string());
-    }
-    if request.user.trim().is_empty() {
-        return Err("Username is required".to_string());
-    }
+    validate_ssh_cli_identity(request.user.trim(), request.hostname.trim())?;
     if request.port == 0 {
         return Err("Port must be between 1 and 65535".to_string());
     }
     Ok(())
+}
+
+/// OpenSSH treats a destination that begins with `-` as another option. A crafted
+/// username like `-oProxyCommand=…` therefore becomes local command execution when
+/// we spawn `ssh user@host`. Same for a leading-dash hostname if ever passed alone.
+/// Reject those shapes at save/test time and always pass `--` before the destination.
+pub(crate) fn validate_ssh_cli_identity(user: &str, hostname: &str) -> Result<(), String> {
+    validate_ssh_cli_user(user)?;
+    validate_ssh_cli_hostname(hostname)?;
+    Ok(())
+}
+
+fn validate_ssh_cli_user(user: &str) -> Result<(), String> {
+    if user.is_empty() {
+        return Err("Username is required".to_string());
+    }
+    if user.starts_with('-') {
+        return Err("Username must not start with '-'".to_string());
+    }
+    if user.contains('@') {
+        return Err("Username must not contain '@'".to_string());
+    }
+    if user
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\0')
+    {
+        return Err("Username contains invalid characters".to_string());
+    }
+    Ok(())
+}
+
+fn validate_ssh_cli_hostname(hostname: &str) -> Result<(), String> {
+    if hostname.is_empty() {
+        return Err("Hostname is required".to_string());
+    }
+    if hostname.starts_with('-') {
+        return Err("Hostname must not start with '-'".to_string());
+    }
+    if hostname
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\0')
+    {
+        return Err("Hostname contains invalid characters".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn push_ssh_cli_destination(
+    command: &mut portable_pty::CommandBuilder,
+    user: &str,
+    hostname: &str,
+) {
+    command.arg("--");
+    command.arg(format!("{user}@{hostname}"));
 }
 
 fn validate_group_exists(vault: &HostsVault, group_id: Option<&str>) -> Result<(), String> {
@@ -726,5 +776,28 @@ mod tests {
             "Expected Ok(None) when password is empty"
         );
         assert_eq!(res_empty.unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_ssh_option_injection_via_username() {
+        let err = validate_ssh_cli_identity(
+            "-oProxyCommand=touch /tmp/pwned #",
+            "127.0.0.1",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("must not start with '-'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_at_sign_and_whitespace_in_ssh_identity() {
+        assert!(validate_ssh_cli_identity("user@evil", "host").is_err());
+        assert!(validate_ssh_cli_identity("user name", "host").is_err());
+        assert!(validate_ssh_cli_identity("user", "-evilhost").is_err());
+        assert!(validate_ssh_cli_identity("user", "host name").is_err());
+        assert!(validate_ssh_cli_identity("ubuntu", "example.com").is_ok());
+        assert!(validate_ssh_cli_identity("ubuntu", "127.0.0.1").is_ok());
     }
 }
