@@ -1546,7 +1546,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       const script = resolveVars(snippet.script ?? "");
       // اسکریپت از بک‌اند می‌ره بالا؛ خط ورودی رو خالی فرض می‌کنیم
       lineTrackerRef.current = emptyLineTracker();
-      runSnippetScript(sid, snippet.name, script).catch((err) =>
+      runSnippetScript(sid, snippet.name, script, snippet.runAsSudo).catch((err) =>
         console.error("run_snippet_script failed:", err)
       );
     }
@@ -1886,9 +1886,16 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
                           i === snippetIndex ? "bg-[var(--color-surface-2)]" : "hover:bg-[var(--color-surface-2)]/60",
                         ].join(" ")}
                       >
-                        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
-                          {kindLabels[s.kind]?.[0] || "C"}
-                        </span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="flex h-7 w-7 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
+                            {kindLabels[s.kind]?.[0] || "C"}
+                          </span>
+                          {s.runAsSudo && (
+                            <span className="rounded bg-red-600 px-1 py-0.5 text-[8px] font-black text-white uppercase tracking-wider select-none leading-none">
+                              sudo
+                            </span>
+                          )}
+                        </div>
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
                           <div className="truncate text-xs text-muted-foreground font-mono">{s.body || s.command || s.script || ""}</div>

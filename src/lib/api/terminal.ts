@@ -43,8 +43,9 @@ export function runSnippetScript(
   sessionId: string,
   title: string,
   script: string,
+  runAsSudo?: boolean,
 ): Promise<void> {
-  return call<void>("run_snippet_script", { sessionId, title, script });
+  return call<void>("run_snippet_script", { sessionId, title, script, runAsSudo: runAsSudo ?? false });
 }
 
 /** `T` is left to the caller since each window defines its own connection-stage/status unions. */
