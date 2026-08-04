@@ -24,6 +24,8 @@ pub struct SaveSnippetRequest {
     pub keyword: Option<String>,
     #[serde(default)]
     pub os_targets: Vec<SnippetOsTarget>,
+    #[serde(default)]
+    pub run_as_sudo: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -239,6 +241,7 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
                 os_targets: request.os_targets.clone(),
                 created_at: existing_created_at.or_else(|| Some(now_iso())),
                 updated_at: Some(now_iso()),
+                run_as_sudo: request.run_as_sudo,
             };
 
             upsert_by_id(&mut vault.snippets, snippet_db.clone());

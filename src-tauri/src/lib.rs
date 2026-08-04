@@ -599,6 +599,7 @@ async fn run_snippet_script(
     session_id: String,
     title: String,
     script: String,
+    run_as_sudo: bool,
 ) -> Result<(), String> {
     // Emit title message directly to xterm via event (bypasses PTY — user sees the title)
     let title_msg = format!(
@@ -620,8 +621,8 @@ async fn run_snippet_script(
         };
 
         match host_id {
-            Some(h_id) => run_script_over_ssh(&app, &session_id, &h_id, &script),
-            None => run_script_locally(&app, &session_id, &script),
+            Some(h_id) => run_script_over_ssh(&app, &session_id, &h_id, &script, run_as_sudo),
+            None => run_script_locally(&app, &session_id, &script, run_as_sudo),
         }
     })
     .await
@@ -635,11 +636,12 @@ fn run_script_over_ssh(
     session_id: &str,
     host_id: &str,
     script: &str,
+    run_as_sudo: bool,
 ) -> Result<(), String> {
     match upload_script_via_sftp(app, session_id, host_id, script) {
         Ok(remote_path) => {
             let state = app.state::<AppState>();
-            let payload = snippet_exec::remote_exec_payload(&remote_path);
+            let payload = snippet_exec::remote_exec_payload(&remote_path, run_as_sudo);
             let manager = state.pty_manager.lock().unwrap();
             manager.write_to_session(session_id, &payload)
         }
@@ -656,7 +658,7 @@ fn run_script_over_ssh(
                 sftp_err
             );
             let _ = app.emit(&format!("term:{}:output", session_id), warn);
-            run_script_via_heredoc(app, session_id, script).map_err(|heredoc_err| {
+            run_script_via_heredoc(app, session_id, script, run_as_sudo).map_err(|heredoc_err| {
                 format!(
                     "SFTP upload failed ({}); heredoc fallback failed: {}",
                     sftp_err, heredoc_err
@@ -729,9 +731,10 @@ fn run_script_via_heredoc(
     app: &tauri::AppHandle,
     session_id: &str,
     script: &str,
+    run_as_sudo: bool,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let payload = snippet_exec::heredoc_payload(script, &snippet_exec::short_id());
+    let payload = snippet_exec::heredoc_payload(script, &snippet_exec::short_id(), run_as_sudo);
     let manager = state.pty_manager.lock().unwrap();
     manager.write_to_session(session_id, &payload)
 }
@@ -741,6 +744,7 @@ fn run_script_locally(
     app: &tauri::AppHandle,
     session_id: &str,
     script: &str,
+    run_as_sudo: bool,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
     let local_temp_path =
@@ -753,7 +757,7 @@ fn run_script_locally(
         let _ = std::fs::set_permissions(&local_temp_path, std::fs::Permissions::from_mode(0o600));
     }
 
-    let payload = snippet_exec::local_exec_payload(&local_temp_path.to_string_lossy());
+    let payload = snippet_exec::local_exec_payload(&local_temp_path.to_string_lossy(), run_as_sudo);
     let manager = state.pty_manager.lock().unwrap();
     manager.write_to_session(session_id, &payload)
 }
