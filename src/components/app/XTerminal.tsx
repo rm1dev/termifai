@@ -83,7 +83,7 @@ import {
 import { TerminalFindBar } from "@/components/app/TerminalFindBar";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
-import { Search } from "lucide-react";
+import { Search, Copy, Check } from "lucide-react";
 
 interface Props {
   sessionId?: string;
@@ -240,7 +240,16 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
   const [connectionLogs, setConnectionLogs] = useState<string[]>([]);
   const [showConnectionLogs, setShowConnectionLogs] = useState(false);
+  const [logsCopied, setLogsCopied] = useState(false);
   const [reconnectState, setReconnectState] = useState<ReconnectState | null>(null);
+
+  const handleCopyConnectionLogs = useCallback(() => {
+    if (connectionLogs.length === 0) return;
+    const text = connectionLogs.join("\n");
+    void navigator.clipboard.writeText(text);
+    setLogsCopied(true);
+    setTimeout(() => setLogsCopied(false), 2000);
+  }, [connectionLogs]);
   const [snippetPalette, setSnippetPalette] = useState(false);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
   const [snippetGroups, setSnippetGroups] = useState<SnippetGroup[]>([]);
@@ -1629,8 +1638,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
                 <span className="font-mono text-sm font-bold">&gt;_</span>
               </div>
               <div>
-                <h3 className="text-lg font-bold text-foreground">{connectionTitle ?? "SSH Session"}</h3>
-                <p className="mt-0.5 text-sm font-medium text-muted-foreground">{connectionLabel}</p>
+                <h3 className="text-lg font-bold text-foreground select-text cursor-text">{connectionTitle ?? "SSH Session"}</h3>
+                <p className="mt-0.5 text-sm font-medium text-muted-foreground select-text cursor-text">{connectionLabel}</p>
               </div>
             </div>
 
@@ -1668,24 +1677,54 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
             <div className="rounded-2xl bg-[var(--color-surface)] px-5 py-4 text-left">
               <div className="flex items-center justify-between gap-4">
                 <div>
-                  <span className="block text-base font-bold text-foreground">
+                  <span className="block text-base font-bold text-foreground select-text cursor-text">
                     {connectionSteps[safeActiveIndex]?.label ?? "Connecting"}
                   </span>
-                  <span className={`mt-1 block text-xs ${connectionStatus.status === "failed" ? "text-red-400" : "text-muted-foreground"}`}>
+                  <span className={`mt-1 block text-xs select-text cursor-text ${connectionStatus.status === "failed" ? "text-red-400" : "text-muted-foreground"}`}>
                     {connectionStatus.message}
                   </span>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowConnectionLogs((show) => !show)}
-                  className="rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-1 text-xs font-semibold text-muted-foreground hover:text-foreground"
-                >
-                  {showConnectionLogs ? "Hide Logs" : "Show Logs"}
-                </button>
+                <div className="flex items-center gap-2">
+                  {showConnectionLogs && connectionLogs.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleCopyConnectionLogs}
+                      className="flex items-center gap-1.5 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-semibold text-muted-foreground transition hover:text-foreground active:scale-95"
+                      title="Copy all connection logs"
+                    >
+                      {logsCopied ? (
+                        <>
+                          <Check className="h-3.5 w-3.5 text-emerald-400" />
+                          <span className="text-emerald-400">Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3.5 w-3.5" />
+                          <span>Copy Logs</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setShowConnectionLogs((show) => !show)}
+                    className="rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-1 text-xs font-semibold text-muted-foreground hover:text-foreground"
+                  >
+                    {showConnectionLogs ? "Hide Logs" : "Show Logs"}
+                  </button>
+                </div>
               </div>
               {showConnectionLogs && (
-                <div className="mt-3 max-h-28 overflow-auto rounded-lg border border-border bg-background/60 p-2 font-mono text-[10px] leading-4 text-muted-foreground">
-                  {connectionLogs.length ? connectionLogs.map((log, index) => <div key={`${index}-${log}`}>{log}</div>) : "Waiting for SSH logs..."}
+                <div className="mt-3 max-h-40 overflow-auto rounded-lg border border-border bg-background/60 p-2.5 font-mono text-[11px] leading-5 text-muted-foreground select-text cursor-text">
+                  {connectionLogs.length ? (
+                    connectionLogs.map((log, index) => (
+                      <div key={`${index}-${log}`} className="select-text cursor-text whitespace-pre-wrap break-all">
+                        {log}
+                      </div>
+                    ))
+                  ) : (
+                    <span className="select-text cursor-text">Waiting for SSH logs...</span>
+                  )}
                 </div>
               )}
             </div>
