@@ -253,7 +253,6 @@ impl PtyManager {
                             ) {
                                 ready = true;
                                 connection_tracker.complete();
-                                let _ = tx.send("\x1b[2J\x1b[H".to_string());
                                 let _ = tx.send(strip_debug_logs(&pending_output));
                                 pending_output.clear();
                             } else if pending_output.len() > 8192 {
@@ -755,17 +754,24 @@ fn strip_debug_logs(output: &str) -> String {
 
 fn strip_ansi_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_escape = false;
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    
+    while let Some(c) = chars.next() {
         if c == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if c.is_ascii_alphabetic() {
-                in_escape = false;
+            if let Some(&next) = chars.peek() {
+                if next == '[' || next == ']' {
+                    chars.next(); // Consume '[' or ']'
+                    while let Some(&inner) = chars.peek() {
+                        chars.next();
+                        if inner.is_ascii_alphabetic() || inner == '\x07' || inner == '\x1b' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
             }
-        } else {
-            out.push(c);
         }
+        out.push(c);
     }
     out
 }

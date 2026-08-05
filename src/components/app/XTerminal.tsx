@@ -475,6 +475,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
       await removeKnownHost(target);
       setShowConnectionLogs(false);
+      setIsResettingHostKey(false);
       setConnectionStatus({
         stage: "connecting",
         status: "active",

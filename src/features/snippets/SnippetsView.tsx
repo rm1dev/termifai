@@ -195,7 +195,10 @@ export function SnippetsView() {
 
   const selectedIds = Array.from(selected);
 
-  const getSnippetContent = (s: Snippet) => s.body || s.command || s.script || "";
+  const getSnippetContent = (s: Snippet) => {
+    if (s.kind === "script") return "";
+    return s.body || s.command || "";
+  };
 
   const visibleSnippets = snippets.filter((s) => {
     if (!query.trim()) return true;
@@ -710,7 +713,14 @@ function SnippetListRow({
         <KindIcon className="h-4 w-4" />
       </span>
       <div className="w-48 shrink-0 truncate text-sm font-medium text-foreground">{s.name}</div>
-      <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+      <div className="shrink-0 flex items-center gap-1.5">
+        <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+        {s.runAsSudo && (
+          <span className="rounded bg-red-600 px-1 py-0.5 text-[8px] font-black text-white uppercase tracking-wider select-none leading-none">
+            sudo
+          </span>
+        )}
+      </div>
       <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
         <button
