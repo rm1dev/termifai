@@ -1549,8 +1549,12 @@ async fn sftp_open_remote(
     let _ = std::process::Command::new("xdg-open")
         .arg(&tmp_path)
         .spawn();
+    // فایل temp آماده‌ست؛ اگه open خود سیستم شکست بخوره باز هم path رو برمی‌گردونیم
+    // تا watch/upload بعدی از کار نیفته.
     #[cfg(target_os = "windows")]
-    windows_shell_open(&tmp_path, None)?;
+    if let Err(e) = windows_shell_open(&tmp_path, None) {
+        eprintln!("Failed to open remote temp file: {}", e);
+    }
     Ok(tmp_path)
 }
 
