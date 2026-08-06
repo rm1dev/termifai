@@ -548,6 +548,11 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
         .clone()
         .ok_or_else(|| "No sync backend configured".to_string())?;
     let master_password = resolve_master_password(request.master_password)?;
+    // بدون vault unlocked، decrypt_host_password می‌شه None و merge ممکنه
+    // پسوردهای ریموت رو با host بدون پسورد بازنویسی کنه — قبل از gather آنلاک کن
+    if !crate::vault::is_unlocked() {
+        crate::vault::op_unlock(app, &master_password)?;
+    }
     let device_id = ensure_device_id(app)?;
 
     // اگه فرانت تنظیمات نفرستاده، از کش دیسک استفاده کن (مسیر auto-sync)
@@ -931,7 +936,16 @@ fn gather_local_snapshot(
     let hosts_vault = crate::hosts::list_hosts(app)?;
     let mut hosts = hosts_vault.hosts;
     for host in hosts.iter_mut() {
+        let had_encrypted = host
+            .password
+            .as_deref()
+            .is_some_and(|p| p.starts_with("v1:"));
         host.password = crate::hosts::decrypt_host_password(host);
+        // اگه ciphertext هست ولی decrypt نشد (vault قفل)، sync رو قطع کن تا
+        // یه snapshot بدون پسورد آپلود/merge نشه و دیتای ریموت پاک نشه
+        if had_encrypted && host.password.is_none() {
+            return Err("vault_locked".to_string());
+        }
     }
 
     let ssh_keys = if sync_ssh_keys {
