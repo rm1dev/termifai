@@ -1385,8 +1385,14 @@ async fn sftp_stat_remote(
 #[tauri::command]
 async fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
+        sftp::validate_path_segment(&new_name)?;
         let p = std::path::Path::new(&path);
         let dest = p.parent().ok_or("No parent dir")?.join(&new_name);
+        // Belt-and-suspenders: joined dest must stay under the same parent.
+        let parent = p.parent().ok_or("No parent dir")?;
+        if dest.parent() != Some(parent) {
+            return Err("Rename must stay in the same directory".to_string());
+        }
         std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
     })
     .await
@@ -1413,6 +1419,12 @@ async fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
 #[tauri::command]
 async fn sftp_mkdir_local(path: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
+        sftp::reject_parent_dir_components(&path)?;
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .ok_or_else(|| "mkdir path has no file name".to_string())?
+            .to_string_lossy();
+        sftp::validate_path_segment(&name)?;
         std::fs::create_dir_all(&path).map_err(|e| format!("Create dir '{}': {}", path, e))
     })
     .await
