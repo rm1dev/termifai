@@ -1697,6 +1697,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
         sessionId={sftpSessionId}
         path={permTarget ?? ""}
         onClose={() => setPermTarget(null)}
+        onApplied={() => { if (remotePath) void loadRemoteDir(remotePath); }}
       />
 
       {/* Open With dialog */}

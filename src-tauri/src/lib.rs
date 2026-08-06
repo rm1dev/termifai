@@ -1643,16 +1643,22 @@ async fn sftp_copy_remote(
 }
 
 #[tauri::command]
-fn sftp_get_users_groups(
-    state: State<AppState>,
+async fn sftp_get_users_groups(
+    app: tauri::AppHandle,
     session_id: String,
 ) -> Result<sftp::UsersGroups, String> {
-    let entry = {
-        let manager = state.sftp_manager.lock().unwrap();
-        manager.get_session(&session_id)?
-    };
-    let entry_guard = entry.lock().unwrap();
-    entry_guard.get_users_groups()
+    // چند round-trip بلاکینگ SSH داره؛ نباید thread کامند رو بلاک کنه
+    tokio::task::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let entry = {
+            let manager = state.sftp_manager.lock().unwrap();
+            manager.get_session(&session_id)?
+        };
+        let entry_guard = entry.lock().unwrap();
+        entry_guard.get_users_groups()
+    })
+    .await
+    .map_err(|e| format!("Thread panic: {}", e))?
 }
 
 #[tauri::command]
