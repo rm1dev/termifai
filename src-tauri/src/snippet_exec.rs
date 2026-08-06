@@ -14,17 +14,21 @@ pub fn short_id() -> String {
 /// PTY payload executing a script already uploaded to `remote_path` via SFTP.
 /// The leading `printf` erases the echoed command line; `bash` interprets the
 /// file regardless of shebang, matching the local branch and pre-SFTP behavior.
-pub fn remote_exec_payload(remote_path: &str) -> String {
+pub fn remote_exec_payload(remote_path: &str, run_as_sudo: bool) -> String {
+    let cmd = if run_as_sudo { "sudo bash" } else { "bash" };
     format!(
-        " printf '\\033[1A\\033[2K\\r' && bash \"{p}\"; rm -f \"{p}\"\r",
+        " printf '\\033[1A\\033[2K\\r' && {} \"{p}\"; rm -f \"{p}\"\r",
+        cmd,
         p = remote_path
     )
 }
 
 /// PTY payload executing a script written to a local temp file.
-pub fn local_exec_payload(path: &str) -> String {
+pub fn local_exec_payload(path: &str, run_as_sudo: bool) -> String {
+    let cmd = if run_as_sudo { "sudo bash" } else { "bash" };
     format!(
-        " printf '\\033[1A\\033[2K\\r' && bash \"{p}\"; rm -f \"{p}\"\r",
+        " printf '\\033[1A\\033[2K\\r' && {} \"{p}\"; rm -f \"{p}\"\r",
+        cmd,
         p = path
     )
 }
@@ -35,10 +39,12 @@ pub fn local_exec_payload(path: &str) -> String {
 /// `script` must already be normalized (no `\r`).
 /// The mktemp template must end in the X run: BSD/busybox mktemp only
 /// substitute a trailing run of X's.
-pub fn heredoc_payload(script: &str, marker_id: &str) -> String {
+pub fn heredoc_payload(script: &str, marker_id: &str, run_as_sudo: bool) -> String {
     let eof = format!("TERMIFAI_EOF_{}", marker_id);
+    let cmd = if run_as_sudo { "sudo bash" } else { "bash" };
     format!(
-        " printf '\\033[1A\\033[2K\\r' && f=$(mktemp /tmp/termifai_XXXXXXXX) && cat > \"$f\" << '{eof}'\r{script}\r{eof}\rbash \"$f\"; rm -f \"$f\"\r",
+        " printf '\\033[1A\\033[2K\\r' && f=$(mktemp /tmp/termifai_XXXXXXXX) && cat > \"$f\" << '{eof}'\r{script}\r{eof}\r{} \"$f\"; rm -f \"$f\"\r",
+        cmd,
         eof = eof,
         script = script,
     )
@@ -64,7 +70,7 @@ mod tests {
 
     #[test]
     fn remote_payload_runs_via_bash_and_cleans_up() {
-        let p = remote_exec_payload("/tmp/x.sh");
+        let p = remote_exec_payload("/tmp/x.sh", false);
         assert!(
             p.contains("bash \"/tmp/x.sh\""),
             "must run via bash, got: {p}"
@@ -76,22 +82,31 @@ mod tests {
             "leading space keeps it out of shell history"
         );
         assert!(p.ends_with('\r'));
+
+        let p_sudo = remote_exec_payload("/tmp/x.sh", true);
+        assert!(p_sudo.contains("sudo bash \"/tmp/x.sh\""));
     }
 
     #[test]
     fn local_payload_runs_via_bash_and_cleans_up() {
-        let p = local_exec_payload("/var/folders/t/x.sh");
+        let p = local_exec_payload("/var/folders/t/x.sh", false);
         assert!(p.contains("bash \"/var/folders/t/x.sh\""));
         assert!(p.contains("rm -f \"/var/folders/t/x.sh\""));
+
+        let p_sudo = local_exec_payload("/var/folders/t/x.sh", true);
+        assert!(p_sudo.contains("sudo bash \"/var/folders/t/x.sh\""));
     }
 
     #[test]
     fn heredoc_payload_embeds_script_and_marker() {
-        let p = heredoc_payload("echo hi\necho bye", "abc12345");
+        let p = heredoc_payload("echo hi\necho bye", "abc12345", false);
         assert!(p.contains("<< 'TERMIFAI_EOF_abc12345'"));
         assert!(p.contains("echo hi\necho bye"));
         assert!(p.contains("bash \"$f\""));
         assert!(p.contains("mktemp /tmp/termifai_XXXXXXXX"));
         assert!(p.ends_with('\r'));
+
+        let p_sudo = heredoc_payload("echo hi\necho bye", "abc12345", true);
+        assert!(p_sudo.contains("sudo bash \"$f\""));
     }
 }

@@ -256,8 +256,8 @@
     -webkit-user-drag: none;
   }
 
-  /* Allow text selection in inputs, textareas, and terminal */
-  input, textarea, [contenteditable="true"], .xterm-wrapper {
+  /* Allow text selection in inputs, textareas, terminal, and explicitly selectable areas */
+  input, textarea, [contenteditable="true"], .xterm-wrapper, .select-text {
     user-select: text;
     -webkit-user-select: text;
   }
