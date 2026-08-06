@@ -309,6 +309,9 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const reconnectAttemptRef = useRef(0);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // phase رو تو ref نگه می‌داریم تا handleDisconnect از mount-effect بدون
+  // stale closure ببینه الان وسط reconnectیم یا نه.
+  const reconnectPhaseRef = useRef<ReconnectState["phase"] | null>(null);
   // The drag-drop event fires at the webview level, not per-DOM-element, and
   // every tab's XTerminal (including hidden ones) mounts this listener — so
   // handlers read isActive from a ref to ignore drops over background tabs.
@@ -336,6 +339,12 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       termRef.current?.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
       return;
     }
+    // وسط backoff/connecting یا بعد از failed، attempt counter رو صفر نکن —
+    // وگرنه هر keystroke روی session مرده از اول شروع می‌کنه و هیچ‌وقت failed نمی‌شه.
+    const phase = reconnectPhaseRef.current;
+    if (phase === "waiting" || phase === "connecting" || phase === "failed") {
+      return;
+    }
     termRef.current?.write("\r\n\x1b[38;2;255;99;99m[Connection to host lost.]\x1b[0m\r\n");
     reconnectAttemptRef.current = 0;
     scheduleReconnectAttempt();
@@ -346,12 +355,14 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     reconnectAttemptRef.current = attempt;
     if (attempt > MAX_RECONNECT_ATTEMPTS) {
       clearReconnectTimers();
+      reconnectPhaseRef.current = "failed";
       setReconnectState({ phase: "failed", attempt: MAX_RECONNECT_ATTEMPTS, countdown: 0 });
       return;
     }
 
     const delay = RECONNECT_DELAYS_SEC[attempt - 1];
     let remaining = delay;
+    reconnectPhaseRef.current = "waiting";
     setReconnectState({ phase: "waiting", attempt, countdown: remaining });
 
     clearReconnectTimers();
@@ -370,6 +381,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     // create an ownerless ssh session that (via tmux attach -D on the same
     // named session) kicks the client of whichever terminal replaced us.
     if (!termRef.current) return;
+    reconnectPhaseRef.current = "connecting";
     setReconnectState({ phase: "connecting", attempt, countdown: 0 });
     const staleSid = sessionRef.current;
     try {
@@ -419,6 +431,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       }
 
       reconnectAttemptRef.current = 0;
+      reconnectPhaseRef.current = null;
       setReconnectState(null);
       term?.write("\r\n\x1b[38;2;120;220;140m[Reconnected.]\x1b[0m\r\n");
     } catch {
@@ -430,6 +443,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const manualReconnect = useCallback(() => {
     clearReconnectTimers();
     reconnectAttemptRef.current = 0;
+    reconnectPhaseRef.current = null;
     void performReconnect(1).catch(() => {});
   }, []);
 
@@ -971,6 +985,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
       if (shortcuts["terminal-paste"] && isShortcutMatch(event, shortcuts["terminal-paste"])) {
         if (event.type === "keydown") {
+          // بدون preventDefault مرورگر هم paste می‌زنه → متن دو بار می‌ره تو PTY
+          event.preventDefault();
           const sid = sessionRef.current;
           if (sid) {
             readClipboardText().then((text) => {
@@ -1438,6 +1454,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       highlighterRef.current = null;
       rtlOverlayRef.current = null;
       clearReconnectTimers();
+      // تب بسته شد → session بک‌اند رو هم ببند، وگرنه PTY/SSH یتیم می‌مونه
+      // (با resilient tmux حتی attach زنده‌ی بعدی رو هم با -AD می‌پره).
+      const sidToClose = sessionRef.current;
+      if (sidToClose) {
+        closeSession(sidToClose).catch(() => {});
+        sessionRef.current = null;
+      }
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
       window.removeEventListener(appThemeChangedEvent, onAppThemeChanged);
