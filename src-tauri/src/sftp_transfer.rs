@@ -3,8 +3,11 @@
 //! هویت resume با marker کنار فایل انجام می‌شه؛ I/O واقعی هنوز تو `sftp.rs` می‌مونه.
 
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// Max automatic reconnect attempts before pausing for manual Resume.
 pub const MAX_RECONNECT_ATTEMPTS: u32 = 5;
@@ -131,6 +134,23 @@ impl TransferQueue {
             job.state = JobState::Done;
             job.bytes_done = job.total_bytes;
             job.error = None;
+        }
+    }
+}
+
+/// Atomically claims the single in-flight transfer slot for a session.
+/// A second claim while the first is still registered fails — cancel/done
+/// events are keyed only by `session_id`, so overlapping transfers corrupt state.
+pub fn claim_transfer_slot(
+    flags: &mut HashMap<String, Arc<AtomicBool>>,
+    session_id: &str,
+) -> Result<Arc<AtomicBool>, String> {
+    match flags.entry(session_id.to_string()) {
+        Entry::Occupied(_) => Err("A transfer is already in progress for this session".to_string()),
+        Entry::Vacant(slot) => {
+            let flag = Arc::new(AtomicBool::new(false));
+            slot.insert(Arc::clone(&flag));
+            Ok(flag)
         }
     }
 }
@@ -563,6 +583,19 @@ mod tests {
         assert!(!same_file_identity(10, Some(1), 10, Some(2)));
         assert!(!same_file_identity(10, None, 10, Some(1)));
         assert!(!same_file_identity(10, Some(1), 11, Some(1)));
+    }
+
+    #[test]
+    fn claim_transfer_slot_rejects_second_claim() {
+        let mut flags = HashMap::new();
+        let first = claim_transfer_slot(&mut flags, "sess-1").unwrap();
+        assert!(!first.load(std::sync::atomic::Ordering::Relaxed));
+        let err = claim_transfer_slot(&mut flags, "sess-1").unwrap_err();
+        assert!(err.contains("already in progress"));
+        // سشن دیگه آزاد باشه
+        assert!(claim_transfer_slot(&mut flags, "sess-2").is_ok());
+        flags.remove("sess-1");
+        assert!(claim_transfer_slot(&mut flags, "sess-1").is_ok());
     }
 
     #[test]

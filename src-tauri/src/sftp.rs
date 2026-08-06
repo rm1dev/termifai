@@ -320,12 +320,15 @@ impl SftpEntry {
         self.keepalive_stop.store(true, Ordering::Relaxed);
     }
 
-    pub fn is_keepalive_stopped(&self) -> bool {
-        self.keepalive_stop.load(Ordering::Relaxed)
+    /// Stops the previous keepalive worker and installs a fresh stop flag so a
+    /// new keepalive thread can be spawned after reconnect (the old worker may
+    /// already have exited on `keepalive_send` error).
+    fn reset_keepalive_stop(&mut self) -> Arc<AtomicBool> {
+        self.keepalive_stop.store(true, Ordering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        self.keepalive_stop = Arc::clone(&stop);
+        stop
     }
-
-    pub fn get_keepalive_stop(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.keepalive_stop)
     }
 }
 
@@ -1587,14 +1590,13 @@ pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>, session_id: &str) -> Resul
     };
     fn silent_log(_stage: &str, _msg: &str) {}
     let session = ssh::connect(&cfg, silent_log)?;
-
-    let new_stop = Arc::new(AtomicBool::new(false));
-    {
+    // بعد از reconnect باید keepalive دوباره بالا بیاد؛ وگرنه سشن idle دوباره می‌میره
+    let keepalive_stop = {
         let mut guard = entry.lock().unwrap();
         guard.replace_session(session);
-        guard.keepalive_stop = Arc::clone(&new_stop);
-    }
-    spawn_sftp_keepalive(Arc::clone(entry), new_stop, session_id);
+        guard.reset_keepalive_stop()
+    };
+    spawn_sftp_keepalive(Arc::clone(entry), keepalive_stop, &creds.hostname);
     Ok(())
 }
 
