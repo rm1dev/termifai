@@ -236,9 +236,11 @@ pub struct RemoteStatResult {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct UsersGroups {
     pub users: Vec<String>,
     pub groups: Vec<String>,
+    pub current_user: String,
 }
 
 pub struct SftpEntry {
@@ -272,6 +274,9 @@ impl SftpEntry {
 fn spawn_sftp_keepalive(entry: Arc<Mutex<SftpEntry>>, stop: Arc<AtomicBool>, session_id: &str) {
     let name = format!("sftp-ka-{}", &session_id[..session_id.len().min(12)]);
     let _ = std::thread::Builder::new().name(name).spawn(move || {
+        // با اولین خطای لحظه‌ای (مثل contention کوتاه) نخ رو نکش —
+        // وگرنه بعد از چند ثانیه idle سشن می‌میره و Channel open: Session(-7) می‌گیری
+        let mut consecutive_failures = 0u32;
         while !stop.load(Ordering::Relaxed) {
             for _ in 0..10 {
                 if stop.load(Ordering::Relaxed) {
@@ -281,13 +286,20 @@ fn spawn_sftp_keepalive(entry: Arc<Mutex<SftpEntry>>, stop: Arc<AtomicBool>, ses
             }
             // اگه transfer قفل گرفته، رد شو — ترافیک فعال خودش سشن رو زنده نگه می‌داره
             let Ok(guard) = entry.try_lock() else {
+                consecutive_failures = 0;
                 continue;
             };
             if stop.load(Ordering::Relaxed) {
                 return;
             }
-            if guard.session.keepalive_send().is_err() {
-                return;
+            match guard.session.keepalive_send() {
+                Ok(_) => consecutive_failures = 0,
+                Err(_) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        return;
+                    }
+                }
             }
         }
     });
@@ -650,8 +662,13 @@ impl SftpEntry {
             .session
             .channel_session()
             .map_err(|e| format!("Channel open: {}", e))?;
+        // stderr رو به stdout می‌چسبونیم، دو دلیل:
+        // ۱) پیام خطای واقعی شل (مثل Operation not permitted) گم نمی‌شه و به کاربر می‌رسه
+        // ۲) اگه stderr جدا بمونه هیچ‌وقت خونده نمی‌شه؛ وقتی بافرش پر بشه (مثلاً chmod -R
+        //    روی درخت بزرگ با کلی فایل غیرقابل‌دسترس) پنجره‌ی کانال فول می‌شه و read روی
+        //    stdout تا ابد بلاک می‌مونه → کل سشن SFTP قفل می‌کنه
         channel
-            .exec(cmd)
+            .exec(&format!("{{ {}; }} 2>&1", cmd))
             .map_err(|e| format!("Exec '{}': {}", cmd, e))?;
         let mut output = String::new();
         use std::io::Read;
@@ -665,24 +682,39 @@ impl SftpEntry {
             .exit_status()
             .map_err(|e| format!("Exit status: {}", e))?;
         if status != 0 {
-            return Err(format!("Command '{}' exited with status {}", cmd, status));
+            // اولین خط غیرخالی خروجی معمولاً خود پیام خطای شله (بخاطر 2>&1)
+            let detail = output.lines().map(|l| l.trim()).find(|l| !l.is_empty());
+            return Err(match detail {
+                Some(d) => {
+                    let truncated: String = d.chars().take(300).collect();
+                    format!("{} (exit status {})", truncated, status)
+                }
+                None => format!("Command '{}' exited with status {}", cmd, status),
+            });
         }
         Ok(output)
     }
 
     pub fn stat_remote(&self, path: &str) -> Result<RemoteStatResult, String> {
-        let sftp = self
-            .session
-            .sftp()
-            .map_err(|e| format!("SFTP subsystem: {}", e))?;
-        let stat = sftp
-            .stat(std::path::Path::new(path))
-            .map_err(|e| format!("stat '{}': {}", path, e))?;
-        let permissions = stat.perm.unwrap_or(0) & 0o7777;
+        // اول SFTP رو کامل ببند، بعد exec بزن.
+        // اگه کانال SFTP هنوز باز باشه و همزمان channel_session باز کنیم،
+        // libssh2 گاهی SOCKET_SEND (-7) می‌ده → «Unable to send channel-open request»
+        let permissions = {
+            let sftp = self
+                .session
+                .sftp()
+                .map_err(|e| format!("SFTP subsystem: {}", e))?;
+            let stat = sftp
+                .stat(std::path::Path::new(path))
+                .map_err(|e| format!("stat '{}': {}", path, e))?;
+            stat.perm.unwrap_or(0) & 0o7777
+        };
         // get owner/group via SSH exec since libssh2 stat doesn't return names
+        // stat -c مال گنو/لینوکسه؛ روی BSD/macOS از stat -f استفاده می‌کنیم
+        let escaped = shell_escape(path);
         let owner_out = self.exec_command(&format!(
-            "stat -c '%U %G' {} 2>/dev/null || echo 'root root'",
-            shell_escape(path)
+            "stat -c '%U %G' {0} 2>/dev/null || stat -f '%Su %Sg' {0} 2>/dev/null || echo 'root root'",
+            escaped
         ))?;
         let parts: Vec<&str> = owner_out.trim().splitn(2, ' ').collect();
         let owner = parts.first().unwrap_or(&"root").to_string();
@@ -738,21 +770,40 @@ impl SftpEntry {
     }
 
     pub fn get_users_groups(&self) -> Result<UsersGroups, String> {
-        let users_out = self
-            .exec_command("getent passwd | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/passwd")?;
-        let groups_out =
-            self.exec_command("getent group | cut -d: -f1 2>/dev/null || cut -d: -f1 /etc/group")?;
-        let users = users_out
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let groups = groups_out
-            .lines()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        Ok(UsersGroups { users, groups })
+        // یه round-trip به‌جای سه تا — باز/بست مکرر کانال exec سشن رو شکننده می‌کنه
+        // (مخصوصاً وقتی دیالوگ با Promise.all همزمان stat هم می‌زنه)
+        let out = self.exec_command(
+            "printf '%s\\n' '__T_USERS__'; \
+             (getent passwd 2>/dev/null || cat /etc/passwd) | cut -d: -f1; \
+             printf '%s\\n' '__T_GROUPS__'; \
+             (getent group 2>/dev/null || cat /etc/group) | cut -d: -f1; \
+             printf '%s\\n' '__T_WHO__'; \
+             (id -un 2>/dev/null || whoami 2>/dev/null || echo '')",
+        )?;
+        let mut section = "";
+        let mut users = Vec::new();
+        let mut groups = Vec::new();
+        let mut current_user = String::new();
+        for line in out.lines() {
+            let line = line.trim();
+            match line {
+                "__T_USERS__" => section = "users",
+                "__T_GROUPS__" => section = "groups",
+                "__T_WHO__" => section = "who",
+                "" => {}
+                other => match section {
+                    "users" => users.push(other.to_string()),
+                    "groups" => groups.push(other.to_string()),
+                    "who" if current_user.is_empty() => current_user = other.to_string(),
+                    _ => {}
+                },
+            }
+        }
+        Ok(UsersGroups {
+            users,
+            groups,
+            current_user,
+        })
     }
 
     pub fn open_remote(&self, session_id: &str, remote_path: &str) -> Result<String, String> {
