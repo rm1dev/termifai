@@ -202,6 +202,58 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// A single file/folder name for rename/mkdir — not a relative or absolute path.
+/// Rejects empty names, `.` / `..`, separators, and absolute paths so
+/// `parent.join(name)` cannot escape the intended directory.
+pub fn validate_path_segment(name: &str) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Name cannot be empty".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err("Invalid name".to_string());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return Err("Name cannot contain path separators".to_string());
+    }
+    let as_path = std::path::Path::new(name);
+    if as_path.is_absolute() || as_path.components().count() != 1 {
+        return Err("Name must be a single path segment".to_string());
+    }
+    Ok(())
+}
+
+/// Ensures `to_path` is a same-directory rename of `from_path` to a safe
+/// single-segment name (blocks `../` and absolute destinations).
+pub fn validate_same_dir_rename(from_path: &str, to_path: &str) -> Result<(), String> {
+    let from = std::path::Path::new(from_path);
+    let to = std::path::Path::new(to_path);
+    let from_parent = from
+        .parent()
+        .ok_or_else(|| "Source path has no parent directory".to_string())?;
+    let to_parent = to
+        .parent()
+        .ok_or_else(|| "Destination path has no parent directory".to_string())?;
+    if from_parent != to_parent {
+        return Err("Rename must stay in the same directory".to_string());
+    }
+    let name = to
+        .file_name()
+        .ok_or_else(|| "Destination path has no file name".to_string())?
+        .to_string_lossy();
+    validate_path_segment(&name)
+}
+
+/// Rejects any `..` component so mkdir/join cannot climb out of the pane cwd.
+pub fn reject_parent_dir_components(path: &str) -> Result<(), String> {
+    for component in std::path::Path::new(path).components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err("Path cannot contain '..'".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn format_unix_timestamp(secs: u64) -> String {
     let secs = secs as i64;
     let (y, mo, d, h, mi) = unix_to_ymd_hm(secs);
@@ -702,6 +754,7 @@ impl SftpEntry {
     }
 
     pub fn rename_remote(&self, from_path: &str, to_path: &str) -> Result<(), String> {
+        validate_same_dir_rename(from_path, to_path)?;
         let sftp = self
             .session
             .sftp()
@@ -715,6 +768,12 @@ impl SftpEntry {
     }
 
     pub fn mkdir_remote(&self, path: &str) -> Result<(), String> {
+        reject_parent_dir_components(path)?;
+        let name = std::path::Path::new(path)
+            .file_name()
+            .ok_or_else(|| "mkdir path has no file name".to_string())?
+            .to_string_lossy();
+        validate_path_segment(&name)?;
         let sftp = self
             .session
             .sftp()
@@ -1578,6 +1637,34 @@ mod tests {
         let result = manager.get_session("nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn validate_path_segment_rejects_traversal() {
+        assert!(validate_path_segment("notes.txt").is_ok());
+        assert!(validate_path_segment("my-folder").is_ok());
+        assert!(validate_path_segment("../secrets.txt").is_err());
+        assert!(validate_path_segment("..\\secrets.txt").is_err());
+        assert!(validate_path_segment("/etc/passwd").is_err());
+        assert!(validate_path_segment("foo/bar").is_err());
+        assert!(validate_path_segment("..").is_err());
+        assert!(validate_path_segment(".").is_err());
+        assert!(validate_path_segment("").is_err());
+    }
+
+    #[test]
+    fn validate_same_dir_rename_blocks_escape() {
+        assert!(validate_same_dir_rename("/home/u/a.txt", "/home/u/b.txt").is_ok());
+        assert!(validate_same_dir_rename("/home/u/a.txt", "/home/u/../b.txt").is_err());
+        assert!(validate_same_dir_rename("/home/u/a.txt", "/etc/passwd").is_err());
+        assert!(validate_same_dir_rename("/home/u/a.txt", "/home/u/sub/b.txt").is_err());
+    }
+
+    #[test]
+    fn reject_parent_dir_components_blocks_dotdot() {
+        assert!(reject_parent_dir_components("/home/u/newdir").is_ok());
+        assert!(reject_parent_dir_components("/home/u/../evil").is_err());
+        assert!(reject_parent_dir_components("foo/../../bar").is_err());
     }
 
     #[test]
