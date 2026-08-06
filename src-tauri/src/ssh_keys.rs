@@ -554,4 +554,3 @@ mod tests {
         assert!(remove_known_host("   ").is_err());
     }
 }
-

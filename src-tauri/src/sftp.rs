@@ -267,7 +267,7 @@ impl SftpEntry {
     pub fn stop_keepalive(&self) {
         self.keepalive_stop.store(true, Ordering::Relaxed);
     }
-    
+
     pub fn is_keepalive_stopped(&self) -> bool {
         self.keepalive_stop.load(Ordering::Relaxed)
     }
@@ -560,12 +560,12 @@ impl SftpEntry {
                 let _ = sftp.unlink(std::path::Path::new(remote_path));
             }
             clear_upload_marker(local_path);
-            
+
             // workaround to ensure dir exists if path is like 'foo/bar'
             if let Some(parent) = std::path::Path::new(remote_path).parent() {
                 let _ = sftp.mkdir(parent, 0o755);
             }
-            
+
             sftp.create(std::path::Path::new(remote_path))
                 .map_err(|e| format!("create remote '{}': {}", remote_path, e))?
         };
