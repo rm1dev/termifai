@@ -485,6 +485,11 @@ pub fn save_snippet_group(
                     error = Some("Selected group does not exist".to_string());
                     return;
                 }
+                // نذار گروه بره زیر نوه‌ش — چرخه می‌سازه و delete گیر می‌کنه
+                if would_create_group_cycle(&vault.groups, &id, Some(parent_id)) {
+                    error = Some("Group cannot be nested under its own descendant".to_string());
+                    return;
+                }
             }
             upsert_group_by_id(&mut vault.groups, group.clone());
         })
@@ -534,11 +539,39 @@ pub fn remove_snippet_group(app: &AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
+fn would_create_group_cycle(
+    groups: &[SnippetGroup],
+    id: &str,
+    parent_id: Option<&str>,
+) -> bool {
+    let mut current = parent_id;
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = current {
+        if pid == id {
+            return true;
+        }
+        if !seen.insert(pid) {
+            // زنجیرهٔ والد از قبل چرخه داره
+            return true;
+        }
+        current = groups
+            .iter()
+            .find(|g| g.id == pid)
+            .and_then(|g| g.parent_id.as_deref());
+    }
+    false
+}
+
 fn descendant_group_ids(groups: &[SnippetGroup], id: &str) -> Vec<String> {
     let mut descendants = Vec::new();
     let mut stack = vec![id.to_string()];
+    let mut visited = std::collections::HashSet::new();
 
     while let Some(parent_id) = stack.pop() {
+        if !visited.insert(parent_id.clone()) {
+            // چرخهٔ sync‌شده — قطع کن تا hang نشه
+            continue;
+        }
         for group in groups.iter().filter(|group| {
             group
                 .parent_id
@@ -730,6 +763,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn write_synced_script_bodies_keeps_disk_until_purge() {
         // اگه vault commit بترکه، نباید از قبل orphan پاک شده باشه
         let dir = temp_dir();
@@ -779,5 +813,49 @@ mod tests {
         purge_orphan_script_files(&dir, &keep);
         assert!(read_script_file(&dir, "was-script").is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn would_create_group_cycle_rejects_nesting_under_descendant() {
+        let groups = vec![
+            SnippetGroup {
+                id: "a".to_string(),
+                name: "A".to_string(),
+                parent_id: None,
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            SnippetGroup {
+                id: "b".to_string(),
+                name: "B".to_string(),
+                parent_id: Some("a".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+        ];
+        assert!(would_create_group_cycle(&groups, "a", Some("b")));
+        assert!(!would_create_group_cycle(&groups, "b", Some("a")));
+        assert!(!would_create_group_cycle(&groups, "a", None));
+    }
+
+    #[test]
+    fn descendant_group_ids_terminates_on_parent_cycle() {
+        let groups = vec![
+            SnippetGroup {
+                id: "a".to_string(),
+                name: "A".to_string(),
+                parent_id: Some("b".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            SnippetGroup {
+                id: "b".to_string(),
+                name: "B".to_string(),
+                parent_id: Some("a".to_string()),
+                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+        ];
+        let descendants = descendant_group_ids(&groups, "a");
+        assert!(descendants.contains(&"b".to_string()));
+        // Must not hang / grow forever on a mutual parent cycle.
+        assert!(descendants.len() <= 2);
+    }
     }
 }

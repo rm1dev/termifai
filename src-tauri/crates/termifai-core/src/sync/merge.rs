@@ -276,4 +276,24 @@ mod tests {
         let merged2 = merge_blob(&no_ts, &remote);
         assert_eq!(merged2.value, remote.value, "missing local timestamp loses to a timestamped remote");
     }
+
+    #[test]
+    fn rebase_keeps_local_only_entity_added_during_sync() {
+        // Simulates apply_outcome rebase: prior merge outcome is treated as
+        // "remote", and a host saved while sync was in flight is current local.
+        let prior_outcome = vec![group("g1", "2026-01-01T00:00:00Z"), group("g2", "2026-02-01T00:00:00Z")];
+        let current_local = vec![group("g1", "2026-01-01T00:00:00Z"), group("g3", "2026-03-01T00:00:00Z")];
+        let rebased = merge_entities(
+            current_local,
+            prior_outcome,
+            &[],
+            EntityKind::Group,
+            "dev-a",
+            "dev-b",
+        );
+        let ids: Vec<&str> = rebased.iter().map(|g| g.id.as_str()).collect();
+        assert!(ids.contains(&"g1"));
+        assert!(ids.contains(&"g2"), "remote-only entity from prior merge must survive");
+        assert!(ids.contains(&"g3"), "local save during sync must not be clobbered");
+    }
 }

@@ -576,16 +576,18 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
     };
     let _ = persist_settings_cache(app, &settings);
 
+    // Snapshot dirty gen قبل از gather تا ویرایش‌های وسط sync رو از دست ندیم
+    let dirty_gen_at_gather = crate::sync_auto::dirty_generation();
     let local = gather_local_snapshot(
         app,
         sync_state.sync_ssh_keys,
-        settings,
-        device_id,
+        settings.clone(),
+        device_id.clone(),
         sync_state.device_name.clone(),
     )?;
 
     let backend = build_backend(app, &backend_config)?;
-    let outcome = sync::run_sync(
+    let mut outcome = sync::run_sync(
         backend.as_ref(),
         local,
         &master_password,
@@ -593,7 +595,21 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
     )
     .map_err(|e| e.to_string())?;
 
+    let dirty_during_sync = crate::sync_auto::dirty_generation() != dirty_gen_at_gather;
+
     let applied = if outcome.local_changed {
+        // اگه وسط sync چیزی ذخیره شده، outcome قدیمی رو روی vault زنده
+        // replace نکن — اول با حالت فعلی دوباره merge کن.
+        if dirty_during_sync {
+            outcome = rebase_outcome_on_current_local(
+                app,
+                &outcome,
+                sync_state.sync_ssh_keys,
+                settings,
+                device_id,
+                sync_state.device_name.clone(),
+            )?;
+        }
         apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
         true
     } else {
@@ -621,13 +637,15 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
         at: synced_at.clone(),
     };
 
+    // فقط وقتی dirty رو پاک کن که از gather تا حالا ویرایش جدیدی نیومده باشه.
+    let still_dirty = crate::sync_auto::dirty_generation() != dirty_gen_at_gather;
     let state = app.state::<AppState>();
     state
         .sync_state_store
         .update_with_migration(migrate_sync_state, |s| {
             s.last_synced_blob_version = blob_version;
             s.last_sync_at = Some(synced_at);
-            s.dirty = false;
+            s.dirty = still_dirty;
             s.last_error = None;
             s.last_sync_stats = Some(stats);
             s.settings_cache = SettingsCache {
@@ -637,6 +655,10 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
             };
         })
         .map_err(|e| e.to_string())?;
+
+    if still_dirty {
+        crate::sync_auto::note_dirty();
+    }
 
     Ok(result)
 }
@@ -691,6 +713,11 @@ pub fn sync_import_foreign(
     if !crate::vault::is_unlocked() {
         return Err("Vault is locked".to_string());
     }
+    // هم‌زمانی با sync_now باعث apply/store موازی و state پاره‌پاره می‌شه
+    let _guard = sync_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let current_master_password = resolve_master_password(request.current_master_password)?;
 
     let backend = build_backend(app, &request.backend)?;
@@ -701,13 +728,15 @@ pub fn sync_import_foreign(
     let sync_state = load_state(app)?;
     let device_id = ensure_device_id(app)?;
     let device_name = sync_state.device_name.clone();
+    // مثل sync_now از کش واقعی استفاده کن — default خالی تم/شورتکات بقیه دستگاه‌ها رو پاک می‌کنه
+    let settings = crate::sync_auto::cache_to_settings(&sync_state.settings_cache);
 
     let outcome = if request.replace_remote {
         // Overwrite remote with this device's own state — no merge.
         let local = gather_local_snapshot(
             app,
             sync_state.sync_ssh_keys,
-            SettingsPayload::default(),
+            settings,
             device_id.clone(),
             device_name.clone(),
         )?;
@@ -716,18 +745,14 @@ pub fn sync_import_foreign(
         let local = gather_local_snapshot(
             app,
             sync_state.sync_ssh_keys,
-            SettingsPayload::default(),
+            settings,
             device_id.clone(),
             device_name.clone(),
         )?;
         sync::merge_snapshot(&local, Some(foreign_payload))
     };
 
-    apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
-
-    // Re-encrypt and re-upload under the current device's own master
-    // password with a fresh salt, so other devices hit the standard
-    // "master password changed elsewhere" re-link path on their next sync.
+    // اول remote رو بنویس، بعد local — اگه store بخوره local دست‌نخورده می‌مونه
     let new_salt = sync::random_sync_salt();
     let key = sync::derive_sync_key(&current_master_password, &new_salt)
         .map_err(|e| format!("Failed to derive sync key: {:?}", e))?;
@@ -764,6 +789,8 @@ pub fn sync_import_foreign(
         .store(&new_manifest, &blob_bytes, Some(manifest.blob_version))
         .map_err(|e| e.to_string())?;
 
+    apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
+
     let state = app.state::<AppState>();
     state
         .sync_state_store
@@ -772,6 +799,11 @@ pub fn sync_import_foreign(
             s.last_synced_blob_version = new_manifest.blob_version;
             s.last_sync_at = Some(now_iso());
             s.dirty = false;
+            s.settings_cache = SettingsCache {
+                app_theme: to_cached_blob(outcome.settings.app_theme.clone()),
+                terminal_appearance: to_cached_blob(outcome.settings.terminal_appearance.clone()),
+                shortcuts: to_cached_blob(outcome.settings.shortcuts.clone()),
+            };
         })
         .map_err(|e| e.to_string())?;
 
@@ -924,6 +956,39 @@ fn build_backend(
             Ok(Box::new(backend))
         }
     }
+}
+
+/// Re-merge a sync outcome against the live local vault so saves that landed
+/// while `run_sync` was in flight are not wiped by a full-store replace.
+fn rebase_outcome_on_current_local(
+    app: &AppHandle,
+    outcome: &SyncOutcome,
+    sync_ssh_keys: bool,
+    settings: SettingsPayload,
+    device_id: String,
+    device_name: Option<String>,
+) -> Result<SyncOutcome, String> {
+    let current = gather_local_snapshot(app, sync_ssh_keys, settings, device_id, device_name)?;
+    let remote = termifai_core::sync::SyncPayload {
+        format_version: sync::PAYLOAD_FORMAT_VERSION,
+        exported_at: now_iso(),
+        device_id: String::new(),
+        hosts: outcome.hosts.clone(),
+        groups: outcome.groups.clone(),
+        snippets: outcome.snippets.clone(),
+        snippet_groups: outcome.snippet_groups.clone(),
+        port_forwards: outcome.port_forwards.clone(),
+        ssh_keys: outcome.ssh_keys.clone(),
+        settings: outcome.settings.clone(),
+        tombstones: outcome.tombstones.clone(),
+    };
+    let mut rebased = sync::merge_snapshot(&current, Some(remote));
+    rebased.blob_version = outcome.blob_version;
+    rebased.uploaded = outcome.uploaded;
+    rebased.local_changed = true;
+    rebased.collections_uploaded = outcome.collections_uploaded.clone();
+    rebased.collections_downloaded = outcome.collections_downloaded.clone();
+    Ok(rebased)
 }
 
 fn gather_local_snapshot(
