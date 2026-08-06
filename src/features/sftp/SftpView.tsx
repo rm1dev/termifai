@@ -65,19 +65,19 @@ function SftpConnectingOverlay({
       </div>
 
       {/* Host info */}
-      <h2 className="text-lg font-semibold tracking-tight text-foreground">
+      <h2 className="text-lg font-semibold tracking-tight text-foreground select-text cursor-text">
         {hostTitle || "SFTP"}
       </h2>
       {hostLabel && (
-        <p className="mt-1 text-xs text-muted-foreground">{hostLabel}</p>
+        <p className="mt-1 text-xs text-muted-foreground select-text cursor-text">{hostLabel}</p>
       )}
 
       {/* Status / error */}
       {!failed ? (
-        <p className="mt-6 text-xs text-muted-foreground">{message || "Connecting..."}</p>
+        <p className="mt-6 text-xs text-muted-foreground select-text cursor-text">{message || "Connecting..."}</p>
       ) : (
         <div className="mt-6 flex w-full max-w-xs flex-col items-center gap-4">
-          <p className="text-center text-xs text-red-400">{error}</p>
+          <p className="text-center text-xs text-red-400 select-text cursor-text">{error}</p>
           <div className="flex w-full gap-2">
             <button
               className="flex-1 rounded-lg border border-border bg-[var(--color-surface-2)] py-2 text-xs font-semibold text-foreground hover:bg-white/5"
@@ -319,15 +319,18 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
   // Load hosts for picker (only when no host is pre-selected)
   useEffect(() => {
+    let cancelled = false;
     if (!tab.sftpHostId) {
       sftpCall<{ hosts: Host[]; groups: HostGroup[] }>("list_hosts")
         .then((v) => {
+          if (cancelled) return;
           setAllHosts(v.hosts);
           setAllGroups(v.groups || []);
         })
         .catch(() => {});
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; };
+  }, [tab.sftpHostId]);
 
   const [selectedLocal, setSelectedLocal] = useState<Set<string>>(new Set());
   const [selectedRemote, setSelectedRemote] = useState<Set<string>>(new Set());
@@ -999,10 +1002,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
   // Auto-connect on mount if hostId is pre-set
   useEffect(() => {
-    if (tab.sftpHostId && !isConnected) {
+    if (tab.sftpHostId && !isConnectedRef.current) {
       void handleConnect();
     }
     return () => {
+      // Disconnect when component unmounts. Disconnecting removes the keepalive and session.
       connectCleanupRef.current?.();
       connectCleanupRef.current = null;
       void sftpCall("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
@@ -1697,6 +1701,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
         sessionId={sftpSessionId}
         path={permTarget ?? ""}
         onClose={() => setPermTarget(null)}
+        onApplied={() => { if (remotePath) void loadRemoteDir(remotePath); }}
       />
 
       {/* Open With dialog */}

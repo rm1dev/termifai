@@ -104,6 +104,7 @@ export interface Snippet {
   /** Restricts which hosts this snippet is offered on. Empty/absent = all OS. */
   osTargets?: SnippetOsTarget[];
   createdAt?: string; // ISO date string
+  runAsSudo?: boolean;
 }
 
 export type SshKeyType = "ed25519" | "rsa";

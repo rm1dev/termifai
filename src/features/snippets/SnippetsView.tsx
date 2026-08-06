@@ -42,6 +42,7 @@ import {
   listSnippets,
   removeSnippetGroup,
   removeSnippets,
+  reorderSnippetGroups,
   reorderSnippets,
   saveSnippet,
   saveSnippetGroup,
@@ -163,9 +164,41 @@ export function SnippetsView() {
     }
   };
 
+  const reorderGroups = async (siblingOrder: string[]) => {
+    if (siblingOrder.length === 0) return;
+    const firstId = siblingOrder[0];
+    const firstGroup = groups.find((group) => group.id === firstId);
+    if (!firstGroup) return;
+
+    const parentId = firstGroup.parentId;
+    const groupsById = new Map(groups.map((group) => [group.id, group]));
+    let siblingIdx = 0;
+    const reorderedGroups = groups.map((group) => (
+      group.parentId === parentId ? groupsById.get(siblingOrder[siblingIdx++])! : group
+    ));
+    setGroups(reorderedGroups);
+    try {
+      await reorderSnippetGroups(siblingOrder);
+      notifySnippetsChanged();
+    } catch (err) {
+      console.error("Failed to reorder snippet groups:", err);
+      try {
+        const data = await listSnippets();
+        setSnippets(data.snippets);
+        setGroups(data.groups);
+      } catch (reloadErr) {
+        console.error("Failed to reload snippets after group reorder:", reloadErr);
+      }
+    }
+  };
+
+
   const selectedIds = Array.from(selected);
 
-  const getSnippetContent = (s: Snippet) => s.body || s.command || s.script || "";
+  const getSnippetContent = (s: Snippet) => {
+    if (s.kind === "script") return "";
+    return s.body || s.command || "";
+  };
 
   const visibleSnippets = snippets.filter((s) => {
     if (!query.trim()) return true;
@@ -173,6 +206,9 @@ export function SnippetsView() {
     return s.name.toLowerCase().includes(q) || getSnippetContent(s).toLowerCase().includes(q);
   });
 
+  const dragSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
+  );
   const rootSnippets = visibleSnippets.filter((s) => !s.groupId);
   const rootGroups = groups.filter((g) => !g.parentId);
   const isSearching = query.trim().length > 0;
@@ -265,27 +301,47 @@ export function SnippetsView() {
             />
           ) : (
             <>
-              {rootGroups.map((g) => (
-                <SnippetGroupNode
-                  key={g.id}
-                  group={g}
-                  depth={0}
-                  groups={groups}
-                  snippets={visibleSnippets}
-                  selected={selected}
-                  collapsed={collapsed}
-                  onToggle={toggleCollapse}
-                  toggleSelect={toggleSelect}
-                  getSnippetContent={getSnippetContent}
-                  onAddSubgroup={(parentId) => setGroupModal({ open: true, parentId, group: null })}
-                  onAddSnippet={(groupId) => setEditor({ open: true, snippet: null, groupId })}
-                  onEditGroup={(group) => setGroupModal({ open: true, parentId: group.parentId, group })}
-                  onDeleteGroup={(id) => void removeGroup(id)}
-                  onEdit={(s) => setEditor({ open: true, snippet: s })}
-                  onRemove={(id) => setRemoving([id])}
-                  onReorder={(ids) => void reorder(ids)}
-                />
-              ))}
+              <DndContext
+                sensors={dragSensors}
+                collisionDetection={closestCenter}
+                modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+                onDragEnd={(e: DragEndEvent) => {
+                  const { active, over } = e;
+                  if (!over || active.id === over.id) return;
+                  const activeGroup = groups.find((g) => g.id === active.id);
+                  const overGroup = groups.find((g) => g.id === over.id);
+                  if (activeGroup && overGroup && activeGroup.parentId === overGroup.parentId) {
+                    const siblingGroups = groups.filter((g) => g.parentId === activeGroup.parentId);
+                    const ids = siblingGroups.map((g) => g.id);
+                    const from = ids.indexOf(active.id as string);
+                    const to = ids.indexOf(over.id as string);
+                    if (from !== -1 && to !== -1) void reorderGroups(arrayMove(ids, from, to));
+                  }
+                }}
+              >
+                <SortableContext items={rootGroups.map((group) => group.id)} strategy={verticalListSortingStrategy}>
+                  {rootGroups.map((g) => (
+                    <SortableSnippetGroupNode
+                      key={g.id}
+                      group={g}
+                      groups={groups}
+                      snippets={visibleSnippets}
+                      selected={selected}
+                      collapsed={collapsed}
+                      onToggle={toggleCollapse}
+                      toggleSelect={toggleSelect}
+                      getSnippetContent={getSnippetContent}
+                      onAddSubgroup={(parentId) => setGroupModal({ open: true, parentId, group: null })}
+                      onAddSnippet={(groupId) => setEditor({ open: true, snippet: null, groupId })}
+                      onEditGroup={(group) => setGroupModal({ open: true, parentId: group.parentId, group })}
+                      onDeleteGroup={(id) => void removeGroup(id)}
+                      onEdit={(s) => setEditor({ open: true, snippet: s })}
+                      onRemove={(id) => setRemoving([id])}
+                      onReorder={(ids) => void reorder(ids)}
+                    />
+                  ))}
+                </SortableContext>
+              </DndContext>
               <SnippetsList
                 snippets={rootSnippets}
                 selected={selected}
@@ -300,7 +356,7 @@ export function SnippetsView() {
         </div>
       )}
 
-      {(editor.open) && (
+      {editor.open && (
         <SnippetModal
           snippet={editor.snippet ?? null}
           groups={groups}
@@ -309,7 +365,6 @@ export function SnippetsView() {
           onSubmit={(s) => { void upsert(s); setEditor({ open: false }); }}
         />
       )}
-
       {groupModal.open && (
         <SnippetGroupModal
           groups={groups}
@@ -319,7 +374,6 @@ export function SnippetsView() {
           onSubmit={(name, parentId) => void upsertGroup(name, parentId, groupModal.group?.id)}
         />
       )}
-
       {removing && (
         <RemoveSnippetModal
           count={removing.length}
@@ -359,10 +413,7 @@ function descendantGroupIds(groups: SnippetGroup[], id: string): string[] {
 }
 
 /* ---- Group rendering (recursive) ---- */
-function SnippetGroupNode({
-  group, depth, groups, snippets, selected, collapsed, onToggle, toggleSelect, getSnippetContent,
-  onAddSubgroup, onAddSnippet, onEditGroup, onDeleteGroup, onEdit, onRemove, onReorder,
-}: {
+type SnippetGroupNodeProps = {
   group: SnippetGroup;
   depth: number;
   groups: SnippetGroup[];
@@ -379,7 +430,13 @@ function SnippetGroupNode({
   onEdit: (s: Snippet) => void;
   onRemove: (id: string) => void;
   onReorder: (ids: string[]) => void;
-}) {
+  dragHandle?: React.ReactNode;
+};
+
+function SnippetGroupNode({
+  group, depth, groups, snippets, selected, collapsed, onToggle, toggleSelect, getSnippetContent,
+  onAddSubgroup, onAddSnippet, onEditGroup, onDeleteGroup, onEdit, onRemove, onReorder, dragHandle,
+}: SnippetGroupNodeProps) {
   const isOpen = !collapsed[group.id];
   const children = groups.filter((g) => g.parentId === group.id);
   const groupSnippets = snippets.filter((s) => s.groupId === group.id);
@@ -387,6 +444,7 @@ function SnippetGroupNode({
   return (
     <div className="mb-2" style={{ marginLeft: depth * 16 }}>
       <div className="group flex items-center gap-1.5 rounded-md px-1.5 py-1 hover:bg-[var(--color-surface)]">
+        {dragHandle}
         <button
           onClick={() => onToggle(group.id)}
           className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-[var(--color-surface-2)] hover:text-foreground"
@@ -432,27 +490,31 @@ function SnippetGroupNode({
 
       {isOpen && (
         <div className="mt-1.5 pl-4">
-          {children.map((c) => (
-            <SnippetGroupNode
-              key={c.id}
-              group={c}
-              depth={depth + 1}
-              groups={groups}
-              snippets={snippets}
-              selected={selected}
-              collapsed={collapsed}
-              onToggle={onToggle}
-              toggleSelect={toggleSelect}
-              getSnippetContent={getSnippetContent}
-              onAddSubgroup={onAddSubgroup}
-              onAddSnippet={onAddSnippet}
-              onEditGroup={onEditGroup}
-              onDeleteGroup={onDeleteGroup}
-              onEdit={onEdit}
-              onRemove={onRemove}
-              onReorder={onReorder}
-            />
-          ))}
+          {children.length > 0 && (
+            <SortableContext items={children.map((c) => c.id)} strategy={verticalListSortingStrategy}>
+              {children.map((c) => (
+                <SortableSnippetGroupNode
+                  key={c.id}
+                  group={c}
+                  depth={depth + 1}
+                  groups={groups}
+                  snippets={snippets}
+                  selected={selected}
+                  collapsed={collapsed}
+                  onToggle={onToggle}
+                  toggleSelect={toggleSelect}
+                  getSnippetContent={getSnippetContent}
+                  onAddSubgroup={onAddSubgroup}
+                  onAddSnippet={onAddSnippet}
+                  onEditGroup={onEditGroup}
+                  onDeleteGroup={onDeleteGroup}
+                  onEdit={onEdit}
+                  onRemove={onRemove}
+                  onReorder={onReorder}
+                />
+              ))}
+            </SortableContext>
+          )}
           {groupSnippets.length > 0 && (
             <SnippetsList
               snippets={groupSnippets}
@@ -466,6 +528,38 @@ function SnippetGroupNode({
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function SortableSnippetGroupNode(props: Omit<SnippetGroupNodeProps, "depth" | "dragHandle"> & { depth?: number }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: props.group.id });
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform ? { ...transform, x: 0, scaleX: 1, scaleY: 1 } : null),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 10 : undefined,
+    position: "relative",
+    background: isDragging ? "var(--color-surface-2)" : undefined,
+  };
+
+  return (
+    <div ref={setNodeRef} style={style}>
+      <SnippetGroupNode
+        {...props}
+        depth={props.depth ?? 0}
+        dragHandle={
+          <button
+            type="button"
+            {...attributes}
+            {...listeners}
+            onClick={(e) => e.stopPropagation()}
+            className="flex h-6 w-5 shrink-0 cursor-grab items-center justify-center text-muted-foreground/50 opacity-0 transition-opacity hover:text-muted-foreground group-hover:opacity-100 active:cursor-grabbing"
+          >
+            <GripVertical className="h-3.5 w-3.5" />
+          </button>
+        }
+      />
     </div>
   );
 }
@@ -619,7 +713,14 @@ function SnippetListRow({
         <KindIcon className="h-4 w-4" />
       </span>
       <div className="w-48 shrink-0 truncate text-sm font-medium text-foreground">{s.name}</div>
-      <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+      <div className="shrink-0 flex items-center gap-1.5">
+        <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+        {s.runAsSudo && (
+          <span className="rounded bg-red-600 px-1 py-0.5 text-[8px] font-black text-white uppercase tracking-wider select-none leading-none">
+            sudo
+          </span>
+        )}
+      </div>
       <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
         <button
@@ -828,6 +929,7 @@ function SnippetModal({
   const [body, setBody] = useState(snippet?.body ?? "");
   const [command, setCommand] = useState(snippet?.command ?? "");
   const [script, setScript] = useState(snippet?.script ?? "");
+  const [runAsSudo, setRunAsSudo] = useState(snippet?.runAsSudo ?? false);
   const [groupId, setGroupId] = useState<string | null>(snippet?.groupId ?? defaultGroupId ?? null);
   const [keyword, setKeyword] = useState(snippet?.keyword ?? "");
   const [osTargets, setOsTargets] = useState<SnippetOsTarget[]>(
@@ -924,9 +1026,23 @@ function SnippetModal({
             </Field>
           )}
           {kind === "script" && (
-            <Field label="Script">
-              <CodeEditor value={script} onChange={setScript} placeholder="#!/bin/bash" minRows={10} />
-            </Field>
+            <>
+              <Field label="Script">
+                <CodeEditor value={script} onChange={setScript} placeholder="#!/bin/bash" minRows={10} />
+              </Field>
+              <div className="flex items-center gap-2 pt-1">
+                <input
+                  type="checkbox"
+                  id="runAsSudo"
+                  checked={runAsSudo}
+                  onChange={(e) => setRunAsSudo(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border border-border bg-[var(--color-surface)] text-[var(--color-brand-orange)] accent-[var(--color-brand-orange)] focus:ring-ring cursor-pointer"
+                />
+                <label htmlFor="runAsSudo" className="text-xs font-medium text-foreground cursor-pointer select-none">
+                  Run as sudoer (execute script with root privileges)
+                </label>
+              </div>
+            </>
           )}
           {/* Variables section */}
           <div className="space-y-2">
@@ -1047,6 +1163,7 @@ function SnippetModal({
               keyword: kind === "text" ? keyword.trim() || undefined : undefined,
               osTargets: osTargets.includes("all") ? [] : osTargets,
               createdAt: snippet?.createdAt ?? new Date().toISOString(),
+              runAsSudo: kind === "script" ? runAsSudo : undefined,
             })}
             disabled={!valid}
             className="h-8 rounded-md bg-[var(--color-brand-orange)] px-3 text-xs font-semibold text-[var(--color-primary-foreground)] disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"

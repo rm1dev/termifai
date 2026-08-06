@@ -246,6 +246,15 @@ impl PtyManager {
                                     let _ = tx.send(cleaned);
                                 }
                                 pending_output.clear();
+                            } else if is_password_change_or_interactive_prompt(
+                                &pending_output,
+                                password_sent,
+                                password_for_prompt.is_none(),
+                            ) {
+                                ready = true;
+                                connection_tracker.complete();
+                                let _ = tx.send(strip_debug_logs(&pending_output));
+                                pending_output.clear();
                             } else if pending_output.len() > 8192 {
                                 let keep_from = pending_output.len().saturating_sub(8192);
                                 pending_output = pending_output[keep_from..].to_string();
@@ -514,6 +523,14 @@ impl ConnectionTracker {
                 "handshaking",
                 "Host key not verified. Check SSH client version.",
             );
+        } else if lower.contains("remote host identification has changed")
+            || (lower.contains("host key for") && lower.contains("has changed"))
+            || (lower.contains("host key verification failed") && lower.contains("offending"))
+        {
+            self.fail(
+                "handshaking",
+                "Host key verification failed: Remote host key has changed.",
+            );
         } else if lower.contains("host key verification failed")
             || lower.contains("no matching host key type")
             || lower.contains("no matching key exchange method")
@@ -659,9 +676,150 @@ fn find_ready_marker_line(output: &str, marker: &str) -> Option<usize> {
     None
 }
 
+fn is_password_change_or_interactive_prompt(
+    pending: &str,
+    password_sent: bool,
+    password_for_prompt_is_none: bool,
+) -> bool {
+    let lower = pending.to_lowercase();
+    let cleaned = strip_ansi_escapes(&lower);
+
+    let password_change_keywords = [
+        "changing password for",
+        "password has expired",
+        "password expired",
+        "must change password",
+        "must change your password",
+        "current password",
+        "current unix password",
+        "(current) unix password",
+        "(current) password",
+        "enter current password",
+        "enter existing password",
+        "new password",
+        "retype new password",
+        "confirm new password",
+        "enter new password",
+        "enter new unix password",
+    ];
+
+    for kw in &password_change_keywords {
+        if cleaned.contains(kw) {
+            return true;
+        }
+    }
+
+    let otp_prompts = [
+        "passcode:",
+        "verification code:",
+        "otp:",
+        "two-factor",
+        "2fa",
+    ];
+    for prompt in &otp_prompts {
+        if cleaned.contains(prompt) {
+            return true;
+        }
+    }
+
+    // If no password was provided in vault, open terminal on initial password prompt so user can type it
+    if password_for_prompt_is_none && cleaned.contains("password:") {
+        return true;
+    }
+
+    // If stored password was auto-injected, open terminal ONLY if a SECOND password prompt appears (auth failure retry)
+    if password_sent && cleaned.contains("password:") {
+        // Count how many times 'password:' appears to distinguish the initial prompt (1) from retry prompt (2)
+        let count = cleaned.matches("password:").count();
+        if count > 1 {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn strip_debug_logs(output: &str) -> String {
+    output
+        .lines()
+        .filter(|line| {
+            let bare = strip_ansi_escapes(line.trim_start());
+            !bare.starts_with("debug1: ")
+                && !bare.starts_with("debug2: ")
+                && !bare.starts_with("debug3: ")
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+fn strip_ansi_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if let Some(&next) = chars.peek() {
+                if next == '[' || next == ']' {
+                    chars.next(); // Consume '[' or ']'
+                    while let Some(&inner) = chars.peek() {
+                        chars.next();
+                        if inner.is_ascii_alphabetic() || inner == '\x07' || inner == '\x1b' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_password_change_prompts() {
+        assert!(is_password_change_or_interactive_prompt(
+            "WARNING: Your password has expired.\nChanging password for user603.\n(current) UNIX password:",
+            true,
+            false
+        ));
+        assert!(is_password_change_or_interactive_prompt(
+            "\x1b[31mNew password:\x1b[0m",
+            false,
+            false
+        ));
+        assert!(is_password_change_or_interactive_prompt(
+            "Enter current password:",
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn detects_secondary_password_prompt_after_sent() {
+        // Single password prompt when password_sent is true should NOT trigger ready (keeps debug logs hidden)
+        assert!(!is_password_change_or_interactive_prompt(
+            "debug1: Next authentication method: password\nreza@192.168.2.22's password: ",
+            true,
+            false
+        ));
+        // Double password prompt (auth retry) when password_sent is true SHOULD trigger ready
+        assert!(is_password_change_or_interactive_prompt(
+            "reza@192.168.2.22's password: \nPermission denied, please try again.\nreza@192.168.2.22's password: ",
+            true,
+            false
+        ));
+        // Single password prompt when password_for_prompt is none SHOULD trigger ready (for manual password entry)
+        assert!(is_password_change_or_interactive_prompt(
+            "reza@192.168.2.22's password: ",
+            false,
+            true
+        ));
+    }
 
     #[test]
     fn kill_all_empties_sessions() {

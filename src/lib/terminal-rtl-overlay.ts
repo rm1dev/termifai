@@ -438,15 +438,25 @@ export function attachRtlOverlay(
           bg = fg;
           fg = swappedFg;
         }
-        const key = styleKey(fg, bg, bold, dim, italic);
+        const isRtlChar = isStrongRtlCodePoint(chars.codePointAt(0) || 0) || (chars.charCodeAt(0) >= 0x0600 && chars.charCodeAt(0) <= 0x06ff);
+        const key = styleKey(fg, bg, bold, dim, italic) + (isRtlChar ? "|RTL" : "|LTR");
 
-        if (!currentSpan || key !== currentKey) {
+        const forceNewSpan = !isRtlChar;
+
+        if (!currentSpan || key !== currentKey || forceNewSpan) {
           currentSpan = document.createElement("span");
           currentSpan.style.color = fg;
           if (bg) currentSpan.style.backgroundColor = bg;
           if (bold) currentSpan.style.fontWeight = "bold";
           if (dim) currentSpan.style.opacity = "0.55";
           if (italic) currentSpan.style.fontStyle = "italic";
+          
+          if (!isRtlChar) {
+            currentSpan.style.display = "inline-block";
+            currentSpan.style.width = `${dims.cellW * width}px`;
+            currentSpan.style.textAlign = "center";
+          }
+          
           lineEl.appendChild(currentSpan);
           currentKey = key;
         }

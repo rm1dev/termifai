@@ -11,6 +11,7 @@ import {
   onConnectionStatus,
   onSessionExited,
   onSessionOutput,
+  removeKnownHost,
   resizeSession,
   runSnippetScript,
   writeToSession,
@@ -83,7 +84,7 @@ import {
 import { TerminalFindBar } from "@/components/app/TerminalFindBar";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import type { OsKind, Snippet, SnippetGroup } from "@/components/app/types";
-import { Search } from "lucide-react";
+import { Search, Copy, Check, AlertTriangle, RefreshCw } from "lucide-react";
 
 interface Props {
   sessionId?: string;
@@ -240,14 +241,23 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatusPayload>(initialConnectionStatus);
   const [connectionLogs, setConnectionLogs] = useState<string[]>([]);
   const [showConnectionLogs, setShowConnectionLogs] = useState(false);
+  const [logsCopied, setLogsCopied] = useState(false);
   const [reconnectState, setReconnectState] = useState<ReconnectState | null>(null);
+
+  const handleCopyConnectionLogs = useCallback(() => {
+    if (connectionLogs.length === 0) return;
+    const text = connectionLogs.join("\n");
+    void navigator.clipboard.writeText(text);
+    setLogsCopied(true);
+    setTimeout(() => setLogsCopied(false), 2000);
+  }, [connectionLogs]);
   const [snippetPalette, setSnippetPalette] = useState(false);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
   const [snippetGroups, setSnippetGroups] = useState<SnippetGroup[]>([]);
   const [snippetQuery, setSnippetQuery] = useState("");
   const [snippetIndex, setSnippetIndex] = useState(0);
   const [variablePrompt, setVariablePrompt] = useState<{ snippet: Snippet; values: Record<string, string>; currentIdx: number } | null>(null);
-  // Find bar — کوئری توکنی + گزینه‌ها، مشابه ترمینال مک
+  // Find bar — tokenized query + options, similar to Mac terminal
   const [findOpen, setFindOpen] = useState(false);
   const [findParts, setFindParts] = useState<FindPart[]>([]);
   const [findOptions, setFindOptions] = useState<FindOptions>(defaultFindOptions);
@@ -266,8 +276,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   // keyword -> snippet, for the text-only auto-expand feature. Only snippets
   // with no variables are eligible (mid-line variable prompts would be jarring).
   const keywordSnippetsRef = useRef<Map<string, Snippet>>(new Map());
-  // متن تایپ‌شده از آخرین Enter — مستقیم از keystroke، نه از بافر xterm
-  // (اکوی PTY دیرتر می‌رسه). برای keyword expand و گیت command/script.
+  // Text typed since last Enter — directly from keystroke, not from xterm buffer
+  // (PTY echo arrives later). Used for keyword expand and git command/script.
   const lineTrackerRef = useRef<LineTrackerState>(emptyLineTracker());
   const noteInjectedInput = (text: string) => {
     lineTrackerRef.current = applyInjectedTextToLineTracker(lineTrackerRef.current, text);
@@ -282,7 +292,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const searchAddonRef = useRef<SearchAddon | null>(null);
   const highlighterRef = useRef<ReturnType<typeof attachSemanticHighlighter> | null>(null);
   const rtlOverlayRef = useRef<ReturnType<typeof attachRtlOverlay> | null>(null);
-  // اکشن‌های Find از داخل key handler ترمینال (mount effect) صدا زده می‌شن
+  // Find actions are called from inside the terminal key handler (mount effect)
   const openFindRef = useRef<() => void>(() => {});
   const findNextActionRef = useRef<(incremental?: boolean) => void>(() => {});
   const findPreviousActionRef = useRef<() => void>(() => {});
@@ -290,7 +300,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const findPartsRef = useRef(findParts);
   const findOpenRef = useRef(findOpen);
   const appThemeRef = useRef<AppTheme>(loadAppTheme());
-  // Cmd+K / منوی Clear — داخل effect ساخته می‌شه چون به term و highlighter نیاز داره
+  // Cmd+K / Clear menu — created inside effect because it needs term and highlighter
   const clearTerminalRef = useRef<(() => void) | null>(null);
   const isInitializedRef = useRef(false);
   const mountCountRef = useRef(0);
@@ -307,7 +317,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     isActiveRef.current = isActive;
   }, [isActive]);
 
-  const clearReconnectTimers = () => {
+  const clearReconnectTimers = useCallback(() => {
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
       reconnectTimeoutRef.current = null;
@@ -316,7 +326,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       clearInterval(reconnectIntervalRef.current);
       reconnectIntervalRef.current = null;
     }
-  };
+  }, []);
 
   // Called whenever the PTY session ends unexpectedly. For SSH tabs (hostId
   // present) this kicks off the auto-reconnect flow; local shells just get
@@ -417,16 +427,71 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   };
 
   // Manual reconnect from the "failed" screen, or a manual retry at any point.
-  const manualReconnect = () => {
+  const manualReconnect = useCallback(() => {
     clearReconnectTimers();
     reconnectAttemptRef.current = 0;
     void performReconnect(1).catch(() => {});
-  };
+  }, []);
+
+  const [isResettingHostKey, setIsResettingHostKey] = useState(false);
+
+  const isHostKeyChanged =
+    connectionStatus.status === "failed" &&
+    (connectionStatus.message.toLowerCase().includes("host key") ||
+      connectionLogs.some(
+        (log) =>
+          log.toLowerCase().includes("identification has changed") ||
+          log.toLowerCase().includes("host key verification failed") ||
+          log.toLowerCase().includes("host key for")
+      ));
+
+  useEffect(() => {
+    if (isHostKeyChanged) {
+      clearReconnectTimers();
+      setReconnectState(null);
+    }
+  }, [isHostKeyChanged, clearReconnectTimers]);
+
+  const handleResetHostKey = useCallback(async () => {
+    setIsResettingHostKey(true);
+    try {
+      let target = connectionLabel || initialCommand || "";
+      if (!target) {
+        for (const log of connectionLogs) {
+          let match = log.match(/Host key for (.*?) has changed/i);
+          if (match && match[1]) { target = match[1]; break; }
+          
+          match = log.match(/Authenticating to ([^\s:]+)/i);
+          if (match && match[1]) { target = match[1]; break; }
+          
+          match = log.match(/Connecting to ([^\s]+)/i);
+          if (match && match[1]) { target = match[1]; break; }
+        }
+      }
+
+      if (!target) {
+        throw new Error("Could not determine host IP to reset");
+      }
+
+      await removeKnownHost(target);
+      setShowConnectionLogs(false);
+      setIsResettingHostKey(false);
+      setConnectionStatus({
+        stage: "connecting",
+        status: "active",
+        message: "Host key reset. Please connect again.",
+      });
+    } catch (err) {
+      console.error("Failed to reset host key:", err);
+    } finally {
+      setIsResettingHostKey(false);
+    }
+  }, [connectionLabel, initialCommand, connectionLogs, clearReconnectTimers]);
 
   // ── Terminal clipboard actions (context menu + Windows right-click) ───────
   const copySelection = useCallback(() => {
     const term = termRef.current;
-    // روی خطوط فارسی/عربی، ستون‌های selection بصری‌ان نه منطقی — نگاشت لازمه
+    // On Persian/Arabic lines, selection columns are visual not logical — mapping needed
     const selection = term ? getRtlAwareSelection(term) : "";
     if (term && selection) {
       navigator.clipboard.writeText(selection).catch(() => {});
@@ -437,7 +502,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const pasteClipboard = useCallback(() => {
     const sid = sessionRef.current;
     if (!sid) return;
-    // از مسیر native می‌خونیم که حباب تأیید Paste مک ظاهر نشه
+    // Read from native path so Mac's Paste confirmation bubble doesn't appear
     readClipboardText()
       .then((text) => {
         if (!text) return;
@@ -471,7 +536,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     const addon = searchAddonRef.current;
     const term = termRef.current;
     if (!addon || !term) return;
-    // onDidChangeResults قبل از snap ایندکس -1 می‌ده (Previous کوتاه)؛ خودمون درستش می‌کنیم
+    // onDidChangeResults returns index -1 before snap (short Previous); we fix it ourselves
     const meta = getFindResultMeta(addon, term);
     setFindResultIndex(meta.index);
     setFindResultCount(meta.count);
@@ -541,8 +606,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     const term = termRef.current;
     if (!term) return;
     const base = xtermTheme(appThemeRef.current);
-    // SearchAddon بعد از paste دوباره select می‌کنه؛ اگه FG selection سیاه باشه
-    // روی پس‌زمینهٔ تیرهٔ decoration متن غیب می‌شه — FG روشن اجباری می‌کنیم
+    // SearchAddon selects again after paste; if selection FG is black
+    // text disappears on dark decoration background — force light FG
     term.options.theme = enabled
       ? { ...base, selectionForeground: appThemeRef.current.xterm.brightWhite || "#ffffff" }
       : base;
@@ -550,16 +615,16 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   const openFind = useCallback(() => {
     const term = termRef.current;
-    // نگاشت RTL — تا سرچ با کلمه‌ای که کاربر «می‌بینه» سید بشه نه بایت‌های خام بافر
+    // RTL mapping — so search is seeded with what the user "sees" not raw buffer bytes
     const selection = term ? getRtlAwareSelection(term).trim() : "";
     if (selection && !findPartsRef.current.length) {
-      // اگه چیزی select شده، همون رو بذار تو ورودی Find
+      // If something is selected, put it in the Find input
       const seeded: FindPart[] = [{ kind: "text", value: selection }];
       setFindParts(seeded);
       findPartsRef.current = seeded;
     }
     clearFindSelectionAnchor();
-    // semantic highlight با decorationهای Find قاطی می‌شه — تا بسته شدن Find خاموش
+    // Semantic highlight mixes with Find decorations — disabled until Find closes
     highlighterRef.current?.setPaused(true);
     applyFindSelectionTheme(true);
     setFindOpen(true);
@@ -583,13 +648,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     findPreviousActionRef.current = runFindPrevious;
   }, [openFind, runFindNext, runFindPrevious]);
 
-  // با تغییر کوئری/گزینه، جستجوی incremental بزن
+  // On query/option change, trigger incremental search
   useEffect(() => {
     if (!findOpen) return;
     runFindNext(true);
   }, [findOpen, findParts, findOptions, runFindNext]);
 
-  // SearchAddon بعد از paste/write دوباره select می‌کنه — همون لحظه پاکش کن
+  // SearchAddon selects again after paste/write — clear it immediately
   useEffect(() => {
     if (!findOpen) return;
     const term = termRef.current;
@@ -599,12 +664,12 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       if (!term.hasSelection()) return;
       finalizeFindSelection(term);
     });
-    // اگه از قبل selection مونده، همین الان پاک کن
+    // If there's a leftover selection, clear it right now
     if (term.hasSelection()) finalizeFindSelection(term);
     return () => disp.dispose();
   }, [findOpen]);
 
-  // وقتی فوکوس روی ورودی Find هست، xterm کلید رو نمی‌بینه — از window می‌گیریم
+  // When Find input is focused, xterm doesn't see keys — we get them from window
   useEffect(() => {
     if (!findOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -755,8 +820,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       allowProposedApi: true,
     });
 
-    // جدول عرض یونیکد ۶ اموجی‌ها رو تک‌سلولی می‌بینه؛ نسخه ۱۱ عرض درست (۲ سلول) می‌ده
-    // تا گلیف پهن روی حرف بعدی نره (مثل 🚀Server بدون فاصله)
+    // Unicode 6 width table sees emojis as single-cell; version 11 gives correct width (2 cells)
+    // So wide glyphs don't overlap the next character (like 🚀Server without space)
     term.loadAddon(new Unicode11Addon());
     term.unicode.activeVersion = "11";
 
@@ -798,12 +863,12 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     // OSC52 clipboard support: remote programs (tmux, nvim, …) can push
     // copied text to the system clipboard through this escape sequence.
     term.loadAddon(new ClipboardAddon());
-    // باگ شمارش overlapping regex در addon-search@0.16 رو قبل از ساخت پچ کن
+    // Patch overlapping regex counting bug in addon-search@0.16 before building
     patchSearchAddonNonOverlappingHighlights();
     const searchAddon = new SearchAddon();
     term.loadAddon(searchAddon);
     searchAddonRef.current = searchAddon;
-    // بعد از تایپ، addon با _updateMatches دوباره findPrevious می‌زنه — snap/clear/ایندکس
+    // After typing, addon hits findPrevious again via _updateMatches — snap/clear/index
     const resultsDisp = searchAddon.onDidChangeResults((e) => {
       if (findOpenRef.current && !isFindSelectionClearSuppressed()) {
         if (term.hasSelection()) {
@@ -829,20 +894,20 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     appThemeRef.current = appTheme;
     const highlighter = attachSemanticHighlighter(term, () => currentTheme.xterm);
     highlighterRef.current = highlighter;
-    // لایه RTL: shaping مرورگر + selection بدون شکستن حروف
+    // RTL layer: browser shaping + selection without breaking characters
     const rtlOverlay = attachRtlOverlay(term, () => currentTheme.xterm);
     rtlOverlayRef.current = rtlOverlay;
 
-    // Cmd+K نباید فقط term.clear() همگام بزنه:
-    // ۱) clear() با صف write قاطی می‌شه و خروجی pending کرسر رو وسط صفحه می‌بره
-    // ۲) شل از clear لوکال خبر نداره؛ prompt چندخطی/starship با offset غلط redraw می‌کنه
-    //    → چند خط اول ls و مشابه «غیب» می‌شن یا از وسط viewport شروع می‌شن
-    // ۳) clearAllMarkers هایلایتر رو بدون refresh ول می‌کنه
-    // راه‌حل: ED3 از صف write (پاک‌کردن اسکرول‌بک) + Ctrl+L به شل (صفحه + sync کرسر/prompt)
+    // Cmd+K shouldn't just run synchronous term.clear():
+    // 1) clear() mixes with write queue and moves pending cursor output to middle of screen
+    // 2) Shell doesn't know about local clear; multiline prompts/starship redraw with wrong offset
+    //    -> first few lines of ls etc. "disappear" or start from middle of viewport
+    // 3) clearAllMarkers leaves highlighter without refresh
+    // Solution: ED3 from write queue (clear scrollback) + Ctrl+L to shell (screen + sync cursor/prompt)
     const clearTerminalBuffer = () => {
       searchAddon.clearDecorations();
       if (term.buffer.active.type === "alternate") {
-        // vim و مشابه: فقط viewport؛ Ctrl+L نده که با برنامه قاطی نشه
+        // vim etc: viewport only; don't send Ctrl+L to avoid messing with app
         term.write("\x1b[H\x1b[2J", () => {
           if (!destroyed) {
             highlighter.refresh();
@@ -865,7 +930,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
           console.error("clear terminal failed:", err);
         });
       } else {
-        // هنوز session نداریم — فقط emulator رو خالی کن
+        // No session yet — just clear the emulator
         term.write("\x1b[H\x1b[2J", () => {
           if (!destroyed) {
             highlighter.refresh();
@@ -894,7 +959,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
       if (shortcuts["terminal-copy"] && isShortcutMatch(event, shortcuts["terminal-copy"])) {
         if (event.type === "keydown") {
-          // نسخه RTL-aware — رو خطوط فارسی متن دیده‌شده رو کپی می‌کنه نه بافر خام
+          // RTL-aware version — on Persian lines it copies visible text not raw buffer
           const selection = getRtlAwareSelection(term);
           if (selection) {
             navigator.clipboard.writeText(selection).catch(() => {});
@@ -1040,13 +1105,13 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     };
     const applyTheme = (theme: AppTheme) => {
       const base = xtermTheme(theme);
-      // اگه Find بازه، FG selection روشن بمونه تا paste متن رو سیاه نکنه
+      // If Find is open, keep selection FG light so paste doesn't make text black
       term.options.theme = findOpenRef.current
         ? { ...base, selectionForeground: theme.xterm.brightWhite || "#ffffff" }
         : base;
       currentTheme = theme;
       appThemeRef.current = theme;
-      // decorationهای Find با پالت قبلی کشیده شدن — با تم جدید دوباره جستجو بزن
+      // Find decorations were drawn with previous palette — search again with new theme
       highlighter.refresh();
       rtlOverlay.refresh();
       if (findOpenRef.current) {
@@ -1133,7 +1198,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         return;
       }
 
-      // Escape sequence ها (فلش‌ها و …) جدا از متن printable پیگیری می‌شن
+      // Escape sequences (arrows, etc.) are tracked separately from printable text
       if (data.startsWith("\x1b")) {
         lineTrackerRef.current = applyEscapeToLineTracker(lineTrackerRef.current, data);
         send(data);
@@ -1350,7 +1415,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
     return () => {
       if (mountId !== mountCountRef.current) {
-        // Strict Mode double-invoke: این mount قدیمیه، فقط clean کن
+        // Strict Mode double-invoke: this mount is old, just clean up
         destroyed = true;
         clearTerminalRef.current = null;
         searchAddonRef.current = null;
@@ -1473,7 +1538,7 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
   // ── Snippet Palette Logic ──────────────────────────────────────────────────
 
-  // command/script فقط وقتی خط ورودی خالیه (نه وسط تایپ / تاریخچه شل)
+  // command/script only when input line is empty (not mid-type / shell history)
   const cursorAtLineStart = () => isAtLineStart(lineTrackerRef.current);
 
   // Full "Parent › Child" path for a snippet's group, or null when ungrouped —
@@ -1535,9 +1600,9 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       writeToSession(sid, cmd + "\r").catch(() => {});
     } else if (snippet.kind === "script") {
       const script = resolveVars(snippet.script ?? "");
-      // اسکریپت از بک‌اند می‌ره بالا؛ خط ورودی رو خالی فرض می‌کنیم
+      // Script executes from backend; assume input line is empty
       lineTrackerRef.current = emptyLineTracker();
-      runSnippetScript(sid, snippet.name, script).catch((err) =>
+      runSnippetScript(sid, snippet.name, script, snippet.runAsSudo).catch((err) =>
         console.error("run_snippet_script failed:", err)
       );
     }
@@ -1629,8 +1694,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
                 <span className="font-mono text-sm font-bold">&gt;_</span>
               </div>
               <div>
-                <h3 className="text-lg font-bold text-foreground">{connectionTitle ?? "SSH Session"}</h3>
-                <p className="mt-0.5 text-sm font-medium text-muted-foreground">{connectionLabel}</p>
+                <h3 className="text-lg font-bold text-foreground select-text cursor-text">{connectionTitle ?? "SSH Session"}</h3>
+                <p className="mt-0.5 text-sm font-medium text-muted-foreground select-text cursor-text">{connectionLabel}</p>
               </div>
             </div>
 
@@ -1668,24 +1733,93 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
             <div className="rounded-2xl bg-[var(--color-surface)] px-5 py-4 text-left">
               <div className="flex items-center justify-between gap-4">
                 <div>
-                  <span className="block text-base font-bold text-foreground">
+                  <span className="block text-base font-bold text-foreground select-text cursor-text">
                     {connectionSteps[safeActiveIndex]?.label ?? "Connecting"}
                   </span>
-                  <span className={`mt-1 block text-xs ${connectionStatus.status === "failed" ? "text-red-400" : "text-muted-foreground"}`}>
+                  <span className={`mt-1 block text-xs select-text cursor-text ${connectionStatus.status === "failed" ? "text-red-400" : "text-muted-foreground"}`}>
                     {connectionStatus.message}
                   </span>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setShowConnectionLogs((show) => !show)}
-                  className="rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-1 text-xs font-semibold text-muted-foreground hover:text-foreground"
-                >
-                  {showConnectionLogs ? "Hide Logs" : "Show Logs"}
-                </button>
+                <div className="flex items-center gap-2">
+                  {showConnectionLogs && connectionLogs.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleCopyConnectionLogs}
+                      className="flex items-center gap-1.5 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-semibold text-muted-foreground transition hover:text-foreground active:scale-95"
+                      title="Copy all connection logs"
+                    >
+                      {logsCopied ? (
+                        <>
+                          <Check className="h-3.5 w-3.5 text-emerald-400" />
+                          <span className="text-emerald-400">Copied</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="h-3.5 w-3.5" />
+                          <span>Copy Logs</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setShowConnectionLogs((show) => !show)}
+                    className="rounded-md border border-border bg-[var(--color-surface-2)] px-3 py-1 text-xs font-semibold text-muted-foreground hover:text-foreground"
+                  >
+                    {showConnectionLogs ? "Hide Logs" : "Show Logs"}
+                  </button>
+                </div>
               </div>
               {showConnectionLogs && (
-                <div className="mt-3 max-h-28 overflow-auto rounded-lg border border-border bg-background/60 p-2 font-mono text-[10px] leading-4 text-muted-foreground">
-                  {connectionLogs.length ? connectionLogs.map((log, index) => <div key={`${index}-${log}`}>{log}</div>) : "Waiting for SSH logs..."}
+                <div className="mt-3 max-h-40 overflow-auto rounded-lg border border-border bg-background/60 p-2.5 font-mono text-[11px] leading-5 text-muted-foreground select-text cursor-text">
+                  {connectionLogs.length ? (
+                    connectionLogs.map((log, index) => (
+                      <div key={`${index}-${log}`} className="select-text cursor-text whitespace-pre-wrap break-all">
+                        {log}
+                      </div>
+                    ))
+                  ) : (
+                    <span className="select-text cursor-text">Waiting for SSH logs...</span>
+                  )}
+                </div>
+              )}
+              {isHostKeyChanged && (
+                <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-left">
+                  <div className="flex items-start gap-3">
+                    <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-400" />
+                    <div className="flex-1">
+                      <h4 className="text-sm font-bold text-amber-300 select-text cursor-text">
+                        Host Key Verification Failed
+                      </h4>
+                      <p className="mt-1 text-xs leading-relaxed text-amber-200/90 select-text cursor-text">
+                        The remote host key for this server has changed since your last connection. This usually happens if the server was reinstalled or its SSH key was rotated.
+                      </p>
+                      <div className="mt-3 flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={isResettingHostKey}
+                          onClick={handleResetHostKey}
+                          className="flex items-center gap-2 rounded-lg bg-amber-500 px-3.5 py-1.5 text-xs font-bold text-black transition hover:bg-amber-400 active:scale-95 disabled:opacity-50"
+                        >
+                          {isResettingHostKey ? (
+                            <span>Resetting host key...</span>
+                          ) : (
+                            <>
+                              <RefreshCw className="h-3.5 w-3.5" />
+                              <span>Reset Host Key</span>
+                            </>
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={closeConnection}
+                          className="flex items-center gap-2 rounded-lg border border-amber-500/50 bg-transparent px-3.5 py-1.5 text-xs font-bold text-amber-500 transition hover:bg-amber-500/10 active:scale-95 disabled:opacity-50"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
@@ -1702,21 +1836,45 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       )}
       {!isConnecting && reconnectState && (reconnectState.phase === "waiting" || reconnectState.phase === "connecting") && (
         <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-3 border-b border-border bg-[var(--color-surface)]/95 px-4 py-2 text-xs backdrop-blur">
-          <div className="flex items-center gap-2">
-            <div className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-muted-foreground border-t-red-400" />
-            <span className="font-medium text-foreground">
-              {reconnectState.phase === "connecting"
-                ? `Reconnecting… (attempt ${reconnectState.attempt} of ${MAX_RECONNECT_ATTEMPTS})`
-                : `Connection lost — retrying (${reconnectState.attempt}/${MAX_RECONNECT_ATTEMPTS}) in ${reconnectState.countdown}s`}
-            </span>
+          <div className="flex items-center gap-3">
+            {reconnectState.phase === "connecting" ? (
+              <div className="flex items-center gap-2">
+                <div className="h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-muted-foreground border-t-red-400" />
+                <span className="font-medium text-foreground">
+                  Reconnecting… (attempt {reconnectState.attempt} of {MAX_RECONNECT_ATTEMPTS})
+                </span>
+              </div>
+            ) : (
+              <div className="flex items-center gap-3">
+                <div className="relative flex h-6 w-6 items-center justify-center">
+                  <svg className="h-full w-full -rotate-90 transform" viewBox="0 0 24 24">
+                    <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" fill="none" className="text-muted/30" />
+                    <circle 
+                      cx="12" cy="12" r="10" 
+                      stroke="currentColor" 
+                      strokeWidth="2" 
+                      fill="none" 
+                      strokeDasharray="62.83" 
+                      strokeDashoffset={Math.max(0, 62.83 - (62.83 * (reconnectState.countdown / (RECONNECT_DELAYS_SEC[reconnectState.attempt - 1] || 1))))} 
+                      className="text-red-400 transition-all duration-1000 ease-linear" 
+                    />
+                  </svg>
+                  <span className="absolute text-[9px] font-bold text-foreground">{reconnectState.countdown}</span>
+                </div>
+                <span className="font-medium text-foreground">
+                  Connection lost — retrying ({reconnectState.attempt}/{MAX_RECONNECT_ATTEMPTS})
+                </span>
+              </div>
+            )}
           </div>
           {reconnectState.phase === "waiting" && (
             <button
               type="button"
               onClick={() => { clearReconnectTimers(); void performReconnect(reconnectState.attempt); }}
-              className="shrink-0 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-semibold text-foreground hover:bg-[var(--color-surface)]"
+              className="shrink-0 flex items-center gap-1.5 rounded-md border border-border bg-[var(--color-surface-2)] px-2.5 py-1 text-xs font-semibold text-foreground transition hover:bg-[var(--color-surface)] active:scale-95"
             >
-              Retry now
+              <RefreshCw className="h-3.5 w-3.5" />
+              Reconnect Now
             </button>
           )}
         </div>
@@ -1847,9 +2005,16 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
                           i === snippetIndex ? "bg-[var(--color-surface-2)]" : "hover:bg-[var(--color-surface-2)]/60",
                         ].join(" ")}
                       >
-                        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
-                          {kindLabels[s.kind]?.[0] || "C"}
-                        </span>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="flex h-7 w-7 items-center justify-center rounded text-[10px] font-bold text-white" style={{ backgroundColor: kindColors[s.kind] || kindColors.command }}>
+                            {kindLabels[s.kind]?.[0] || "C"}
+                          </span>
+                          {s.runAsSudo && (
+                            <span className="rounded bg-red-600 px-1 py-0.5 text-[8px] font-black text-white uppercase tracking-wider select-none leading-none">
+                              sudo
+                            </span>
+                          )}
+                        </div>
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-sm font-medium text-foreground">{s.name}</div>
                           <div className="truncate text-xs text-muted-foreground font-mono">{s.body || s.command || s.script || ""}</div>
