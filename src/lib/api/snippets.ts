@@ -18,6 +18,7 @@ export function saveSnippet(s: Snippet): Promise<Snippet> {
       groupId: s.groupId ?? null,
       keyword: s.kind === "text" ? s.keyword : null,
       osTargets: s.osTargets && s.osTargets.length > 0 ? s.osTargets : [],
+      runAsSudo: s.runAsSudo,
     },
   });
 }

@@ -195,7 +195,10 @@ export function SnippetsView() {
 
   const selectedIds = Array.from(selected);
 
-  const getSnippetContent = (s: Snippet) => s.body || s.command || s.script || "";
+  const getSnippetContent = (s: Snippet) => {
+    if (s.kind === "script") return "";
+    return s.body || s.command || "";
+  };
 
   const visibleSnippets = snippets.filter((s) => {
     if (!query.trim()) return true;
@@ -710,7 +713,14 @@ function SnippetListRow({
         <KindIcon className="h-4 w-4" />
       </span>
       <div className="w-48 shrink-0 truncate text-sm font-medium text-foreground">{s.name}</div>
-      <span className="shrink-0 rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+      <div className="shrink-0 flex items-center gap-1.5">
+        <span className="rounded bg-[var(--color-surface-2)] px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{meta.label}</span>
+        {s.runAsSudo && (
+          <span className="rounded bg-red-600 px-1 py-0.5 text-[8px] font-black text-white uppercase tracking-wider select-none leading-none">
+            sudo
+          </span>
+        )}
+      </div>
       <div className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">{getSnippetContent(s)}</div>
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
         <button
@@ -919,6 +929,7 @@ function SnippetModal({
   const [body, setBody] = useState(snippet?.body ?? "");
   const [command, setCommand] = useState(snippet?.command ?? "");
   const [script, setScript] = useState(snippet?.script ?? "");
+  const [runAsSudo, setRunAsSudo] = useState(snippet?.runAsSudo ?? false);
   const [groupId, setGroupId] = useState<string | null>(snippet?.groupId ?? defaultGroupId ?? null);
   const [keyword, setKeyword] = useState(snippet?.keyword ?? "");
   const [osTargets, setOsTargets] = useState<SnippetOsTarget[]>(
@@ -1015,9 +1026,23 @@ function SnippetModal({
             </Field>
           )}
           {kind === "script" && (
-            <Field label="Script">
-              <CodeEditor value={script} onChange={setScript} placeholder="#!/bin/bash" minRows={10} />
-            </Field>
+            <>
+              <Field label="Script">
+                <CodeEditor value={script} onChange={setScript} placeholder="#!/bin/bash" minRows={10} />
+              </Field>
+              <div className="flex items-center gap-2 pt-1">
+                <input
+                  type="checkbox"
+                  id="runAsSudo"
+                  checked={runAsSudo}
+                  onChange={(e) => setRunAsSudo(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border border-border bg-[var(--color-surface)] text-[var(--color-brand-orange)] accent-[var(--color-brand-orange)] focus:ring-ring cursor-pointer"
+                />
+                <label htmlFor="runAsSudo" className="text-xs font-medium text-foreground cursor-pointer select-none">
+                  Run as sudoer (execute script with root privileges)
+                </label>
+              </div>
+            </>
           )}
           {/* Variables section */}
           <div className="space-y-2">
@@ -1138,6 +1163,7 @@ function SnippetModal({
               keyword: kind === "text" ? keyword.trim() || undefined : undefined,
               osTargets: osTargets.includes("all") ? [] : osTargets,
               createdAt: snippet?.createdAt ?? new Date().toISOString(),
+              runAsSudo: kind === "script" ? runAsSudo : undefined,
             })}
             disabled={!valid}
             className="h-8 rounded-md bg-[var(--color-brand-orange)] px-3 text-xs font-semibold text-[var(--color-primary-foreground)] disabled:cursor-not-allowed disabled:opacity-50 hover:enabled:opacity-90"
