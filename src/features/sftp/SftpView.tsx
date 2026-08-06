@@ -342,6 +342,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
   const [transferStatus, setTransferStatus] = useState<SftpTransferStatus | null>(null);
   const [transferSpeed, setTransferSpeed] = useState<number | null>(null);
   const speedSampleRef = useRef<SpeedSample | null>(null);
+  // جلوی دابل‌کلیک / آپلود هم‌زمان با دانلود رو می‌گیره (state هنوز آپدیت نشده)
+  const transferBusyRef = useRef(false);
   // remoteDragOver: highlight while an OS drag (Finder/Explorer) hovers the remote pane.
   const [remoteDragOver, setRemoteDragOver] = useState(false);
   // paneDrag: pointer-based drag between panes. HTML5 drag & drop is unusable
@@ -798,7 +800,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
   const handleDownload = async (paths?: string[]) => {
     const targets = paths ?? [...selectedRemote];
-    if (targets.length === 0 || !isConnected) return;
+    if (targets.length === 0 || !isConnected || transferBusyRef.current) return;
+    transferBusyRef.current = true;
     setTransferError(null);
     setTransferProgress(null);
     setTransferStatus(null);
@@ -824,6 +827,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
         setTransferProgress(null);
       }
     } finally {
+      transferBusyRef.current = false;
       setTransferProgress(null);
       setTransferOverall(null);
       setTransferStatus(null);
@@ -833,7 +837,8 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
   const handleUpload = async (paths?: string[]) => {
     const targets = paths ?? [...selectedLocal];
-    if (targets.length === 0 || !isConnected) return;
+    if (targets.length === 0 || !isConnected || transferBusyRef.current) return;
+    transferBusyRef.current = true;
     setTransferError(null);
     setTransferProgress(null);
     setTransferStatus(null);
@@ -859,6 +864,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
         setTransferProgress(null);
       }
     } finally {
+      transferBusyRef.current = false;
       setTransferProgress(null);
       setTransferOverall(null);
       setTransferStatus(null);
@@ -1666,6 +1672,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
               <button
                 className="rounded bg-[oklch(0.45_0.12_145)] px-2.5 py-1 text-xs font-medium text-white hover:bg-[oklch(0.5_0.12_145)]"
                 onClick={async () => {
+                  if (transferBusyRef.current) {
+                    toast.error("A transfer is already in progress");
+                    return;
+                  }
+                  transferBusyRef.current = true;
                   try {
                     await sftpTransfer(sftpSessionId, "sftp_upload", {
                       sessionId: sftpSessionId,
@@ -1677,6 +1688,7 @@ export function SftpView({ tab }: { tab: AppTab }) {
                     setWatchedFile(null);
                     if (remotePath) await loadRemoteDir(remotePath);
                   } catch (e) { toast.error(String(e)); }
+                  finally { transferBusyRef.current = false; }
                 }}
               >
                 Upload
