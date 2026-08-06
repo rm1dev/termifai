@@ -389,8 +389,11 @@ export function SnippetsView() {
 function groupPath(groups: SnippetGroup[], id: string | null): string {
   if (!id) return "— (root)";
   const parts: string[] = [];
+  const seen = new Set<string>();
   let cur: SnippetGroup | undefined = groups.find((g) => g.id === id);
   while (cur) {
+    if (seen.has(cur.id)) break; // چرخهٔ خراب از sync — از حلقه دربیا
+    seen.add(cur.id);
     parts.unshift(cur.name);
     cur = cur.parentId ? groups.find((g) => g.id === cur!.parentId) : undefined;
   }
@@ -400,8 +403,11 @@ function groupPath(groups: SnippetGroup[], id: string | null): string {
 function descendantGroupIds(groups: SnippetGroup[], id: string): string[] {
   const descendants: string[] = [];
   const stack = [id];
+  const visited = new Set<string>();
   while (stack.length > 0) {
     const parentId = stack.pop()!;
+    if (visited.has(parentId)) continue;
+    visited.add(parentId);
     groups
       .filter((group) => group.parentId === parentId)
       .forEach((group) => {
