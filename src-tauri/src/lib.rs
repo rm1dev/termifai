@@ -1438,6 +1438,52 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     Ok(())
 }
 
+/// روی ویندوز `cmd /c start` با آرگومان‌های خام، متاکاراکترهایی مثل `&` رو
+/// به‌عنوان جداکننده فرمان می‌خونه — برای open از ShellExecute استفاده می‌کنیم.
+#[cfg(target_os = "windows")]
+fn windows_shell_open(file: &str, params: Option<&str>) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let file_w = wide(file);
+    let params_w = params.map(wide);
+    let status = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            file_w.as_ptr(),
+            params_w
+                .as_ref()
+                .map(|p| p.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // برگشتی ShellExecute اگه ≤32 باشه یعنی خطا
+    if (status as isize) <= 32 {
+        Err(format!(
+            "Failed to open path (ShellExecute error {})",
+            status as isize
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_quote_param(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', ""))
+}
+
 #[tauri::command]
 fn sftp_open_local(path: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -1451,10 +1497,7 @@ fn sftp_open_local(path: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd")
-        .args(["/c", "start", "", &path])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    windows_shell_open(&path, None)?;
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return Err("Platform not supported for open_local".to_string());
     Ok(())
@@ -1473,10 +1516,7 @@ fn sftp_open_with_local(path: String, app: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    std::process::Command::new("cmd")
-        .args(["/c", "start", "", &app, &path])
-        .spawn()
-        .map_err(|e| e.to_string())?;
+    windows_shell_open(&app, Some(&windows_quote_param(&path)))?;
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return Err("Platform not supported for open_with_local".to_string());
     Ok(())
@@ -1510,9 +1550,7 @@ async fn sftp_open_remote(
         .arg(&tmp_path)
         .spawn();
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", &tmp_path])
-        .spawn();
+    windows_shell_open(&tmp_path, None)?;
     Ok(tmp_path)
 }
 

@@ -756,10 +756,13 @@ impl SftpEntry {
     }
 
     pub fn open_remote(&self, session_id: &str, remote_path: &str) -> Result<String, String> {
-        let file_name = std::path::Path::new(remote_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
+        // اسم خام remote می‌تونه & یا ..\\ داشته باشه؛ قبل از join تمیزش می‌کنیم
+        let file_name = sanitize_open_basename(
+            std::path::Path::new(remote_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file"),
+        );
 
         let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let rand_id = &rand_id[..8];
@@ -768,7 +771,7 @@ impl SftpEntry {
             .join(format!("{}_{}", session_id, rand_id));
         std::fs::create_dir_all(&app_temp_dir)
             .map_err(|e| format!("Create temp dir failed: {}", e))?;
-        let tmp_path = app_temp_dir.join(file_name);
+        let tmp_path = app_temp_dir.join(&file_name);
 
         let sftp = self
             .session
@@ -1184,6 +1187,39 @@ fn pathbase(path: &str) -> String {
         .to_string()
 }
 
+/// اسم فایل temp برای Open remote رو از path traversal و متاکاراکترهای
+/// خطرناک (مخصوصاً `cmd.exe` روی ویندوز مثل `&` و `|`) پاک می‌کنه.
+fn sanitize_open_basename(name: &str) -> String {
+    let base = name
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty() && *part != "." && *part != "..")
+        .unwrap_or("file");
+
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(
+                    c,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '&' | '%' | '^' | '!'
+                )
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    // اسم خالی یا فقط‌نقطه روی ویندوز خراب می‌شه
+    let trimmed = cleaned.trim().trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed
+    }
+}
+
 /// Creates `path` on the remote if it doesn't exist; errors if it exists as a non-directory.
 fn ensure_remote_dir(sftp: &ssh2::Sftp, path: &str) -> Result<(), String> {
     if let Ok(stat) = sftp.stat(std::path::Path::new(path)) {
@@ -1526,6 +1562,31 @@ mod tests {
             ConflictDecision::Cancel
         });
         assert_eq!(h.resolve(&conflict_info()).unwrap_err(), "Cancelled");
+    }
+
+    #[test]
+    fn sanitize_open_basename_strips_cmd_metacharacters() {
+        assert_eq!(
+            sanitize_open_basename("x&calc.exe&y.txt"),
+            "x_calc.exe_y.txt"
+        );
+        assert_eq!(sanitize_open_basename("report|rm.txt"), "report_rm.txt");
+        assert_eq!(sanitize_open_basename("a<script>.txt"), "a_script_.txt");
+    }
+
+    #[test]
+    fn sanitize_open_basename_blocks_path_escape() {
+        assert_eq!(sanitize_open_basename("..\\..\\secret.txt"), "secret.txt");
+        assert_eq!(sanitize_open_basename("../evil.txt"), "evil.txt");
+        assert_eq!(sanitize_open_basename(".."), "file");
+        assert_eq!(sanitize_open_basename("."), "file");
+        assert_eq!(sanitize_open_basename(""), "file");
+    }
+
+    #[test]
+    fn sanitize_open_basename_keeps_safe_unicode_names() {
+        assert_eq!(sanitize_open_basename("گزارش.pdf"), "گزارش.pdf");
+        assert_eq!(sanitize_open_basename("notes (1).md"), "notes (1).md");
     }
 }
 

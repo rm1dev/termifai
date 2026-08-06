@@ -119,10 +119,32 @@ fn open_url(url: &str) -> Result<(), String> {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     #[cfg(target_os = "windows")]
     {
-        let escaped = url.replace("&", "^&");
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", &escaped])
-            .spawn();
+        // قبلاً فقط `&` رو با `^&` فرار می‌دادیم؛ بقیه متاکاراکترهای cmd
+        // هنوز خطرناک بودن. ShellExecute مسیر امن‌تریه.
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let wide: Vec<u16> = std::ffi::OsStr::new(url)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (status as isize) <= 32 {
+            return Err(format!(
+                "Failed to open URL (ShellExecute error {})",
+                status as isize
+            ));
+        }
     }
     Ok(())
 }
