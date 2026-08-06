@@ -66,6 +66,8 @@ pub struct Snippet {
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_as_sudo: Option<bool>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -119,6 +121,7 @@ mod tests {
             os_targets: vec![SnippetOsTarget::Linux, SnippetOsTarget::Windows],
             created_at: None,
             updated_at: None,
+            run_as_sudo: None,
         };
         let json = serde_json::to_string(&snippet).unwrap();
         let back: Snippet = serde_json::from_str(&json).unwrap();

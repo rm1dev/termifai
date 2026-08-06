@@ -446,3 +446,111 @@ fn set_private_key_permissions(path: &Path) -> Result<(), String> {
 fn set_private_key_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
+
+pub fn remove_known_host(host_or_ip: &str) -> Result<(), String> {
+    let clean_target = host_or_ip.trim();
+    if clean_target.is_empty() {
+        return Err("Target host or IP cannot be empty".to_string());
+    }
+
+    let host_only = if let Some(idx) = clean_target.find('@') {
+        &clean_target[idx + 1..]
+    } else {
+        clean_target
+    };
+
+    let (hostname, port) = if host_only.starts_with('[') {
+        if let Some(end_bracket) = host_only.find(']') {
+            let h = &host_only[1..end_bracket];
+            let p = host_only[end_bracket + 1..].strip_prefix(':');
+            (h, p)
+        } else {
+            (host_only, None)
+        }
+    } else if let Some(colon_idx) = host_only.rfind(':') {
+        if host_only.chars().filter(|&c| c == ':').count() == 1 {
+            (&host_only[..colon_idx], Some(&host_only[colon_idx + 1..]))
+        } else {
+            (host_only, None)
+        }
+    } else {
+        (host_only, None)
+    };
+
+    let mut targets_to_remove = vec![hostname.to_string()];
+    if let Some(p) = port {
+        if p != "22" {
+            targets_to_remove.push(format!("[{}]:{}", hostname, p));
+        }
+    }
+    if !targets_to_remove.contains(&clean_target.to_string()) {
+        targets_to_remove.push(clean_target.to_string());
+    }
+
+    for target in &targets_to_remove {
+        let _ = Command::new("ssh-keygen")
+            .arg("-R")
+            .arg(target)
+            .stdin(Stdio::null())
+            .output();
+    }
+
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let known_hosts_path = PathBuf::from(home).join(".ssh").join("known_hosts");
+        if known_hosts_path.exists() {
+            if let Ok(contents) = fs::read_to_string(&known_hosts_path) {
+                let mut modified = false;
+                let new_lines: Vec<&str> = contents
+                    .lines()
+                    .filter(|line| {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() || trimmed.starts_with('#') {
+                            return true;
+                        }
+                        let host_field = match trimmed.split_whitespace().next() {
+                            Some(f) => f,
+                            None => return true,
+                        };
+
+                        let matches = targets_to_remove.iter().any(|t| {
+                            host_field == t
+                                || host_field.split(',').any(|h| h == t)
+                                || (t.contains(':') && host_field.contains(t))
+                        });
+
+                        if matches {
+                            modified = true;
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+
+                if modified {
+                    let mut new_content = new_lines.join("\n");
+                    if !new_content.is_empty() {
+                        new_content.push('\n');
+                    }
+                    let temp_path = known_hosts_path.with_extension("tmp_termifai");
+                    if fs::write(&temp_path, new_content.as_bytes()).is_ok() {
+                        let _ = fs::rename(&temp_path, &known_hosts_path);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remove_known_host_invalid_input() {
+        assert!(remove_known_host("").is_err());
+        assert!(remove_known_host("   ").is_err());
+    }
+}

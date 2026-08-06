@@ -18,6 +18,7 @@ export function saveSnippet(s: Snippet): Promise<Snippet> {
       groupId: s.groupId ?? null,
       keyword: s.kind === "text" ? s.keyword : null,
       osTargets: s.osTargets && s.osTargets.length > 0 ? s.osTargets : [],
+      runAsSudo: s.runAsSudo,
     },
   });
 }
@@ -28,6 +29,10 @@ export function removeSnippets(ids: string[]): Promise<void> {
 
 export function reorderSnippets(ids: string[]): Promise<void> {
   return call<void>("reorder_snippets", { ids });
+}
+
+export function reorderSnippetGroups(ids: string[]): Promise<void> {
+  return call<void>("reorder_snippet_groups", { ids });
 }
 
 export function saveSnippetGroup(
