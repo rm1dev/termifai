@@ -267,6 +267,14 @@ impl SftpEntry {
     pub fn stop_keepalive(&self) {
         self.keepalive_stop.store(true, Ordering::Relaxed);
     }
+    
+    pub fn is_keepalive_stopped(&self) -> bool {
+        self.keepalive_stop.load(Ordering::Relaxed)
+    }
+
+    pub fn get_keepalive_stop(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.keepalive_stop)
+    }
 }
 
 /// `set_keepalive` فقط config می‌کنه؛ باید دوره‌ای `keepalive_send` بزنیم وگرنه
@@ -289,7 +297,7 @@ fn spawn_sftp_keepalive(entry: Arc<Mutex<SftpEntry>>, stop: Arc<AtomicBool>, ses
                 consecutive_failures = 0;
                 continue;
             };
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || guard.is_keepalive_stopped() {
                 return;
             }
             match guard.session.keepalive_send() {
@@ -552,6 +560,12 @@ impl SftpEntry {
                 let _ = sftp.unlink(std::path::Path::new(remote_path));
             }
             clear_upload_marker(local_path);
+            
+            // workaround to ensure dir exists if path is like 'foo/bar'
+            if let Some(parent) = std::path::Path::new(remote_path).parent() {
+                let _ = sftp.mkdir(parent, 0o755);
+            }
+            
             sftp.create(std::path::Path::new(remote_path))
                 .map_err(|e| format!("create remote '{}': {}", remote_path, e))?
         };
@@ -1422,11 +1436,13 @@ impl SftpManager {
 }
 
 /// Handshake مجدد بیرون از قفل `SftpManager` — فقط قفل خود سشن موقع replace گرفته می‌شه.
-pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>) -> Result<(), String> {
+pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>, session_id: &str) -> Result<(), String> {
     let creds = {
         let guard = entry.lock().unwrap();
+        guard.get_keepalive_stop().store(true, Ordering::Relaxed);
         guard.reconnect.clone()
     };
+
     let key_path = creds.private_key_path.as_deref().map(std::path::Path::new);
     let cfg = ssh::SshConfig {
         hostname: &creds.hostname,
@@ -1437,7 +1453,14 @@ pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>) -> Result<(), String> {
     };
     fn silent_log(_stage: &str, _msg: &str) {}
     let session = ssh::connect(&cfg, silent_log)?;
-    entry.lock().unwrap().replace_session(session);
+
+    let new_stop = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = entry.lock().unwrap();
+        guard.replace_session(session);
+        guard.keepalive_stop = Arc::clone(&new_stop);
+    }
+    spawn_sftp_keepalive(Arc::clone(entry), new_stop, session_id);
     Ok(())
 }
 

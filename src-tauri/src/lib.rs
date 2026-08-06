@@ -879,16 +879,44 @@ async fn sftp_list_remote(
     path: String,
 ) -> Result<Vec<RemoteFileEntry>, String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.list_remote(&path)
+        sftp_op_with_retry(&app, &session_id, |entry| entry.list_remote(&path))
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?
+}
+
+/// Helper: run an SFTP operation once, and if it fails with a retryable network
+/// error, silently reconnect the session and retry once. This covers the common
+/// case where a session has gone stale (NAT/idle timeout, server reboot) between
+/// user interactions — without this, every non-transfer operation (list, mkdir,
+/// delete, rename, stat, …) would fail and the user would have to manually
+/// disconnect and reconnect.
+fn sftp_op_with_retry<T>(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    op: impl Fn(&sftp::SftpEntry) -> Result<T, String>,
+) -> Result<T, String> {
+    let state = app.state::<AppState>();
+    let entry = {
+        let manager = state.sftp_manager.lock().unwrap();
+        manager.get_session(session_id)?
+    };
+    // First attempt
+    let first_err = {
+        let guard = entry.lock().unwrap();
+        match op(&guard) {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        }
+    };
+    // Only retry on network errors — permission/path errors are permanent
+    if !is_retryable_network_error(&first_err) {
+        return Err(first_err);
+    }
+    // Reconnect and retry once
+    sftp::reconnect_entry(&entry, session_id)?;
+    let guard = entry.lock().unwrap();
+    op(&guard)
 }
 
 fn emit_sftp_transfer_status(
@@ -1036,7 +1064,7 @@ fn try_reconnect_with_backoff(
             let manager = state.sftp_manager.lock().unwrap();
             manager.take_entry(session_id)?
         };
-        let reconnect_result = sftp::reconnect_entry(&entry);
+        let reconnect_result = sftp::reconnect_entry(&entry, session_id);
         match reconnect_result {
             Ok(()) => {
                 emit_sftp_transfer_status(
@@ -1277,13 +1305,7 @@ async fn sftp_delete_remote(
     paths: Vec<String>,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.delete_remote(&paths)
+        sftp_op_with_retry(&app, &session_id, |entry| entry.delete_remote(&paths))
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?
@@ -1297,13 +1319,9 @@ async fn sftp_rename_remote(
     to_path: String,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.rename_remote(&from_path, &to_path)
+        sftp_op_with_retry(&app, &session_id, |entry| {
+            entry.rename_remote(&from_path, &to_path)
+        })
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?
@@ -1316,13 +1334,7 @@ async fn sftp_mkdir_remote(
     path: String,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.mkdir_remote(&path)
+        sftp_op_with_retry(&app, &session_id, |entry| entry.mkdir_remote(&path))
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?
@@ -1364,13 +1376,7 @@ async fn sftp_stat_remote(
     path: String,
 ) -> Result<sftp::RemoteStatResult, String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.stat_remote(&path)
+        sftp_op_with_retry(&app, &session_id, |entry| entry.stat_remote(&path))
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?
@@ -1509,8 +1515,33 @@ async fn sftp_open_remote(
             let manager = state.sftp_manager.lock().unwrap();
             manager.get_session(&session_id)?
         };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.open_remote(&session_id, &remote_path)?
+        // First attempt
+        let first_err = {
+            let guard = entry.lock().unwrap();
+            match guard.open_remote(&session_id, &remote_path) {
+                Ok(v) => {
+                    // open succeeded — skip retry path
+                    drop(guard);
+                    // open local app
+                    #[cfg(target_os = "macos")]
+                    let _ = std::process::Command::new("open").arg(&v).spawn();
+                    #[cfg(target_os = "linux")]
+                    let _ = std::process::Command::new("xdg-open").arg(&v).spawn();
+                    #[cfg(target_os = "windows")]
+                    let _ = std::process::Command::new("cmd")
+                        .args(["/c", "start", "", &v])
+                        .spawn();
+                    return Ok(v);
+                }
+                Err(e) => e,
+            }
+        };
+        if !is_retryable_network_error(&first_err) {
+            return Err(first_err);
+        }
+        sftp::reconnect_entry(&entry, &session_id)?;
+        let guard = entry.lock().unwrap();
+        guard.open_remote(&session_id, &remote_path)?
     };
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(&tmp_path).spawn();
@@ -1588,13 +1619,9 @@ async fn sftp_chmod(
     recursive: bool,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.chmod(&path, &mode, recursive)
+        sftp_op_with_retry(&app, &session_id, |entry| {
+            entry.chmod(&path, &mode, recursive)
+        })
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?
@@ -1610,13 +1637,9 @@ async fn sftp_chown(
     recursive: bool,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.chown(&path, &user, &group, recursive)
+        sftp_op_with_retry(&app, &session_id, |entry| {
+            entry.chown(&path, &user, &group, recursive)
+        })
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?
@@ -1630,13 +1653,9 @@ async fn sftp_copy_remote(
     dest_dir: String,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.copy_remote(&paths, &dest_dir)
+        sftp_op_with_retry(&app, &session_id, |entry| {
+            entry.copy_remote(&paths, &dest_dir)
+        })
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?
@@ -1649,13 +1668,7 @@ async fn sftp_get_users_groups(
 ) -> Result<sftp::UsersGroups, String> {
     // چند round-trip بلاکینگ SSH داره؛ نباید thread کامند رو بلاک کنه
     tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let entry = {
-            let manager = state.sftp_manager.lock().unwrap();
-            manager.get_session(&session_id)?
-        };
-        let entry_guard = entry.lock().unwrap();
-        entry_guard.get_users_groups()
+        sftp_op_with_retry(&app, &session_id, |entry| entry.get_users_groups())
     })
     .await
     .map_err(|e| format!("Thread panic: {}", e))?

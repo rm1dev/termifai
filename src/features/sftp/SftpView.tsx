@@ -319,15 +319,18 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
   // Load hosts for picker (only when no host is pre-selected)
   useEffect(() => {
+    let cancelled = false;
     if (!tab.sftpHostId) {
       sftpCall<{ hosts: Host[]; groups: HostGroup[] }>("list_hosts")
         .then((v) => {
+          if (cancelled) return;
           setAllHosts(v.hosts);
           setAllGroups(v.groups || []);
         })
         .catch(() => {});
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => { cancelled = true; };
+  }, [tab.sftpHostId]);
 
   const [selectedLocal, setSelectedLocal] = useState<Set<string>>(new Set());
   const [selectedRemote, setSelectedRemote] = useState<Set<string>>(new Set());
@@ -999,10 +1002,11 @@ export function SftpView({ tab }: { tab: AppTab }) {
 
   // Auto-connect on mount if hostId is pre-set
   useEffect(() => {
-    if (tab.sftpHostId && !isConnected) {
+    if (tab.sftpHostId && !isConnectedRef.current) {
       void handleConnect();
     }
     return () => {
+      // Disconnect when component unmounts. Disconnecting removes the keepalive and session.
       connectCleanupRef.current?.();
       connectCleanupRef.current = null;
       void sftpCall("sftp_disconnect", { sessionId: sftpSessionId }).catch(() => {});
