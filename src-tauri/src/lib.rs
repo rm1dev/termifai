@@ -767,12 +767,25 @@ fn run_script_locally(
     let state = app.state::<AppState>();
     let local_temp_path =
         std::env::temp_dir().join(format!("termifai_run_{}.sh", snippet_exec::short_id()));
-    std::fs::write(&local_temp_path, script)
-        .map_err(|e| format!("Failed to write local temp script: {}", e))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&local_temp_path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        // از اول 0600 بساز تا بین write و chmod لو نره
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&local_temp_path)
+            .map_err(|e| format!("Failed to write local temp script: {}", e))?;
+        file.write_all(script.as_bytes())
+            .map_err(|e| format!("Failed to write local temp script: {}", e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&local_temp_path, script)
+            .map_err(|e| format!("Failed to write local temp script: {}", e))?;
     }
 
     let payload = snippet_exec::local_exec_payload(&local_temp_path.to_string_lossy(), run_as_sudo);
