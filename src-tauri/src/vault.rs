@@ -145,7 +145,7 @@ fn linux_boot_session_marker() -> Option<String> {
         if boot_id.is_empty() {
             return None;
         }
-        return Some(format!("boot:{boot_id}"));
+        Some(format!("boot:{boot_id}"))
     }
     #[cfg(not(target_os = "linux"))]
     {
