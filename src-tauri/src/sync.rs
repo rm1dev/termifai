@@ -1095,9 +1095,8 @@ fn apply_outcome(
                 "Vault is locked — cannot apply synced host passwords".to_string()
             })?;
             host.password = Some(
-                termifai_core::crypto::encrypt_field(key, &plaintext).map_err(|e| {
-                    format!("Failed to encrypt synced host password: {e:?}")
-                })?,
+                termifai_core::crypto::encrypt_field(key, &plaintext)
+                    .map_err(|e| format!("Failed to encrypt synced host password: {e:?}"))?,
             );
         }
     }

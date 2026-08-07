@@ -541,11 +541,7 @@ pub fn remove_snippet_group(app: &AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
-fn would_create_group_cycle(
-    groups: &[SnippetGroup],
-    id: &str,
-    parent_id: Option<&str>,
-) -> bool {
+fn would_create_group_cycle(groups: &[SnippetGroup], id: &str, parent_id: Option<&str>) -> bool {
     let mut current = parent_id;
     let mut seen = std::collections::HashSet::new();
     while let Some(pid) = current {
@@ -779,7 +775,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn write_synced_script_bodies_keeps_disk_until_purge() {
         // اگه vault commit بترکه، نباید از قبل orphan پاک شده باشه
         let dir = temp_dir();
@@ -797,6 +792,7 @@ mod tests {
             group_id: None,
             keyword: None,
             os_targets: vec![],
+            run_as_sudo: None,
             created_at: None,
             updated_at: Some("2026-01-01T00:00:00Z".to_string()),
         }];
@@ -893,6 +889,7 @@ mod tests {
                 group_id: Some("deleted".to_string()),
                 keyword: None,
                 os_targets: vec![],
+                run_as_sudo: None,
                 created_at: Some("2026-01-01T00:00:00Z".to_string()),
                 updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             },
@@ -907,6 +904,7 @@ mod tests {
                 group_id: Some("alive".to_string()),
                 keyword: None,
                 os_targets: vec![],
+                run_as_sudo: None,
                 created_at: Some("2026-01-01T00:00:00Z".to_string()),
                 updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             },
