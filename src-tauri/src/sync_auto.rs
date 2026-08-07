@@ -22,12 +22,6 @@ fn app_slot() -> &'static Mutex<Option<AppHandle>> {
     APP.get_or_init(|| Mutex::new(None))
 }
 
-/// Generation bumped on every local dirty mark — sync uses this to avoid
-/// clearing `dirty` / clobbering saves that landed while a sync was in flight.
-pub fn dirty_generation() -> u64 {
-    DIRTY_GEN.load(Ordering::SeqCst)
-}
-
 fn with_app(f: impl FnOnce(&AppHandle)) {
     if let Ok(guard) = app_slot().lock() {
         if let Some(app) = guard.as_ref() {
@@ -49,9 +43,7 @@ pub struct SyncActivityEvent {
     pub auto_sync: bool,
 }
 
-pub fn cache_to_settings(
-    cache: &termifai_core::model::sync_state::SettingsCache,
-) -> SettingsPayload {
+fn cache_to_settings(cache: &termifai_core::model::sync_state::SettingsCache) -> SettingsPayload {
     SettingsPayload {
         app_theme: SettingsBlob {
             value: cache.app_theme.value.clone(),
@@ -89,9 +81,7 @@ fn run_auto_sync(app: &AppHandle) {
         return;
     };
     let settings = cache_to_settings(&state.settings_cache);
-    // اگه یه sync دیگه قفل رو گرفته، None می‌گیریم — باید دوباره زمان‌بندی کنیم
-    // وگرنه dirty پاک می‌شه/می‌مونه ولی دیگه push اتفاق نمی‌افته.
-    if sync::try_sync_now(
+    let _ = sync::try_sync_now(
         app,
         SyncNowRequest {
             master_password: None,
@@ -99,11 +89,7 @@ fn run_auto_sync(app: &AppHandle) {
             terminal_appearance: Some(settings.terminal_appearance),
             shortcuts: Some(settings.shortcuts),
         },
-    )
-    .is_none()
-    {
-        note_dirty();
-    }
+    );
 }
 
 fn spawn_sync_now(app: AppHandle) {

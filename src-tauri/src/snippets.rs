@@ -62,105 +62,64 @@ fn get_snippets_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(snippets_dir)
 }
 
-fn script_path(dir: &std::path::Path, id: &str) -> Result<std::path::PathBuf, String> {
-    validate_snippet_id(id)?;
-    Ok(dir.join(format!("{}.sh", id)))
-}
-
-/// Snippet ids become on-disk `.sh` filenames — allow only a safe charset so
-/// sync/apply cannot write outside the snippets directory via `../` ids.
-fn validate_snippet_id(id: &str) -> Result<(), String> {
-    if id.is_empty() {
-        return Err("Snippet id cannot be empty".to_string());
-    }
-    if !id
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(format!("Invalid snippet id '{}'", id));
-    }
-    Ok(())
+fn script_path(dir: &std::path::Path, id: &str) -> std::path::PathBuf {
+    dir.join(format!("{}.sh", id))
 }
 
 fn read_script_file(dir: &std::path::Path, id: &str) -> Option<String> {
-    let path = script_path(dir, id).ok()?;
-    std::fs::read_to_string(path).ok()
+    std::fs::read_to_string(script_path(dir, id)).ok()
 }
 
 fn write_script_file(dir: &std::path::Path, id: &str, content: &str) -> Result<(), String> {
-    let path = script_path(dir, id)?;
-    std::fs::write(path, content).map_err(|e| format!("Failed to write script file: {}", e))
+    std::fs::write(script_path(dir, id), content)
+        .map_err(|e| format!("Failed to write script file: {}", e))
 }
 
 fn delete_script_file(dir: &std::path::Path, id: &str) {
-    if let Ok(path) = script_path(dir, id) {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Writes/updates `.sh` bodies for Script snippets and clears inline script
-/// fields for vault storage. Returns the set of script ids that must stay on
-/// disk after the vault commit succeeds. Does **not** delete anything — orphans
-/// are purged only after metadata is durable (see [`apply_synced_snippets`]).
-fn write_synced_script_bodies(
-    dir: &std::path::Path,
-    snippets: Vec<Snippet>,
-) -> Result<(Vec<Snippet>, std::collections::HashSet<String>), String> {
-    for snippet in &snippets {
-        validate_snippet_id(&snippet.id)?;
-    }
-    let mut keep_script_ids = std::collections::HashSet::new();
-    let mut vault_snippets = Vec::with_capacity(snippets.len());
-    for mut snippet in snippets {
-        if matches!(snippet.kind, SnippetKind::Script) {
-            if let Some(content) = snippet.script.take() {
-                write_script_file(dir, &snippet.id, &content)?;
-            }
-            keep_script_ids.insert(snippet.id.clone());
-        } else {
-            snippet.script = None;
-        }
-        // مثل save_snippet — محتوای اسکریپت تو DB نمی‌مونه
-        snippet.script = None;
-        vault_snippets.push(snippet);
-    }
-    Ok((vault_snippets, keep_script_ids))
-}
-
-/// Deletes `.sh` files that are no longer Script snippets in the committed vault.
-fn purge_orphan_script_files(
-    dir: &std::path::Path,
-    keep_script_ids: &std::collections::HashSet<String>,
-) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("sh") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                if !keep_script_ids.contains(stem) {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-        }
-    }
+    let _ = std::fs::remove_file(script_path(dir, id));
 }
 
 /// Applies a merged snippet set from sync: writes/updates `.sh` files for
-/// Script snippets, commits vault metadata, then drops orphaned script files.
-/// Orphan deletes happen **after** a successful vault write so a failed sync
-/// apply cannot wipe script bodies while the local vault still references them.
+/// Script snippets, drops orphaned script files, and stores metadata with
+/// `script: None` (body lives on disk, same as `save_snippet`).
 pub fn apply_synced_snippets(
     app: &AppHandle,
     snippets: Vec<Snippet>,
     groups: Vec<SnippetGroup>,
 ) -> Result<(), String> {
     let dir = get_snippets_dir(app)?;
-    let (mut vault_snippets, keep_script_ids) = write_synced_script_bodies(&dir, snippets)?;
+    let keep_ids: std::collections::HashSet<&str> =
+        snippets.iter().map(|s| s.id.as_str()).collect();
 
-    // اگه گروهی tombstone شده ولی snippet هنوز group_id داره، بیارش به root
-    clear_orphan_group_ids(&mut vault_snippets, &groups);
+    // پاک کردن فایل اسکریپت‌هایی که دیگه تو لیست merged نیستن
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("sh") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if !keep_ids.contains(stem) {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    let mut vault_snippets = Vec::with_capacity(snippets.len());
+    for mut snippet in snippets {
+        if matches!(snippet.kind, SnippetKind::Script) {
+            if let Some(content) = snippet.script.take() {
+                write_script_file(&dir, &snippet.id, &content)?;
+            }
+        } else {
+            snippet.script = None;
+            delete_script_file(&dir, &snippet.id);
+        }
+        // مثل save_snippet — محتوای اسکریپت تو DB نمی‌مونه
+        snippet.script = None;
+        vault_snippets.push(snippet);
+    }
 
     let state = app.state::<AppState>();
     state
@@ -170,9 +129,6 @@ pub fn apply_synced_snippets(
             vault.groups = groups.clone();
         })
         .map_err(|e| e.to_string())?;
-
-    // فقط بعد از commit موفق پاک می‌کنیم — وگرنه با failure، دیتای لوکال می‌پره
-    purge_orphan_script_files(&dir, &keep_script_ids);
     Ok(())
 }
 
@@ -246,7 +202,6 @@ pub fn save_snippet(app: &AppHandle, request: SaveSnippetRequest) -> Result<Snip
         .id
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| format!("s-{}", uuid::Uuid::new_v4()));
-    validate_snippet_id(&id)?;
 
     let dir = get_snippets_dir(app)?;
     if matches!(request.kind, SnippetKind::Script) {
@@ -485,11 +440,6 @@ pub fn save_snippet_group(
                     error = Some("Selected group does not exist".to_string());
                     return;
                 }
-                // نذار گروه بره زیر نوه‌ش — چرخه می‌سازه و delete گیر می‌کنه
-                if would_create_group_cycle(&vault.groups, &id, Some(parent_id)) {
-                    error = Some("Group cannot be nested under its own descendant".to_string());
-                    return;
-                }
             }
             upsert_group_by_id(&mut vault.groups, group.clone());
         })
@@ -526,8 +476,6 @@ pub fn remove_snippet_group(app: &AppHandle, id: String) -> Result<(), String> {
                     .unwrap_or(false)
                 {
                     snippet.group_id = None;
-                    // بدون bump، LWW موقع sync ممکنه نسخهٔ قدیمی با group_id حذف‌شده برنده بشه
-                    snippet.updated_at = Some(now_iso());
                 }
             }
         })
@@ -541,35 +489,11 @@ pub fn remove_snippet_group(app: &AppHandle, id: String) -> Result<(), String> {
     Ok(())
 }
 
-fn would_create_group_cycle(groups: &[SnippetGroup], id: &str, parent_id: Option<&str>) -> bool {
-    let mut current = parent_id;
-    let mut seen = std::collections::HashSet::new();
-    while let Some(pid) = current {
-        if pid == id {
-            return true;
-        }
-        if !seen.insert(pid) {
-            // زنجیرهٔ والد از قبل چرخه داره
-            return true;
-        }
-        current = groups
-            .iter()
-            .find(|g| g.id == pid)
-            .and_then(|g| g.parent_id.as_deref());
-    }
-    false
-}
-
 fn descendant_group_ids(groups: &[SnippetGroup], id: &str) -> Vec<String> {
     let mut descendants = Vec::new();
     let mut stack = vec![id.to_string()];
-    let mut visited = std::collections::HashSet::new();
 
     while let Some(parent_id) = stack.pop() {
-        if !visited.insert(parent_id.clone()) {
-            // چرخهٔ sync‌شده — قطع کن تا hang نشه
-            continue;
-        }
         for group in groups.iter().filter(|group| {
             group
                 .parent_id
@@ -583,20 +507,6 @@ fn descendant_group_ids(groups: &[SnippetGroup], id: &str) -> Vec<String> {
     }
 
     descendants
-}
-
-/// Snippets whose `group_id` points at a deleted/missing group vanish from the
-/// normal tree (neither root nor under any folder). Clear those pointers so
-/// they surface at root after sync races.
-fn clear_orphan_group_ids(snippets: &mut [Snippet], groups: &[SnippetGroup]) {
-    let known: std::collections::HashSet<&str> = groups.iter().map(|g| g.id.as_str()).collect();
-    for snippet in snippets.iter_mut() {
-        if let Some(group_id) = snippet.group_id.as_deref() {
-            if !known.contains(group_id) {
-                snippet.group_id = None;
-            }
-        }
-    }
 }
 
 fn upsert_group_by_id(items: &mut Vec<SnippetGroup>, item: SnippetGroup) {
@@ -710,10 +620,7 @@ mod tests {
     #[test]
     fn script_path_uses_id_and_sh_extension() {
         let dir = temp_dir();
-        assert_eq!(script_path(&dir, "s-1").unwrap(), dir.join("s-1.sh"));
-        assert!(script_path(&dir, "../etc/passwd").is_err());
-        assert!(script_path(&dir, "s/evil").is_err());
-        assert!(validate_snippet_id("s-123_abc").is_ok());
+        assert_eq!(script_path(&dir, "s-1"), dir.join("s-1.sh"));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -772,146 +679,5 @@ mod tests {
         assert!(res.is_ok());
         assert_eq!(groups[1].id, "sub2");
         assert_eq!(groups[2].id, "sub1");
-    }
-
-    #[test]
-    fn write_synced_script_bodies_keeps_disk_until_purge() {
-        // اگه vault commit بترکه، نباید از قبل orphan پاک شده باشه
-        let dir = temp_dir();
-        write_script_file(&dir, "keep-me", "echo keep").unwrap();
-        write_script_file(&dir, "orphan", "echo orphan").unwrap();
-
-        let snippets = vec![Snippet {
-            id: "keep-me".to_string(),
-            kind: SnippetKind::Script,
-            name: "Keep".to_string(),
-            body: None,
-            command: None,
-            script: Some("echo keep-v2".to_string()),
-            variables: vec![],
-            group_id: None,
-            keyword: None,
-            os_targets: vec![],
-            run_as_sudo: None,
-            created_at: None,
-            updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-        }];
-
-        let (vault_snippets, keep_ids) = write_synced_script_bodies(&dir, snippets).unwrap();
-        assert_eq!(vault_snippets.len(), 1);
-        assert!(vault_snippets[0].script.is_none());
-        assert!(keep_ids.contains("keep-me"));
-        assert_eq!(
-            read_script_file(&dir, "keep-me").as_deref(),
-            Some("echo keep-v2")
-        );
-        // orphan هنوز روی دیسک هست تا بعد از commit موفق purge بشه
-        assert_eq!(
-            read_script_file(&dir, "orphan").as_deref(),
-            Some("echo orphan")
-        );
-
-        purge_orphan_script_files(&dir, &keep_ids);
-        assert!(read_script_file(&dir, "keep-me").is_some());
-        assert!(read_script_file(&dir, "orphan").is_none());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn purge_orphan_script_files_removes_former_scripts() {
-        let dir = temp_dir();
-        write_script_file(&dir, "was-script", "echo hi").unwrap();
-        let keep = std::collections::HashSet::new();
-        purge_orphan_script_files(&dir, &keep);
-        assert!(read_script_file(&dir, "was-script").is_none());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn would_create_group_cycle_rejects_nesting_under_descendant() {
-        let groups = vec![
-            SnippetGroup {
-                id: "a".to_string(),
-                name: "A".to_string(),
-                parent_id: None,
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-            },
-            SnippetGroup {
-                id: "b".to_string(),
-                name: "B".to_string(),
-                parent_id: Some("a".to_string()),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-            },
-        ];
-        assert!(would_create_group_cycle(&groups, "a", Some("b")));
-        assert!(!would_create_group_cycle(&groups, "b", Some("a")));
-        assert!(!would_create_group_cycle(&groups, "a", None));
-    }
-
-    #[test]
-    fn descendant_group_ids_terminates_on_parent_cycle() {
-        let groups = vec![
-            SnippetGroup {
-                id: "a".to_string(),
-                name: "A".to_string(),
-                parent_id: Some("b".to_string()),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-            },
-            SnippetGroup {
-                id: "b".to_string(),
-                name: "B".to_string(),
-                parent_id: Some("a".to_string()),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-            },
-        ];
-        let descendants = descendant_group_ids(&groups, "a");
-        assert!(descendants.contains(&"b".to_string()));
-        // Must not hang / grow forever on a mutual parent cycle.
-        assert!(descendants.len() <= 2);
-    }
-    #[test]
-    fn clear_orphan_group_ids_moves_snippets_to_root() {
-        let groups = vec![SnippetGroup {
-            id: "alive".to_string(),
-            name: "Alive".to_string(),
-            parent_id: None,
-            updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-        }];
-        let mut snippets = vec![
-            Snippet {
-                id: "s1".to_string(),
-                kind: SnippetKind::Text,
-                name: "orphan".to_string(),
-                body: Some("x".to_string()),
-                command: None,
-                script: None,
-                variables: vec![],
-                group_id: Some("deleted".to_string()),
-                keyword: None,
-                os_targets: vec![],
-                run_as_sudo: None,
-                created_at: Some("2026-01-01T00:00:00Z".to_string()),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-            },
-            Snippet {
-                id: "s2".to_string(),
-                kind: SnippetKind::Text,
-                name: "ok".to_string(),
-                body: Some("y".to_string()),
-                command: None,
-                script: None,
-                variables: vec![],
-                group_id: Some("alive".to_string()),
-                keyword: None,
-                os_targets: vec![],
-                run_as_sudo: None,
-                created_at: Some("2026-01-01T00:00:00Z".to_string()),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-            },
-        ];
-
-        clear_orphan_group_ids(&mut snippets, &groups);
-        assert!(snippets[0].group_id.is_none());
-        assert_eq!(snippets[1].group_id.as_deref(), Some("alive"));
     }
 }

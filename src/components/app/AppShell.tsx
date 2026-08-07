@@ -150,10 +150,7 @@ export function AppShell({ variant = "main", onRequestClose }: AppShellProps = {
     }
     const portArg = host.port && host.port !== 22 ? ` -p ${host.port}` : "";
     const readyMarker = `__TERMIFAI_CONNECTED_${Date.now()}__`;
-    // مسیر working dir رو quote کن وگرنه فاصله/متاکاراکتر شل ریموت رو می‌شکنه یا تزریق می‌کنه
-    const cdPart = host.workingDirectory?.trim()
-      ? `cd ${posixShellQuote(host.workingDirectory.trim())} 2>/dev/null; `
-      : "";
+    const cdPart = host.workingDirectory?.trim() ? `cd ${host.workingDirectory.trim()} 2>/dev/null; ` : "";
     // Stable per-tab tmux session name (fixed at tab creation, reused verbatim
     // on every reconnect attempt): if tmux is on the remote host, attach to —
     // or create — this named session instead of spawning a plain login shell,
@@ -1279,7 +1276,7 @@ function Sidebar({
         })}
       </nav>
       <div className="px-3 pt-3 text-[10px] tracking-wider text-muted-foreground text-center truncate">
-        {isCurrentlyCollapsed ? "v1.2.0" : "v1.2.0 · Termifai"}
+        {isCurrentlyCollapsed ? "v1.1.0" : "v1.1.0 · Termifai"}
       </div>
     </aside>
   );

@@ -344,7 +344,7 @@ export function SettingsWindow() {
         toast.success("Already up to date");
       }
     } catch (e: unknown) {
-      if (String(e).includes("master_password_required") || String(e).includes("vault_locked")) {
+      if (String(e).includes("master_password_required")) {
         setSyncNeedsPassword(true);
       } else {
         setSyncError(String(e));

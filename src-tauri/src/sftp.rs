@@ -202,58 +202,6 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// A single file/folder name for rename/mkdir — not a relative or absolute path.
-/// Rejects empty names, `.` / `..`, separators, and absolute paths so
-/// `parent.join(name)` cannot escape the intended directory.
-pub fn validate_path_segment(name: &str) -> Result<(), String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("Name cannot be empty".to_string());
-    }
-    if name == "." || name == ".." {
-        return Err("Invalid name".to_string());
-    }
-    if name.contains('/') || name.contains('\\') || name.contains('\0') {
-        return Err("Name cannot contain path separators".to_string());
-    }
-    let as_path = std::path::Path::new(name);
-    if as_path.is_absolute() || as_path.components().count() != 1 {
-        return Err("Name must be a single path segment".to_string());
-    }
-    Ok(())
-}
-
-/// Ensures `to_path` is a same-directory rename of `from_path` to a safe
-/// single-segment name (blocks `../` and absolute destinations).
-pub fn validate_same_dir_rename(from_path: &str, to_path: &str) -> Result<(), String> {
-    let from = std::path::Path::new(from_path);
-    let to = std::path::Path::new(to_path);
-    let from_parent = from
-        .parent()
-        .ok_or_else(|| "Source path has no parent directory".to_string())?;
-    let to_parent = to
-        .parent()
-        .ok_or_else(|| "Destination path has no parent directory".to_string())?;
-    if from_parent != to_parent {
-        return Err("Rename must stay in the same directory".to_string());
-    }
-    let name = to
-        .file_name()
-        .ok_or_else(|| "Destination path has no file name".to_string())?
-        .to_string_lossy();
-    validate_path_segment(&name)
-}
-
-/// Rejects any `..` component so mkdir/join cannot climb out of the pane cwd.
-pub fn reject_parent_dir_components(path: &str) -> Result<(), String> {
-    for component in std::path::Path::new(path).components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return Err("Path cannot contain '..'".to_string());
-        }
-    }
-    Ok(())
-}
-
 fn format_unix_timestamp(secs: u64) -> String {
     let secs = secs as i64;
     let (y, mo, d, h, mi) = unix_to_ymd_hm(secs);
@@ -320,14 +268,12 @@ impl SftpEntry {
         self.keepalive_stop.store(true, Ordering::Relaxed);
     }
 
-    /// Stops the previous keepalive worker and installs a fresh stop flag so a
-    /// new keepalive thread can be spawned after reconnect (the old worker may
-    /// already have exited on `keepalive_send` error).
-    fn reset_keepalive_stop(&mut self) -> Arc<AtomicBool> {
-        self.keepalive_stop.store(true, Ordering::Relaxed);
-        let stop = Arc::new(AtomicBool::new(false));
-        self.keepalive_stop = Arc::clone(&stop);
-        stop
+    pub fn is_keepalive_stopped(&self) -> bool {
+        self.keepalive_stop.load(Ordering::Relaxed)
+    }
+
+    pub fn get_keepalive_stop(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.keepalive_stop)
     }
 }
 
@@ -351,7 +297,7 @@ fn spawn_sftp_keepalive(entry: Arc<Mutex<SftpEntry>>, stop: Arc<AtomicBool>, ses
                 consecutive_failures = 0;
                 continue;
             };
-            if stop.load(Ordering::Relaxed) || guard.keepalive_stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || guard.is_keepalive_stopped() {
                 return;
             }
             match guard.session.keepalive_send() {
@@ -447,10 +393,6 @@ impl SftpEntry {
 
         // فایل کامل از قبل تو tmp هست — فقط rename کن
         if resume_at == total_bytes && total_bytes > 0 {
-            if std::path::Path::new(local_path).exists() {
-                std::fs::remove_file(local_path)
-                    .map_err(|e| format!("replace existing '{}': {}", local_path, e))?;
-            }
             std::fs::rename(&tmp_path, local_path)
                 .map_err(|e| format!("rename tmp to '{}': {}", local_path, e))?;
             let _ = std::fs::remove_file(crate::sftp_transfer::download_marker_path(local_path));
@@ -538,25 +480,12 @@ impl SftpEntry {
             local_file
                 .flush()
                 .map_err(|e| format!("flush tmp: {}", e))?;
-            // EOF زودرس (فایل remote وسط کار truncate شده، یا کانال نصفه بسته شده)
-            // نباید به‌عنوان موفقیت rename بشه — فایل ناقص رو جای کامل جا نزن.
-            if total_bytes > 0 && bytes_transferred != total_bytes {
-                return Err(format!(
-                    "incomplete download: got {} of {} bytes",
-                    bytes_transferred, total_bytes
-                ));
-            }
             Ok::<(), String>(())
         })();
 
-        // خطای شبکه/Cancel/incomplete: tmp+marker برای resume می‌مونن
+        // خطای شبکه/Cancel: tmp+marker برای resume می‌مونن
         result?;
 
-        // فقط بعد از دانلود کامل جایگزین کن (ویندوز rename روی فایل موجود fail می‌شه)
-        if std::path::Path::new(local_path).exists() {
-            std::fs::remove_file(local_path)
-                .map_err(|e| format!("replace existing '{}': {}", local_path, e))?;
-        }
         std::fs::rename(&tmp_path, local_path)
             .map_err(|e| format!("rename tmp to '{}': {}", local_path, e))?;
         let _ = std::fs::remove_file(crate::sftp_transfer::download_marker_path(local_path));
@@ -609,10 +538,6 @@ impl SftpEntry {
         let mut local_file =
             std::fs::File::open(local_path).map_err(|e| format!("open local: {}", e))?;
 
-        // آپلود تازه (غیر resume) اول می‌ره تو فایل موقت تا مقصد قبلی از بین نره
-        let remote_tmp = format!("{}.termifai-uploading", remote_path);
-        let using_temp = resume_at == 0;
-
         let mut remote_file = if resume_at > 0 {
             // فقط WRITE + seek — APPEND روی OpenSSH با O_APPEND ممکنه seek رو نادیده بگیره
             let mut f = sftp
@@ -630,11 +555,19 @@ impl SftpEntry {
                 .map_err(|e| format!("seek local: {}", e))?;
             f
         } else {
-            // اگه از آپلود قبلی یه temp مونده، بنداز دور و از صفر بساز
-            let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
+            // فایل غریبه/کهنه رو ننویس روش — از صفر بساز
+            if remote_len.is_some() {
+                let _ = sftp.unlink(std::path::Path::new(remote_path));
+            }
             clear_upload_marker(local_path);
-            sftp.create(std::path::Path::new(&remote_tmp))
-                .map_err(|e| format!("create remote temp '{}': {}", remote_tmp, e))?
+
+            // workaround to ensure dir exists if path is like 'foo/bar'
+            if let Some(parent) = std::path::Path::new(remote_path).parent() {
+                let _ = sftp.mkdir(parent, 0o755);
+            }
+
+            sftp.create(std::path::Path::new(remote_path))
+                .map_err(|e| format!("create remote '{}': {}", remote_path, e))?
         };
 
         write_upload_marker(
@@ -664,71 +597,30 @@ impl SftpEntry {
             total_bytes,
         });
 
-        let write_result = (|| {
-            loop {
-                if cancel.load(Ordering::Relaxed) {
-                    // فایل resumed رو unlink نکن — گیگابایت منتقل‌شده رو نگه دار
-                    return Err("Cancelled".to_string());
-                }
-                let n = local_file
-                    .read(&mut buf)
-                    .map_err(|e| format!("read local: {}", e))?;
-                if n == 0 {
-                    break;
-                }
-                remote_file
-                    .write_all(&buf[..n])
-                    .map_err(|e| format!("write remote: {}", e))?;
-                bytes_transferred += n as u64;
-                if last_progress.elapsed() >= PROGRESS_THROTTLE || bytes_transferred >= total_bytes
-                {
-                    last_progress = Instant::now();
-                    on_progress(TransferProgress {
-                        session_id: session_id.to_string(),
-                        file_name: file_name.clone(),
-                        bytes_transferred,
-                        total_bytes,
-                    });
-                }
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                // فایل resumed رو unlink نکن — گیگابایت منتقل‌شده رو نگه دار
+                return Err("Cancelled".to_string());
             }
-            Ok::<(), String>(())
-        })();
-
-        if let Err(err) = write_result {
-            // آپلود ناقصِ temp رو پاک کن تا مقصد اصلی سالم بمونه؛
-            // marker رو هم بردار وگرنه دفعه بعد ممکنه روی فایل اصلی resume بشه
-            if using_temp {
-                let _ = sftp.unlink(std::path::Path::new(&remote_tmp));
-                clear_upload_marker(local_path);
+            let n = local_file
+                .read(&mut buf)
+                .map_err(|e| format!("read local: {}", e))?;
+            if n == 0 {
+                break;
             }
-            return Err(err);
-        }
-
-        if using_temp {
-            // حالا که فایل کامل تو temp هست، مقصد قدیمی رو بردار و atomic-ish جایگزین کن
-            if remote_len.is_some() {
-                let _ = sftp.unlink(std::path::Path::new(remote_path));
+            remote_file
+                .write_all(&buf[..n])
+                .map_err(|e| format!("write remote: {}", e))?;
+            bytes_transferred += n as u64;
+            if last_progress.elapsed() >= PROGRESS_THROTTLE || bytes_transferred >= total_bytes {
+                last_progress = Instant::now();
+                on_progress(TransferProgress {
+                    session_id: session_id.to_string(),
+                    file_name: file_name.clone(),
+                    bytes_transferred,
+                    total_bytes,
+                });
             }
-            sftp.rename(
-                std::path::Path::new(&remote_tmp),
-                std::path::Path::new(remote_path),
-                None,
-            )
-            .map_err(|e| {
-                // اگه rename ترکید، حداقل temp رو نگه می‌داریم تا بشه دستی نجات داد
-                format!(
-                    "promote upload temp '{}' -> '{}': {}",
-                    remote_tmp, remote_path, e
-                )
-            })?;
-        }
-
-        // فایل local وسط آپلود truncate شده باشه، EOF زودرس می‌آد — موفقیت دروغین نده.
-        if total_bytes > 0 && bytes_transferred != total_bytes {
-            return Err(format!(
-                "incomplete upload: wrote {} of {} bytes",
-                bytes_transferred, total_bytes
-            ));
         }
 
         clear_upload_marker(local_path);
@@ -758,7 +650,6 @@ impl SftpEntry {
     }
 
     pub fn rename_remote(&self, from_path: &str, to_path: &str) -> Result<(), String> {
-        validate_same_dir_rename(from_path, to_path)?;
         let sftp = self
             .session
             .sftp()
@@ -772,12 +663,6 @@ impl SftpEntry {
     }
 
     pub fn mkdir_remote(&self, path: &str) -> Result<(), String> {
-        reject_parent_dir_components(path)?;
-        let name = std::path::Path::new(path)
-            .file_name()
-            .ok_or_else(|| "mkdir path has no file name".to_string())?
-            .to_string_lossy();
-        validate_path_segment(&name)?;
         let sftp = self
             .session
             .sftp()
@@ -936,13 +821,10 @@ impl SftpEntry {
     }
 
     pub fn open_remote(&self, session_id: &str, remote_path: &str) -> Result<String, String> {
-        // اسم خام remote می‌تونه & یا ..\\ داشته باشه؛ قبل از join تمیزش می‌کنیم
-        let file_name = sanitize_open_basename(
-            std::path::Path::new(remote_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file"),
-        );
+        let file_name = std::path::Path::new(remote_path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
 
         let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let rand_id = &rand_id[..8];
@@ -951,7 +833,7 @@ impl SftpEntry {
             .join(format!("{}_{}", session_id, rand_id));
         std::fs::create_dir_all(&app_temp_dir)
             .map_err(|e| format!("Create temp dir failed: {}", e))?;
-        let tmp_path = app_temp_dir.join(&file_name);
+        let tmp_path = app_temp_dir.join(file_name);
 
         let sftp = self
             .session
@@ -1039,10 +921,10 @@ impl SftpEntry {
                         if !proceed {
                             return Ok(());
                         }
-                        // overwrite تأیید شد — marker غریبه رو پاک کن؛ فایل ریموت
-                        // رو نگه می‌داریم تا upload_file بعد از نوشتن کامل جایگزین کنه
+                        // overwrite تأیید شد — marker/ریموت غریبه رو پاک کن
                         if !local_is_dir {
                             clear_upload_marker(local_path);
+                            let _ = sftp.unlink(std::path::Path::new(remote_path));
                         }
                     }
                 }
@@ -1132,7 +1014,7 @@ impl SftpEntry {
                             continue;
                         }
                         clear_upload_marker(&lp_str);
-                        // ریموت رو اینجا unlink نکن — upload_file بعد از موفقیت جایگزین می‌کنه
+                        let _ = sftp.unlink(std::path::Path::new(rp));
                     }
                 }
             }
@@ -1213,9 +1095,8 @@ impl SftpEntry {
                     if !proceed {
                         return Ok(());
                     }
-                    // فایل مقصد رو اینجا پاک نکن — download_file اول تو tmp می‌نویسه
-                    // و فقط بعد از موفقیت جایگزین می‌کنه؛ پاک کردن زودهنگام = از دست رفتن دیتا
                     if !is_dir {
+                        let _ = std::fs::remove_file(local_path);
                         clear_download_resume_files(local_path);
                     }
                 }
@@ -1291,30 +1172,28 @@ impl SftpEntry {
                             })
                             .unwrap_or(false);
 
-                // حتی با tmp قابل resume هم باید conflict بپرسیم؛ وگرنه rename
-                // نهایی فایل لوکال کاربر رو بی‌صدا overwrite می‌کنه.
-                let proceed = conflicts.resolve(&ConflictInfo {
-                    session_id: session_id.to_string(),
-                    file_name: pathbase(rp),
-                    dest_path: lp_str.clone(),
-                    kind: "file".to_string(),
-                    direction: "download".to_string(),
-                    existing_size: dest_size,
-                    existing_modified: dest_mtime.map(format_unix_timestamp),
-                    incoming_size: Some(*size),
-                    incoming_modified: remote_mtime.map(format_unix_timestamp),
-                })?;
-                if !proceed {
-                    offset += size;
-                    on_progress(TransferProgress {
+                if !has_our_tmp {
+                    let proceed = conflicts.resolve(&ConflictInfo {
                         session_id: session_id.to_string(),
                         file_name: pathbase(rp),
-                        bytes_transferred: offset,
-                        total_bytes: grand_total,
-                    });
-                    continue;
-                }
-                if !has_our_tmp {
+                        dest_path: lp_str.clone(),
+                        kind: "file".to_string(),
+                        direction: "download".to_string(),
+                        existing_size: dest_size,
+                        existing_modified: dest_mtime.map(format_unix_timestamp),
+                        incoming_size: Some(*size),
+                        incoming_modified: remote_mtime.map(format_unix_timestamp),
+                    })?;
+                    if !proceed {
+                        offset += size;
+                        on_progress(TransferProgress {
+                            session_id: session_id.to_string(),
+                            file_name: pathbase(rp),
+                            bytes_transferred: offset,
+                            total_bytes: grand_total,
+                        });
+                        continue;
+                    }
                     let _ = std::fs::remove_file(lp);
                     clear_download_resume_files(&lp_str);
                 }
@@ -1368,39 +1247,6 @@ fn pathbase(path: &str) -> String {
         .find(|s| !s.is_empty())
         .unwrap_or("file")
         .to_string()
-}
-
-/// اسم فایل temp برای Open remote رو از path traversal و متاکاراکترهای
-/// خطرناک (مخصوصاً `cmd.exe` روی ویندوز مثل `&` و `|`) پاک می‌کنه.
-fn sanitize_open_basename(name: &str) -> String {
-    let base = name
-        .rsplit(['/', '\\'])
-        .find(|part| !part.is_empty() && *part != "." && *part != "..")
-        .unwrap_or("file");
-
-    let cleaned: String = base
-        .chars()
-        .map(|c| {
-            if c.is_control()
-                || matches!(
-                    c,
-                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '&' | '%' | '^' | '!'
-                )
-            {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect();
-
-    // اسم خالی یا فقط‌نقطه روی ویندوز خراب می‌شه
-    let trimmed = cleaned.trim().trim_matches('.').to_string();
-    if trimmed.is_empty() {
-        "file".to_string()
-    } else {
-        trimmed
-    }
 }
 
 /// Creates `path` on the remote if it doesn't exist; errors if it exists as a non-directory.
@@ -1590,10 +1436,10 @@ impl SftpManager {
 }
 
 /// Handshake مجدد بیرون از قفل `SftpManager` — فقط قفل خود سشن موقع replace گرفته می‌شه.
-pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>, _session_id: &str) -> Result<(), String> {
+pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>, session_id: &str) -> Result<(), String> {
     let creds = {
         let guard = entry.lock().unwrap();
-        guard.keepalive_stop.store(true, Ordering::Relaxed);
+        guard.get_keepalive_stop().store(true, Ordering::Relaxed);
         guard.reconnect.clone()
     };
 
@@ -1607,13 +1453,14 @@ pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>, _session_id: &str) -> Resu
     };
     fn silent_log(_stage: &str, _msg: &str) {}
     let session = ssh::connect(&cfg, silent_log)?;
-    // بعد از reconnect باید keepalive دوباره بالا بیاد؛ وگرنه سشن idle دوباره می‌میره
-    let keepalive_stop = {
+
+    let new_stop = Arc::new(AtomicBool::new(false));
+    {
         let mut guard = entry.lock().unwrap();
         guard.replace_session(session);
-        guard.reset_keepalive_stop()
-    };
-    spawn_sftp_keepalive(Arc::clone(entry), keepalive_stop, &creds.hostname);
+        guard.keepalive_stop = Arc::clone(&new_stop);
+    }
+    spawn_sftp_keepalive(Arc::clone(entry), new_stop, session_id);
     Ok(())
 }
 
@@ -1656,34 +1503,6 @@ mod tests {
         let result = manager.get_session("nonexistent");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not found"));
-    }
-
-    #[test]
-    fn validate_path_segment_rejects_traversal() {
-        assert!(validate_path_segment("notes.txt").is_ok());
-        assert!(validate_path_segment("my-folder").is_ok());
-        assert!(validate_path_segment("../secrets.txt").is_err());
-        assert!(validate_path_segment("..\\secrets.txt").is_err());
-        assert!(validate_path_segment("/etc/passwd").is_err());
-        assert!(validate_path_segment("foo/bar").is_err());
-        assert!(validate_path_segment("..").is_err());
-        assert!(validate_path_segment(".").is_err());
-        assert!(validate_path_segment("").is_err());
-    }
-
-    #[test]
-    fn validate_same_dir_rename_blocks_escape() {
-        assert!(validate_same_dir_rename("/home/u/a.txt", "/home/u/b.txt").is_ok());
-        assert!(validate_same_dir_rename("/home/u/a.txt", "/home/u/../b.txt").is_err());
-        assert!(validate_same_dir_rename("/home/u/a.txt", "/etc/passwd").is_err());
-        assert!(validate_same_dir_rename("/home/u/a.txt", "/home/u/sub/b.txt").is_err());
-    }
-
-    #[test]
-    fn reject_parent_dir_components_blocks_dotdot() {
-        assert!(reject_parent_dir_components("/home/u/newdir").is_ok());
-        assert!(reject_parent_dir_components("/home/u/../evil").is_err());
-        assert!(reject_parent_dir_components("foo/../../bar").is_err());
     }
 
     #[test]
@@ -1781,41 +1600,6 @@ mod tests {
             ConflictDecision::Cancel
         });
         assert_eq!(h.resolve(&conflict_info()).unwrap_err(), "Cancelled");
-    }
-
-    #[test]
-    fn upload_temp_path_is_sidecar_not_destination() {
-        // آپلود overwrite باید اول بره تو *.termifai-uploading تا مقصد اصلی
-        // موقع شکست شبکه از بین نره
-        let remote = "/var/data/config.json";
-        let tmp = format!("{}.termifai-uploading", remote);
-        assert_eq!(tmp, "/var/data/config.json.termifai-uploading");
-        assert_ne!(tmp, remote);
-    }
-
-    #[test]
-    fn sanitize_open_basename_strips_cmd_metacharacters() {
-        assert_eq!(
-            sanitize_open_basename("x&calc.exe&y.txt"),
-            "x_calc.exe_y.txt"
-        );
-        assert_eq!(sanitize_open_basename("report|rm.txt"), "report_rm.txt");
-        assert_eq!(sanitize_open_basename("a<script>.txt"), "a_script_.txt");
-    }
-
-    #[test]
-    fn sanitize_open_basename_blocks_path_escape() {
-        assert_eq!(sanitize_open_basename("..\\..\\secret.txt"), "secret.txt");
-        assert_eq!(sanitize_open_basename("../evil.txt"), "evil.txt");
-        assert_eq!(sanitize_open_basename(".."), "file");
-        assert_eq!(sanitize_open_basename("."), "file");
-        assert_eq!(sanitize_open_basename(""), "file");
-    }
-
-    #[test]
-    fn sanitize_open_basename_keeps_safe_unicode_names() {
-        assert_eq!(sanitize_open_basename("گزارش.pdf"), "گزارش.pdf");
-        assert_eq!(sanitize_open_basename("notes (1).md"), "notes (1).md");
     }
 }
 

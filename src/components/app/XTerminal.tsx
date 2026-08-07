@@ -1,6 +1,6 @@
 import { useEffect, useRef, useLayoutEffect, useState, useCallback } from "react";
 import { Terminal } from "@xterm/xterm";
-import { Base64, ClipboardAddon } from "@xterm/addon-clipboard";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
@@ -18,7 +18,6 @@ import {
 } from "@/lib/api/terminal";
 import { subscribe, type UnlistenFn } from "@/lib/api/transport";
 import { readClipboardText } from "@/lib/api/clipboard";
-import { writeOnlyOsc52ClipboardProvider } from "@/lib/osc52-clipboard";
 import { open as openExternalUrl } from "@tauri-apps/plugin-shell";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { quotePathForShell } from "@/lib/shell-quote";
@@ -310,9 +309,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const reconnectAttemptRef = useRef(0);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  // phase رو تو ref نگه می‌داریم تا handleDisconnect از mount-effect بدون
-  // stale closure ببینه الان وسط reconnectیم یا نه.
-  const reconnectPhaseRef = useRef<ReconnectState["phase"] | null>(null);
   // The drag-drop event fires at the webview level, not per-DOM-element, and
   // every tab's XTerminal (including hidden ones) mounts this listener — so
   // handlers read isActive from a ref to ignore drops over background tabs.
@@ -340,12 +336,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       termRef.current?.write("\r\n\x1b[38;2;255;207;107m[Shell exited. Press any key to restart.]\x1b[0m\r\n");
       return;
     }
-    // وسط backoff/connecting یا بعد از failed، attempt counter رو صفر نکن —
-    // وگرنه هر keystroke روی session مرده از اول شروع می‌کنه و هیچ‌وقت failed نمی‌شه.
-    const phase = reconnectPhaseRef.current;
-    if (phase === "waiting" || phase === "connecting" || phase === "failed") {
-      return;
-    }
     termRef.current?.write("\r\n\x1b[38;2;255;99;99m[Connection to host lost.]\x1b[0m\r\n");
     reconnectAttemptRef.current = 0;
     scheduleReconnectAttempt();
@@ -356,14 +346,12 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     reconnectAttemptRef.current = attempt;
     if (attempt > MAX_RECONNECT_ATTEMPTS) {
       clearReconnectTimers();
-      reconnectPhaseRef.current = "failed";
       setReconnectState({ phase: "failed", attempt: MAX_RECONNECT_ATTEMPTS, countdown: 0 });
       return;
     }
 
     const delay = RECONNECT_DELAYS_SEC[attempt - 1];
     let remaining = delay;
-    reconnectPhaseRef.current = "waiting";
     setReconnectState({ phase: "waiting", attempt, countdown: remaining });
 
     clearReconnectTimers();
@@ -382,7 +370,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     // create an ownerless ssh session that (via tmux attach -D on the same
     // named session) kicks the client of whichever terminal replaced us.
     if (!termRef.current) return;
-    reconnectPhaseRef.current = "connecting";
     setReconnectState({ phase: "connecting", attempt, countdown: 0 });
     const staleSid = sessionRef.current;
     try {
@@ -432,7 +419,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       }
 
       reconnectAttemptRef.current = 0;
-      reconnectPhaseRef.current = null;
       setReconnectState(null);
       term?.write("\r\n\x1b[38;2;120;220;140m[Reconnected.]\x1b[0m\r\n");
     } catch {
@@ -444,7 +430,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
   const manualReconnect = useCallback(() => {
     clearReconnectTimers();
     reconnectAttemptRef.current = 0;
-    reconnectPhaseRef.current = null;
     void performReconnect(1).catch(() => {});
   }, []);
 
@@ -684,12 +669,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     return () => disp.dispose();
   }, [findOpen]);
 
-  // وقتی فوکوس روی ورودی Find هست، xterm کلید رو نمی‌بینه — از window می‌گیریم
-  // فقط تب فعال؛ وگرنه Find مخفی شورتکات تب جاری رو می‌دزده
+  // When Find input is focused, xterm doesn't see keys — we get them from window
   useEffect(() => {
     if (!findOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!isActiveRef.current) return;
       const shortcuts = shortcutsRefLocal.current;
       if (shortcuts["find-in-terminal"] && isShortcutMatch(event, shortcuts["find-in-terminal"])) {
         event.preventDefault();
@@ -877,11 +860,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
         }
       )
     );
-    // OSC52: ریموت می‌تونه به کلیپ‌بورد بنویسه (yank)، ولی کوئری خوندن
-    // (`\e]52;c;?\a`) عمداً رد می‌شه تا محتوای لوکال به PTY نره.
-    // سازنده Addon: (base64, provider) — provider تنها آرگومان اول نیست.
-    term.loadAddon(new ClipboardAddon(new Base64(), writeOnlyOsc52ClipboardProvider));
-    // باگ شمارش overlapping regex در addon-search@0.16 رو قبل از ساخت پچ کن
+    // OSC52 clipboard support: remote programs (tmux, nvim, …) can push
+    // copied text to the system clipboard through this escape sequence.
+    term.loadAddon(new ClipboardAddon());
+    // Patch overlapping regex counting bug in addon-search@0.16 before building
     patchSearchAddonNonOverlappingHighlights();
     const searchAddon = new SearchAddon();
     term.loadAddon(searchAddon);
@@ -989,8 +971,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
 
       if (shortcuts["terminal-paste"] && isShortcutMatch(event, shortcuts["terminal-paste"])) {
         if (event.type === "keydown") {
-          // بدون preventDefault مرورگر هم paste می‌زنه → متن دو بار می‌ره تو PTY
-          event.preventDefault();
           const sid = sessionRef.current;
           if (sid) {
             readClipboardText().then((text) => {
@@ -1234,10 +1214,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       // back asynchronously) exactly equals a known keyword, expand it right
       // away without waiting for a boundary character. Only eligible on
       // kind === "text" snippets with no variables.
-      // تو صفحهٔ جایگزین (vim/nano/…) اصلاً دست نزن — DEL+body فایل رو خراب می‌کنه.
-      if (term.buffer.active.type === "alternate") {
-        return;
-      }
       const lineText = lineTrackerRef.current.text;
       const match = /(\S+)$/.exec(lineText);
       const word = match?.[1];
@@ -1462,13 +1438,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
       highlighterRef.current = null;
       rtlOverlayRef.current = null;
       clearReconnectTimers();
-      // تب بسته شد → session بک‌اند رو هم ببند، وگرنه PTY/SSH یتیم می‌مونه
-      // (با resilient tmux حتی attach زنده‌ی بعدی رو هم با -AD می‌پره).
-      const sidToClose = sessionRef.current;
-      if (sidToClose) {
-        closeSession(sidToClose).catch(() => {});
-        sessionRef.current = null;
-      }
       appearanceRequestRef.current += 1;
       window.removeEventListener(terminalAppearanceChangedEvent, onAppearanceChanged);
       window.removeEventListener(appThemeChangedEvent, onAppThemeChanged);
@@ -1554,14 +1523,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     requestAnimationFrame(tick);
   }, []);
 
-  // تب غیرفعال مونده سوار — پالت/پرامپت/Find رو ببند تا کلید سراسری روی هاست مخفی شلیک نشه
-  useEffect(() => {
-    if (isActive) return;
-    setSnippetPalette(false);
-    setVariablePrompt(null);
-    if (findOpenRef.current) closeFind();
-  }, [isActive, closeFind]);
-
   // Re-fit and focus when this tab becomes active
   useEffect(() => {
     if (!isActive || isConnecting) return;
@@ -1613,8 +1574,6 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     });
 
   const executeSnippet = useCallback((snippet: Snippet, varValues?: Record<string, string>) => {
-    // تب مخفی نباید دستور بفرسته — پالت سراسری قبلاً روی هاست اشتباه شلیک می‌کرد
-    if (!isActiveRef.current) return;
     const sid = sessionRef.current;
     if (!sid) return;
     if ((snippet.kind === "command" || snippet.kind === "script") && !cursorAtLineStart()) return;
@@ -1673,11 +1632,10 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     executeSnippet(variablePrompt.snippet, variablePrompt.values);
   }, [variablePrompt, executeSnippet]);
 
-  // Palette keyboard navigation — فقط تب فعال؛ تب‌های display:none سوار می‌مونن
+  // Palette keyboard navigation
   useEffect(() => {
     if (!snippetPalette) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!isActiveRef.current) return;
       if (e.key === "Escape") {
         e.preventDefault();
         setSnippetPalette(false);

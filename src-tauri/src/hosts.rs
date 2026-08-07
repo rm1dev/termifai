@@ -6,9 +6,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use termifai_core::model::hosts::migrate_hosts_vault;
-pub use termifai_core::model::hosts::{
-    group_deletion_includes_host, AuthMethod, Host, HostGroup, HostsVault, OsKind,
-};
+pub use termifai_core::model::hosts::{AuthMethod, Host, HostGroup, HostsVault, OsKind};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -326,10 +324,6 @@ pub fn save_host_group(
                 error = Some(e);
                 return;
             }
-            if would_create_group_cycle(&vault.groups, &id, parent_id.as_deref()) {
-                error = Some("Group cannot be nested under its own descendant".to_string());
-                return;
-            }
             upsert_by_id(&mut vault.groups, group.clone(), |item| &item.id);
         })
         .map_err(|e| e.to_string())?;
@@ -343,24 +337,17 @@ pub fn save_host_group(
 }
 
 pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
-    // همون گارد remove_hosts: هاست sync server نباید با حذف گروه پاک بشه
-    let sync_state = crate::sync::load_state(app)?;
-    let sync_host_id = match &sync_state.backend {
-        Some(termifai_core::model::sync_state::SyncBackendConfig::Sftp { host_id, .. }) => {
-            Some(host_id.clone())
-        }
-        _ => None,
-    };
-
     let state = app.state::<AppState>();
     let mut removed_group_ids: Vec<String> = Vec::new();
     let mut removed_host_ids: Vec<String> = Vec::new();
-    let mut blocked_sync_host = false;
     state
         .hosts_store
         .update_with_migration(migrate_hosts_vault, |vault| {
-            let descendants = sftp_descendant_group_ids(&vault.groups, &id);
-            let candidate_host_ids: Vec<String> = vault
+            let descendants = descendant_group_ids(&vault.groups, &id);
+            removed_group_ids = std::iter::once(id.clone())
+                .chain(descendants.iter().cloned())
+                .collect();
+            removed_host_ids = vault
                 .hosts
                 .iter()
                 .filter(|host| {
@@ -371,18 +358,6 @@ pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
                 })
                 .map(|host| host.id.clone())
                 .collect();
-
-            if let Some(sync_id) = &sync_host_id {
-                if group_deletion_includes_host(vault, &id, sync_id) {
-                    blocked_sync_host = true;
-                    return;
-                }
-            }
-
-            removed_group_ids = std::iter::once(id.clone())
-                .chain(descendants.iter().cloned())
-                .collect();
-            removed_host_ids = candidate_host_ids;
 
             vault
                 .groups
@@ -395,15 +370,6 @@ pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
             });
         })
         .map_err(|e| e.to_string())?;
-
-    if blocked_sync_host {
-        return Err(
-            "Cannot delete this group — it contains the host configured as the sync server. \
-             Disconnect sync first."
-                .to_string(),
-        );
-    }
-
     crate::tombstones::record(
         app,
         crate::tombstones::EntityKind::Group,
@@ -435,8 +401,7 @@ pub fn test_host_connection(
         .map_err(|e| format!("Failed to resolve host: {}", e))?;
 
     let timeout_secs = request.timeout_secs.unwrap_or(8).clamp(2, 30);
-    // جلوگیری از تزریق آپشن OpenSSH از طریق user/hostname (مثل -oProxyCommand=…)
-    validate_ssh_cli_identity(user, hostname)?;
+    let target = format!("{}@{}", user, hostname);
     let mut command = portable_pty::CommandBuilder::new("ssh");
     command.arg("-o");
     command.arg("BatchMode=no");
@@ -461,7 +426,7 @@ pub fn test_host_connection(
         command.arg(key_path);
     }
 
-    push_ssh_cli_destination(&mut command, user, hostname);
+    command.arg(target);
     command.arg("echo");
     command.arg("termifai-ssh-ok");
 
@@ -607,65 +572,16 @@ fn validate_host(request: &SaveHostRequest) -> Result<(), String> {
     if request.name.trim().is_empty() {
         return Err("Host name is required".to_string());
     }
-    validate_ssh_cli_identity(request.user.trim(), request.hostname.trim())?;
+    if request.hostname.trim().is_empty() {
+        return Err("Hostname is required".to_string());
+    }
+    if request.user.trim().is_empty() {
+        return Err("Username is required".to_string());
+    }
     if request.port == 0 {
         return Err("Port must be between 1 and 65535".to_string());
     }
     Ok(())
-}
-
-/// OpenSSH treats a destination that begins with `-` as another option. A crafted
-/// username like `-oProxyCommand=…` therefore becomes local command execution when
-/// we spawn `ssh user@host`. Same for a leading-dash hostname if ever passed alone.
-/// Reject those shapes at save/test time and always pass `--` before the destination.
-pub(crate) fn validate_ssh_cli_identity(user: &str, hostname: &str) -> Result<(), String> {
-    validate_ssh_cli_user(user)?;
-    validate_ssh_cli_hostname(hostname)?;
-    Ok(())
-}
-
-fn validate_ssh_cli_user(user: &str) -> Result<(), String> {
-    if user.is_empty() {
-        return Err("Username is required".to_string());
-    }
-    if user.starts_with('-') {
-        return Err("Username must not start with '-'".to_string());
-    }
-    if user.contains('@') {
-        return Err("Username must not contain '@'".to_string());
-    }
-    if user
-        .chars()
-        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\0')
-    {
-        return Err("Username contains invalid characters".to_string());
-    }
-    Ok(())
-}
-
-fn validate_ssh_cli_hostname(hostname: &str) -> Result<(), String> {
-    if hostname.is_empty() {
-        return Err("Hostname is required".to_string());
-    }
-    if hostname.starts_with('-') {
-        return Err("Hostname must not start with '-'".to_string());
-    }
-    if hostname
-        .chars()
-        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '\0')
-    {
-        return Err("Hostname contains invalid characters".to_string());
-    }
-    Ok(())
-}
-
-pub(crate) fn push_ssh_cli_destination(
-    command: &mut portable_pty::CommandBuilder,
-    user: &str,
-    hostname: &str,
-) {
-    command.arg("--");
-    command.arg(format!("{user}@{hostname}"));
 }
 
 fn validate_group_exists(vault: &HostsVault, group_id: Option<&str>) -> Result<(), String> {
@@ -688,33 +604,11 @@ where
     }
 }
 
-fn would_create_group_cycle(groups: &[HostGroup], id: &str, parent_id: Option<&str>) -> bool {
-    let mut current = parent_id;
-    let mut seen = std::collections::HashSet::new();
-    while let Some(pid) = current {
-        if pid == id {
-            return true;
-        }
-        if !seen.insert(pid) {
-            return true;
-        }
-        current = groups
-            .iter()
-            .find(|g| g.id == pid)
-            .and_then(|g| g.parent_id.as_deref());
-    }
-    false
-}
-
-fn sftp_descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
+fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
     let mut descendants = Vec::new();
     let mut stack = vec![id.to_string()];
-    let mut visited = std::collections::HashSet::new();
 
     while let Some(parent_id) = stack.pop() {
-        if !visited.insert(parent_id.clone()) {
-            continue;
-        }
         for group in groups.iter().filter(|group| {
             group
                 .parent_id
@@ -832,25 +726,5 @@ mod tests {
             "Expected Ok(None) when password is empty"
         );
         assert_eq!(res_empty.unwrap(), None);
-    }
-
-    #[test]
-    fn rejects_ssh_option_injection_via_username() {
-        let err = validate_ssh_cli_identity("-oProxyCommand=touch /tmp/pwned #", "127.0.0.1")
-            .unwrap_err();
-        assert!(
-            err.contains("must not start with '-'"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn rejects_at_sign_and_whitespace_in_ssh_identity() {
-        assert!(validate_ssh_cli_identity("user@evil", "host").is_err());
-        assert!(validate_ssh_cli_identity("user name", "host").is_err());
-        assert!(validate_ssh_cli_identity("user", "-evilhost").is_err());
-        assert!(validate_ssh_cli_identity("user", "host name").is_err());
-        assert!(validate_ssh_cli_identity("ubuntu", "example.com").is_ok());
-        assert!(validate_ssh_cli_identity("ubuntu", "127.0.0.1").is_ok());
     }
 }

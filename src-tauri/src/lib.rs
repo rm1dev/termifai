@@ -26,8 +26,8 @@ use pty_manager::{PtyManager, TabInfo};
 use serde::Serialize;
 use sftp::{LocalFileEntry, RemoteFileEntry, SftpConnectRequest, SftpManager};
 use sftp_transfer::{
-    backoff_delay_secs, claim_transfer_slot, is_retryable_network_error, TransferStatusEvent,
-    TransferStatusKind, MAX_RECONNECT_ATTEMPTS,
+    backoff_delay_secs, is_retryable_network_error, TransferStatusEvent, TransferStatusKind,
+    MAX_RECONNECT_ATTEMPTS,
 };
 
 #[derive(Serialize, Clone)]
@@ -171,14 +171,6 @@ fn resize_session(
 
 #[tauri::command]
 fn close_session(state: State<AppState>, session_id: String) -> Result<(), String> {
-    // اگه snippet-run یه SFTP کمکی با همین session_id باز کرده، با بستن تب باید بره
-    if let Some(flag) = state.transfer_cancel_flags.lock().unwrap().get(&session_id) {
-        flag.store(true, Ordering::Relaxed);
-    }
-    {
-        let mut sftp_mgr = state.sftp_manager.lock().unwrap();
-        let _ = sftp_mgr.disconnect(&session_id);
-    }
     let manager = state.pty_manager.lock().unwrap();
     manager.close_session(&session_id)
 }
@@ -762,25 +754,12 @@ fn run_script_locally(
     let state = app.state::<AppState>();
     let local_temp_path =
         std::env::temp_dir().join(format!("termifai_run_{}.sh", snippet_exec::short_id()));
+    std::fs::write(&local_temp_path, script)
+        .map_err(|e| format!("Failed to write local temp script: {}", e))?;
     #[cfg(unix)]
     {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        // از اول 0600 بساز تا بین write و chmod لو نره
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&local_temp_path)
-            .map_err(|e| format!("Failed to write local temp script: {}", e))?;
-        file.write_all(script.as_bytes())
-            .map_err(|e| format!("Failed to write local temp script: {}", e))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(&local_temp_path, script)
-            .map_err(|e| format!("Failed to write local temp script: {}", e))?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&local_temp_path, std::fs::Permissions::from_mode(0o600));
     }
 
     let payload = snippet_exec::local_exec_payload(&local_temp_path.to_string_lossy(), run_as_sudo);
@@ -1151,16 +1130,13 @@ fn wait_for_manual_resume(
     }
 }
 
-fn spawn_sftp_transfer(
-    app: tauri::AppHandle,
-    session_id: String,
-    op: SftpTransferOp,
-) -> Result<(), String> {
-    // یه سشن فقط یه transfer فعال می‌تونه داشته باشه — وگرنه cancel/done قاطی می‌شن
+fn spawn_sftp_transfer(app: tauri::AppHandle, session_id: String, op: SftpTransferOp) {
     let cancel_flag = {
         let state = app.state::<AppState>();
         let mut flags = state.transfer_cancel_flags.lock().unwrap();
-        claim_transfer_slot(&mut flags, &session_id)?
+        let flag = Arc::new(AtomicBool::new(false));
+        flags.insert(session_id.clone(), Arc::clone(&flag));
+        flag
     };
     tokio::spawn(async move {
         let app_bg = app.clone();
@@ -1254,7 +1230,6 @@ fn spawn_sftp_transfer(
         }
         let _ = app.emit(&format!("sftp:{}:transfer-done", session_id), done);
     });
-    Ok(())
 }
 
 #[tauri::command]
@@ -1271,7 +1246,8 @@ async fn sftp_download(
             remote_path,
             local_path,
         },
-    )
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -1290,7 +1266,8 @@ async fn sftp_upload(
             remote_path,
             overwrite,
         },
-    )
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -1408,14 +1385,8 @@ async fn sftp_stat_remote(
 #[tauri::command]
 async fn sftp_rename_local(path: String, new_name: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        sftp::validate_path_segment(&new_name)?;
         let p = std::path::Path::new(&path);
         let dest = p.parent().ok_or("No parent dir")?.join(&new_name);
-        // Belt-and-suspenders: joined dest must stay under the same parent.
-        let parent = p.parent().ok_or("No parent dir")?;
-        if dest.parent() != Some(parent) {
-            return Err("Rename must stay in the same directory".to_string());
-        }
         std::fs::rename(p, &dest).map_err(|e| format!("Rename: {}", e))
     })
     .await
@@ -1442,12 +1413,6 @@ async fn sftp_delete_local(paths: Vec<String>) -> Result<(), String> {
 #[tauri::command]
 async fn sftp_mkdir_local(path: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        sftp::reject_parent_dir_components(&path)?;
-        let name = std::path::Path::new(&path)
-            .file_name()
-            .ok_or_else(|| "mkdir path has no file name".to_string())?
-            .to_string_lossy();
-        sftp::validate_path_segment(&name)?;
         std::fs::create_dir_all(&path).map_err(|e| format!("Create dir '{}': {}", path, e))
     })
     .await
@@ -1488,52 +1453,6 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     Ok(())
 }
 
-/// روی ویندوز `cmd /c start` با آرگومان‌های خام، متاکاراکترهایی مثل `&` رو
-/// به‌عنوان جداکننده فرمان می‌خونه — برای open از ShellExecute استفاده می‌کنیم.
-#[cfg(target_os = "windows")]
-fn windows_shell_open(file: &str, params: Option<&str>) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::UI::Shell::ShellExecuteW;
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-    fn wide(s: &str) -> Vec<u16> {
-        std::ffi::OsStr::new(s)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    }
-
-    let file_w = wide(file);
-    let params_w = params.map(wide);
-    let status = unsafe {
-        ShellExecuteW(
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            file_w.as_ptr(),
-            params_w
-                .as_ref()
-                .map(|p| p.as_ptr())
-                .unwrap_or(std::ptr::null()),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-    // برگشتی ShellExecute اگه ≤32 باشه یعنی خطا
-    if (status as isize) <= 32 {
-        Err(format!(
-            "Failed to open path (ShellExecute error {})",
-            status as isize
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_quote_param(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', ""))
-}
-
 #[tauri::command]
 fn sftp_open_local(path: String) -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -1547,7 +1466,10 @@ fn sftp_open_local(path: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    windows_shell_open(&path, None)?;
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", &path])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return Err("Platform not supported for open_local".to_string());
     Ok(())
@@ -1566,7 +1488,10 @@ fn sftp_open_with_local(path: String, app: String) -> Result<(), String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
-    windows_shell_open(&app, Some(&windows_quote_param(&path)))?;
+    std::process::Command::new("cmd")
+        .args(["/c", "start", "", &app, &path])
+        .spawn()
+        .map_err(|e| e.to_string())?;
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     return Err("Platform not supported for open_with_local".to_string());
     Ok(())
@@ -1625,7 +1550,9 @@ async fn sftp_open_remote(
         .arg(&tmp_path)
         .spawn();
     #[cfg(target_os = "windows")]
-    windows_shell_open(&tmp_path, None)?;
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", &tmp_path])
+        .spawn();
     Ok(tmp_path)
 }
 

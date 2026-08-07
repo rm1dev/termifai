@@ -80,21 +80,6 @@ impl CollectionKind {
     pub fn file_name(self) -> String {
         format!("col-{}.blob", self.as_str())
     }
-
-    /// اسم content-addressed — دو دستگاه همزمان دیگه روی یه فایل نمی‌زنن
-    pub fn addressed_file_name(self, blob_sha256: &str) -> String {
-        format!("col-{}-{}.blob", self.as_str(), blob_sha256)
-    }
-}
-
-/// اسم فایل collection؛ با sha می‌شه نسخهٔ immutable
-pub fn collection_file_name(name: &str, expected_sha256: Option<&str>) -> String {
-    match (CollectionKind::from_str(name), expected_sha256) {
-        (Some(kind), Some(sha)) if !sha.is_empty() => kind.addressed_file_name(sha),
-        (Some(kind), _) => kind.file_name(),
-        (None, Some(sha)) if !sha.is_empty() => format!("col-{name}-{sha}.blob"),
-        (None, _) => format!("col-{name}.blob"),
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug, Default)]
