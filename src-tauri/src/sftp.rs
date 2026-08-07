@@ -329,7 +329,6 @@ impl SftpEntry {
         self.keepalive_stop = Arc::clone(&stop);
         stop
     }
-    }
 }
 
 /// `set_keepalive` فقط config می‌کنه؛ باید دوره‌ای `keepalive_send` بزنیم وگرنه
@@ -352,7 +351,7 @@ fn spawn_sftp_keepalive(entry: Arc<Mutex<SftpEntry>>, stop: Arc<AtomicBool>, ses
                 consecutive_failures = 0;
                 continue;
             };
-            if stop.load(Ordering::Relaxed) || guard.is_keepalive_stopped() {
+            if stop.load(Ordering::Relaxed) || guard.keepalive_stop.load(Ordering::Relaxed) {
                 return;
             }
             match guard.session.keepalive_send() {
@@ -712,6 +711,7 @@ impl SftpEntry {
             sftp.rename(
                 std::path::Path::new(&remote_tmp),
                 std::path::Path::new(remote_path),
+                None,
             )
             .map_err(|e| {
                 // اگه rename ترکید، حداقل temp رو نگه می‌داریم تا بشه دستی نجات داد
@@ -935,10 +935,13 @@ impl SftpEntry {
     }
 
     pub fn open_remote(&self, session_id: &str, remote_path: &str) -> Result<String, String> {
-        let file_name = std::path::Path::new(remote_path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| "file".to_string());
+        // اسم خام remote می‌تونه & یا ..\\ داشته باشه؛ قبل از join تمیزش می‌کنیم
+        let file_name = sanitize_open_basename(
+            std::path::Path::new(remote_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("file"),
+        );
 
         let rand_id = uuid::Uuid::new_v4().to_string().replace('-', "");
         let rand_id = &rand_id[..8];
@@ -947,7 +950,7 @@ impl SftpEntry {
             .join(format!("{}_{}", session_id, rand_id));
         std::fs::create_dir_all(&app_temp_dir)
             .map_err(|e| format!("Create temp dir failed: {}", e))?;
-        let tmp_path = app_temp_dir.join(file_name);
+        let tmp_path = app_temp_dir.join(&file_name);
 
         let sftp = self
             .session
@@ -1305,33 +1308,13 @@ impl SftpEntry {
                     on_progress(TransferProgress {
                         session_id: session_id.to_string(),
                         file_name: pathbase(rp),
-                // حتی با tmp قابل resume هم باید conflict بپرسیم؛ وگرنه rename
-                // نهایی فایل لوکال کاربر رو بی‌صدا overwrite می‌کنه.
-                let proceed = conflicts.resolve(&ConflictInfo {
-                    session_id: session_id.to_string(),
-                    file_name: pathbase(rp),
-                    dest_path: lp_str.clone(),
-                    kind: "file".to_string(),
-                    direction: "download".to_string(),
-                    existing_size: dest_size,
-                    existing_modified: dest_mtime.map(format_unix_timestamp),
-                    incoming_size: Some(*size),
-                    incoming_modified: remote_mtime.map(format_unix_timestamp),
-                })?;
-                if !proceed {
-                    offset += size;
-                    on_progress(TransferProgress {
-                        session_id: session_id.to_string(),
-                        file_name: pathbase(rp),
                         bytes_transferred: offset,
                         total_bytes: grand_total,
                     });
                     continue;
                 }
-                }
                 if !has_our_tmp {
                     let _ = std::fs::remove_file(lp);
->>>>>>> e438865 (fix: block OSC52 clipboard read, sync-host group delete, SFTP resume overwrite)
                     clear_download_resume_files(&lp_str);
                 }
             }
@@ -1384,6 +1367,39 @@ fn pathbase(path: &str) -> String {
         .find(|s| !s.is_empty())
         .unwrap_or("file")
         .to_string()
+}
+
+/// اسم فایل temp برای Open remote رو از path traversal و متاکاراکترهای
+/// خطرناک (مخصوصاً `cmd.exe` روی ویندوز مثل `&` و `|`) پاک می‌کنه.
+fn sanitize_open_basename(name: &str) -> String {
+    let base = name
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty() && *part != "." && *part != "..")
+        .unwrap_or("file");
+
+    let cleaned: String = base
+        .chars()
+        .map(|c| {
+            if c.is_control()
+                || matches!(
+                    c,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '&' | '%' | '^' | '!'
+                )
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    // اسم خالی یا فقط‌نقطه روی ویندوز خراب می‌شه
+    let trimmed = cleaned.trim().trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed
+    }
 }
 
 /// Creates `path` on the remote if it doesn't exist; errors if it exists as a non-directory.
@@ -1573,10 +1589,10 @@ impl SftpManager {
 }
 
 /// Handshake مجدد بیرون از قفل `SftpManager` — فقط قفل خود سشن موقع replace گرفته می‌شه.
-pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>, session_id: &str) -> Result<(), String> {
+pub fn reconnect_entry(entry: &Arc<Mutex<SftpEntry>>, _session_id: &str) -> Result<(), String> {
     let creds = {
         let guard = entry.lock().unwrap();
-        guard.get_keepalive_stop().store(true, Ordering::Relaxed);
+        guard.keepalive_stop.store(true, Ordering::Relaxed);
         guard.reconnect.clone()
     };
 
@@ -1767,6 +1783,7 @@ mod tests {
     }
 
     #[test]
+    #[test]
     fn upload_temp_path_is_sidecar_not_destination() {
         // آپلود overwrite باید اول بره تو *.termifai-uploading تا مقصد اصلی
         // موقع شکست شبکه از بین نره
@@ -1774,6 +1791,31 @@ mod tests {
         let tmp = format!("{}.termifai-uploading", remote);
         assert_eq!(tmp, "/var/data/config.json.termifai-uploading");
         assert_ne!(tmp, remote);
+    }
+
+    #[test]
+    fn sanitize_open_basename_strips_cmd_metacharacters() {
+        assert_eq!(
+            sanitize_open_basename("x&calc.exe&y.txt"),
+            "x_calc.exe_y.txt"
+        );
+        assert_eq!(sanitize_open_basename("report|rm.txt"), "report_rm.txt");
+        assert_eq!(sanitize_open_basename("a<script>.txt"), "a_script_.txt");
+    }
+
+    #[test]
+    fn sanitize_open_basename_blocks_path_escape() {
+        assert_eq!(sanitize_open_basename("..\\..\\secret.txt"), "secret.txt");
+        assert_eq!(sanitize_open_basename("../evil.txt"), "evil.txt");
+        assert_eq!(sanitize_open_basename(".."), "file");
+        assert_eq!(sanitize_open_basename("."), "file");
+        assert_eq!(sanitize_open_basename(""), "file");
+    }
+
+    #[test]
+    fn sanitize_open_basename_keeps_safe_unicode_names() {
+        assert_eq!(sanitize_open_basename("گزارش.pdf"), "گزارش.pdf");
+        assert_eq!(sanitize_open_basename("notes (1).md"), "notes (1).md");
     }
 }
 

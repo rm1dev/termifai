@@ -7,8 +7,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Manager};
 use termifai_core::model::hosts::migrate_hosts_vault;
 pub use termifai_core::model::hosts::{
-    descendant_group_ids, group_deletion_includes_host, AuthMethod, Host, HostGroup, HostsVault,
-    OsKind,
+    group_deletion_includes_host, AuthMethod, Host, HostGroup, HostsVault, OsKind,
 };
 
 #[derive(Deserialize)]
@@ -360,7 +359,7 @@ pub fn remove_host_group(app: &AppHandle, id: String) -> Result<(), String> {
     state
         .hosts_store
         .update_with_migration(migrate_hosts_vault, |vault| {
-            let descendants = descendant_group_ids(&vault.groups, &id);
+            let descendants = sftp_descendant_group_ids(&vault.groups, &id);
             let candidate_host_ids: Vec<String> = vault
                 .hosts
                 .iter()
@@ -707,7 +706,7 @@ fn would_create_group_cycle(groups: &[HostGroup], id: &str, parent_id: Option<&s
     false
 }
 
-fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
+fn sftp_descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
     let mut descendants = Vec::new();
     let mut stack = vec![id.to_string()];
     let mut visited = std::collections::HashSet::new();
@@ -731,7 +730,6 @@ fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
     descendants
 }
 
->>>>>>> 7328609 (fix: prevent sync clobber, settings wipe, alt-screen expand, group cycles)
 /// Encrypt a to-be-saved password with the unlocked vault key. If the value is
 /// empty it becomes None. If the vault is locked, we return an error.
 /// A value that is already a "v1:" token is stored as-is: the edit form round-trips
