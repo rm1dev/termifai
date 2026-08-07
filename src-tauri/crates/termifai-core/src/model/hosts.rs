@@ -93,6 +93,40 @@ pub fn migrate_hosts_vault(value: &mut serde_json::Value) {
     }
 }
 
+/// شناسه زیر‌گروه‌های یک گروه (نه خود گروه).
+pub fn descendant_group_ids(groups: &[HostGroup], id: &str) -> Vec<String> {
+    let mut descendants = Vec::new();
+    let mut stack = vec![id.to_string()];
+
+    while let Some(parent_id) = stack.pop() {
+        for group in groups.iter().filter(|group| {
+            group
+                .parent_id
+                .as_ref()
+                .map(|current| current == &parent_id)
+                .unwrap_or(false)
+        }) {
+            descendants.push(group.id.clone());
+            stack.push(group.id.clone());
+        }
+    }
+
+    descendants
+}
+
+/// آیا حذف این گروه (و زیر‌گروه‌هاش) هاست مشخصی رو هم پاک می‌کنه؟
+pub fn group_deletion_includes_host(vault: &HostsVault, group_id: &str, host_id: &str) -> bool {
+    let descendants = descendant_group_ids(&vault.groups, group_id);
+    vault.hosts.iter().any(|host| {
+        host.id == host_id
+            && host
+                .group_id
+                .as_ref()
+                .map(|gid| gid == group_id || descendants.contains(gid))
+                .unwrap_or(false)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +136,59 @@ mod tests {
         let vault = HostsVault::default();
         let json = serde_json::to_string(&vault).unwrap();
         assert!(!json.contains("crypto"), "crypto must be omitted when None");
+    }
+
+    fn sample_host(id: &str, group_id: Option<&str>) -> Host {
+        Host {
+            id: id.into(),
+            name: id.into(),
+            user: "u".into(),
+            hostname: "h".into(),
+            port: 22,
+            os: OsKind::Other,
+            tags: vec![],
+            last_used: None,
+            group_id: group_id.map(str::to_string),
+            auth_method: None,
+            password: None,
+            ssh_key_id: None,
+            show_status_in_dashboard: None,
+            working_directory: None,
+            default_sftp_path: None,
+            updated_at: None,
+            sync_server: None,
+            resilient_session: None,
+        }
+    }
+
+    #[test]
+    fn group_deletion_detects_sync_host_in_nested_group() {
+        let vault = HostsVault {
+            version: 1,
+            hosts: vec![
+                sample_host("h-sync", Some("g-child")),
+                sample_host("h-other", Some("g-root")),
+            ],
+            groups: vec![
+                HostGroup {
+                    id: "g-root".into(),
+                    name: "root".into(),
+                    parent_id: None,
+                    updated_at: None,
+                },
+                HostGroup {
+                    id: "g-child".into(),
+                    name: "child".into(),
+                    parent_id: Some("g-root".into()),
+                    updated_at: None,
+                },
+            ],
+            crypto: None,
+        };
+
+        assert!(group_deletion_includes_host(&vault, "g-root", "h-sync"));
+        assert!(group_deletion_includes_host(&vault, "g-child", "h-sync"));
+        assert!(!group_deletion_includes_host(&vault, "g-child", "h-other"));
+        assert!(!group_deletion_includes_host(&vault, "g-root", "missing"));
     }
 }

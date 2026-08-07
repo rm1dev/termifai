@@ -119,10 +119,32 @@ fn open_url(url: &str) -> Result<(), String> {
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     #[cfg(target_os = "windows")]
     {
-        let escaped = url.replace("&", "^&");
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", "", &escaped])
-            .spawn();
+        // قبلاً فقط `&` رو با `^&` فرار می‌دادیم؛ بقیه متاکاراکترهای cmd
+        // هنوز خطرناک بودن. ShellExecute مسیر امن‌تریه.
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::ShellExecuteW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let wide: Vec<u16> = std::ffi::OsStr::new(url)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if (status as isize) <= 32 {
+            return Err(format!(
+                "Failed to open URL (ShellExecute error {})",
+                status as isize
+            ));
+        }
     }
     Ok(())
 }
@@ -548,6 +570,11 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
         .clone()
         .ok_or_else(|| "No sync backend configured".to_string())?;
     let master_password = resolve_master_password(request.master_password)?;
+    // بدون vault unlocked، decrypt_host_password می‌شه None و merge ممکنه
+    // پسوردهای ریموت رو با host بدون پسورد بازنویسی کنه — قبل از gather آنلاک کن
+    if !crate::vault::is_unlocked() {
+        crate::vault::op_unlock(app, &master_password)?;
+    }
     let device_id = ensure_device_id(app)?;
 
     // اگه فرانت تنظیمات نفرستاده، از کش دیسک استفاده کن (مسیر auto-sync)
@@ -571,16 +598,18 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
     };
     let _ = persist_settings_cache(app, &settings);
 
+    // Snapshot dirty gen قبل از gather تا ویرایش‌های وسط sync رو از دست ندیم
+    let dirty_gen_at_gather = crate::sync_auto::dirty_generation();
     let local = gather_local_snapshot(
         app,
         sync_state.sync_ssh_keys,
-        settings,
-        device_id,
+        settings.clone(),
+        device_id.clone(),
         sync_state.device_name.clone(),
     )?;
 
     let backend = build_backend(app, &backend_config)?;
-    let outcome = sync::run_sync(
+    let mut outcome = sync::run_sync(
         backend.as_ref(),
         local,
         &master_password,
@@ -588,7 +617,21 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
     )
     .map_err(|e| e.to_string())?;
 
+    let dirty_during_sync = crate::sync_auto::dirty_generation() != dirty_gen_at_gather;
+
     let applied = if outcome.local_changed {
+        // اگه وسط sync چیزی ذخیره شده، outcome قدیمی رو روی vault زنده
+        // replace نکن — اول با حالت فعلی دوباره merge کن.
+        if dirty_during_sync {
+            outcome = rebase_outcome_on_current_local(
+                app,
+                &outcome,
+                sync_state.sync_ssh_keys,
+                settings,
+                device_id,
+                sync_state.device_name.clone(),
+            )?;
+        }
         apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
         true
     } else {
@@ -616,13 +659,15 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
         at: synced_at.clone(),
     };
 
+    // فقط وقتی dirty رو پاک کن که از gather تا حالا ویرایش جدیدی نیومده باشه.
+    let still_dirty = crate::sync_auto::dirty_generation() != dirty_gen_at_gather;
     let state = app.state::<AppState>();
     state
         .sync_state_store
         .update_with_migration(migrate_sync_state, |s| {
             s.last_synced_blob_version = blob_version;
             s.last_sync_at = Some(synced_at);
-            s.dirty = false;
+            s.dirty = still_dirty;
             s.last_error = None;
             s.last_sync_stats = Some(stats);
             s.settings_cache = SettingsCache {
@@ -632,6 +677,10 @@ fn sync_now_inner(app: &AppHandle, request: SyncNowRequest) -> Result<SyncNowRes
             };
         })
         .map_err(|e| e.to_string())?;
+
+    if still_dirty {
+        crate::sync_auto::note_dirty();
+    }
 
     Ok(result)
 }
@@ -686,6 +735,11 @@ pub fn sync_import_foreign(
     if !crate::vault::is_unlocked() {
         return Err("Vault is locked".to_string());
     }
+    // هم‌زمانی با sync_now باعث apply/store موازی و state پاره‌پاره می‌شه
+    let _guard = sync_mutex()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
     let current_master_password = resolve_master_password(request.current_master_password)?;
 
     let backend = build_backend(app, &request.backend)?;
@@ -696,13 +750,15 @@ pub fn sync_import_foreign(
     let sync_state = load_state(app)?;
     let device_id = ensure_device_id(app)?;
     let device_name = sync_state.device_name.clone();
+    // مثل sync_now از کش واقعی استفاده کن — default خالی تم/شورتکات بقیه دستگاه‌ها رو پاک می‌کنه
+    let settings = crate::sync_auto::cache_to_settings(&sync_state.settings_cache);
 
     let outcome = if request.replace_remote {
         // Overwrite remote with this device's own state — no merge.
         let local = gather_local_snapshot(
             app,
             sync_state.sync_ssh_keys,
-            SettingsPayload::default(),
+            settings,
             device_id.clone(),
             device_name.clone(),
         )?;
@@ -711,18 +767,14 @@ pub fn sync_import_foreign(
         let local = gather_local_snapshot(
             app,
             sync_state.sync_ssh_keys,
-            SettingsPayload::default(),
+            settings,
             device_id.clone(),
             device_name.clone(),
         )?;
         sync::merge_snapshot(&local, Some(foreign_payload))
     };
 
-    apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
-
-    // Re-encrypt and re-upload under the current device's own master
-    // password with a fresh salt, so other devices hit the standard
-    // "master password changed elsewhere" re-link path on their next sync.
+    // اول remote رو بنویس، بعد local — اگه store بخوره local دست‌نخورده می‌مونه
     let new_salt = sync::random_sync_salt();
     let key = sync::derive_sync_key(&current_master_password, &new_salt)
         .map_err(|e| format!("Failed to derive sync key: {:?}", e))?;
@@ -759,6 +811,8 @@ pub fn sync_import_foreign(
         .store(&new_manifest, &blob_bytes, Some(manifest.blob_version))
         .map_err(|e| e.to_string())?;
 
+    apply_outcome(app, &outcome, sync_state.sync_ssh_keys)?;
+
     let state = app.state::<AppState>();
     state
         .sync_state_store
@@ -767,6 +821,11 @@ pub fn sync_import_foreign(
             s.last_synced_blob_version = new_manifest.blob_version;
             s.last_sync_at = Some(now_iso());
             s.dirty = false;
+            s.settings_cache = SettingsCache {
+                app_theme: to_cached_blob(outcome.settings.app_theme.clone()),
+                terminal_appearance: to_cached_blob(outcome.settings.terminal_appearance.clone()),
+                shortcuts: to_cached_blob(outcome.settings.shortcuts.clone()),
+            };
         })
         .map_err(|e| e.to_string())?;
 
@@ -921,6 +980,39 @@ fn build_backend(
     }
 }
 
+/// Re-merge a sync outcome against the live local vault so saves that landed
+/// while `run_sync` was in flight are not wiped by a full-store replace.
+fn rebase_outcome_on_current_local(
+    app: &AppHandle,
+    outcome: &SyncOutcome,
+    sync_ssh_keys: bool,
+    settings: SettingsPayload,
+    device_id: String,
+    device_name: Option<String>,
+) -> Result<SyncOutcome, String> {
+    let current = gather_local_snapshot(app, sync_ssh_keys, settings, device_id, device_name)?;
+    let remote = termifai_core::sync::SyncPayload {
+        format_version: sync::PAYLOAD_FORMAT_VERSION,
+        exported_at: now_iso(),
+        device_id: String::new(),
+        hosts: outcome.hosts.clone(),
+        groups: outcome.groups.clone(),
+        snippets: outcome.snippets.clone(),
+        snippet_groups: outcome.snippet_groups.clone(),
+        port_forwards: outcome.port_forwards.clone(),
+        ssh_keys: outcome.ssh_keys.clone(),
+        settings: outcome.settings.clone(),
+        tombstones: outcome.tombstones.clone(),
+    };
+    let mut rebased = sync::merge_snapshot(&current, Some(remote));
+    rebased.blob_version = outcome.blob_version;
+    rebased.uploaded = outcome.uploaded;
+    rebased.local_changed = true;
+    rebased.collections_uploaded = outcome.collections_uploaded.clone();
+    rebased.collections_downloaded = outcome.collections_downloaded.clone();
+    Ok(rebased)
+}
+
 fn gather_local_snapshot(
     app: &AppHandle,
     sync_ssh_keys: bool,
@@ -931,7 +1023,16 @@ fn gather_local_snapshot(
     let hosts_vault = crate::hosts::list_hosts(app)?;
     let mut hosts = hosts_vault.hosts;
     for host in hosts.iter_mut() {
+        let had_encrypted = host
+            .password
+            .as_deref()
+            .is_some_and(|p| p.starts_with("v1:"));
         host.password = crate::hosts::decrypt_host_password(host);
+        // اگه ciphertext هست ولی decrypt نشد (vault قفل)، sync رو قطع کن تا
+        // یه snapshot بدون پسورد آپلود/merge نشه و دیتای ریموت پاک نشه
+        if had_encrypted && host.password.is_none() {
+            return Err("vault_locked".to_string());
+        }
     }
 
     let ssh_keys = if sync_ssh_keys {
@@ -986,10 +1087,17 @@ fn apply_outcome(
                     continue;
                 }
             }
+            // take() قبلاً پسورد رو برداشته؛ اگه اینجا encrypt نشه و None بنویسیم،
+            // پسورد هاست برای همیشه پاک می‌شه. قفل بودن vault یا خطای encrypt باید
+            // کل apply رو abort کنه، نه اینکه بی‌سر و صدا passwordless ذخیره بشه.
             let guard = crate::vault::current_key();
-            if let Some(key) = guard.as_ref() {
-                host.password = termifai_core::crypto::encrypt_field(key, &plaintext).ok();
-            }
+            let key = guard.as_ref().ok_or_else(|| {
+                "Vault is locked — cannot apply synced host passwords".to_string()
+            })?;
+            host.password = Some(
+                termifai_core::crypto::encrypt_field(key, &plaintext)
+                    .map_err(|e| format!("Failed to encrypt synced host password: {e:?}"))?,
+            );
         }
     }
 
@@ -1269,18 +1377,32 @@ impl SyncBackend for SftpSyncBackend {
         Ok(contents)
     }
 
-    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+    fn fetch_collection(
+        &self,
+        name: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>, SyncError> {
         let session = self.connect().map_err(SyncError::Backend)?;
         let sftp = session
             .sftp()
             .map_err(|e| SyncError::Backend(e.to_string()))?;
         let remote_dir = self.resolve_remote_dir(&sftp)?;
+        use std::io::Read;
+        if let Some(sha) = expected_sha256.filter(|s| !s.is_empty()) {
+            let addressed = sync::collections::collection_file_name(name, Some(sha));
+            let path = remote_dir.join(addressed);
+            if let Ok(mut file) = sftp.open(&path) {
+                let mut contents = Vec::new();
+                file.read_to_end(&mut contents)
+                    .map_err(|e| SyncError::Io(e.to_string()))?;
+                return Ok(contents);
+            }
+        }
         let file_name = CollectionKind::from_str(name)
             .map(|k| k.file_name())
             .unwrap_or_else(|| format!("col-{name}.blob"));
         let path = remote_dir.join(file_name);
         let mut file = sftp.open(&path).map_err(|_| SyncError::NotFound)?;
-        use std::io::Read;
         let mut contents = Vec::new();
         file.read_to_end(&mut contents)
             .map_err(|e| SyncError::Io(e.to_string()))?;
@@ -1409,6 +1531,22 @@ impl SyncBackend for SftpSyncBackend {
 
         use std::io::Write;
         for (name, bytes) in changed {
+            let sha = sync::sha256_hex(bytes);
+            let addressed_name = sync::collections::collection_file_name(name, Some(&sha));
+            let addressed_path = remote_dir.join(&addressed_name);
+            let addressed_tmp = remote_dir.join(format!("{addressed_name}.tmp"));
+            {
+                let mut f = sftp
+                    .create(&addressed_tmp)
+                    .map_err(|e| SyncError::Backend(e.to_string()))?;
+                f.write_all(bytes)
+                    .map_err(|e| SyncError::Io(e.to_string()))?;
+            }
+            let _ = sftp.unlink(&addressed_path);
+            sftp.rename(&addressed_tmp, &addressed_path, None)
+                .map_err(|e| SyncError::Backend(e.to_string()))?;
+
+            // alias پایدار برای کلاینت قدیمی
             let file_name = CollectionKind::from_str(name)
                 .map(|k| k.file_name())
                 .unwrap_or_else(|| format!("col-{name}.blob"));
