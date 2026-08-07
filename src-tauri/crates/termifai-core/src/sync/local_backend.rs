@@ -67,7 +67,21 @@ impl SyncBackend for LocalDirBackend {
         Ok(fs::read(self.blob_path())?)
     }
 
-    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+    fn fetch_collection(
+        &self,
+        name: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>, SyncError> {
+        // اول content-addressed، بعد alias پایدار (سازگاری با دیتای قدیمی)
+        if let Some(sha) = expected_sha256.filter(|s| !s.is_empty()) {
+            let addressed = self.dir.join(crate::sync::collections::collection_file_name(
+                name,
+                Some(sha),
+            ));
+            if addressed.exists() {
+                return Ok(fs::read(addressed)?);
+            }
+        }
         let path = self.collection_path(name);
         if !path.exists() {
             return Err(SyncError::NotFound);
@@ -100,11 +114,43 @@ impl SyncBackend for LocalDirBackend {
         fs::create_dir_all(&self.dir)?;
         self.cas_check(expected_blob_version)?;
 
+        // محتوای immutable با اسم hash؛ بازندهٔ CAS دیگه blob برنده رو overwrite نمی‌کنه
+        let mut written_addressed: Vec<PathBuf> = Vec::with_capacity(changed.len());
         for (name, bytes) in changed {
-            let path = self.collection_path(name);
-            let tmp = path.with_extension("blob.tmp");
-            fs::write(&tmp, bytes)?;
-            fs::rename(&tmp, &path)?;
+            let sha = crate::sync::payload::sha256_hex(bytes);
+            let addressed = self
+                .dir
+                .join(crate::sync::collections::collection_file_name(name, Some(&sha)));
+            let tmp = addressed.with_extension("blob.tmp");
+            if let Err(e) = fs::write(&tmp, bytes) {
+                for path in &written_addressed {
+                    let _ = fs::remove_file(path);
+                }
+                let _ = fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            if let Err(e) = fs::rename(&tmp, &addressed) {
+                for path in &written_addressed {
+                    let _ = fs::remove_file(path);
+                }
+                let _ = fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            written_addressed.push(addressed);
+
+            // alias پایدار برای کلاینت‌های قدیمی / fetch بدون sha
+            let stable = self.collection_path(name);
+            let stable_tmp = stable.with_extension("blob.tmp");
+            if fs::write(&stable_tmp, bytes).is_ok() {
+                let _ = fs::rename(&stable_tmp, &stable);
+            } else {
+                let _ = fs::remove_file(&stable_tmp);
+            }
+        }
+
+        if let Err(e) = self.cas_check(expected_blob_version) {
+            // addressedهای این تلاش orphan می‌مونن؛ بی‌خطره چون منیفست روشون اشاره نمی‌کنه
+            return Err(e);
         }
 
         // Manifest last — readers that see the new index find blobs already in place.
@@ -201,7 +247,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(backend.fetch_collection("hosts").unwrap(), b"enc-hosts");
+        assert_eq!(backend.fetch_collection("hosts", None).unwrap(), b"enc-hosts");
+        let sha = crate::sync::payload::sha256_hex(b"enc-hosts");
+        assert_eq!(
+            backend.fetch_collection("hosts", Some(&sha)).unwrap(),
+            b"enc-hosts"
+        );
         assert!(!backend.blob_path().exists());
         fs::remove_dir_all(&dir).ok();
     }

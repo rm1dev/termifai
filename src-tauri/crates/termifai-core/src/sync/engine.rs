@@ -355,13 +355,34 @@ fn load_remote_payload(
                 continue;
             }
 
-            match backend.fetch_collection(name) {
+            let expected_sha = manifest
+                .collections
+                .get(name)
+                .map(|m| m.blob_sha256.as_str());
+            match backend.fetch_collection(name, expected_sha) {
                 Ok(bytes) => {
+                    // اگه blob با hash منیفست نخونه، یعنی یه writer وسط race
+                    // فایل پایدار رو خراب کرده — merge نکن، خطا بده
+                    if let Some(meta) = manifest.collections.get(name) {
+                        let actual = sha256_hex(&bytes);
+                        if actual != meta.blob_sha256 {
+                            return Err(SyncError::Backend(format!(
+                                "collection '{name}' failed integrity check (expected {}, got {})",
+                                meta.blob_sha256, actual
+                            )));
+                        }
+                    }
                     let piece = decrypt_collection(key, kind, &bytes)?;
                     pieces.insert(kind, piece);
                     downloaded.push(name.to_string());
                 }
-                Err(SyncError::NotFound) => {}
+                // مانیفست می‌گه این collection هست؛ NotFound یعنی partial upload /
+                // lag بک‌اند — خالی فرض کردنش tombstone/host رو غلط merge می‌کنه.
+                Err(SyncError::NotFound) => {
+                    return Err(SyncError::Backend(format!(
+                        "collection '{name}' listed in manifest but blob is missing"
+                    )));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -441,11 +462,28 @@ pub fn fetch_remote_payload(
             if !manifest.collections.contains_key(name) {
                 continue;
             }
-            match backend.fetch_collection(name) {
+            let expected_sha = manifest
+                .collections
+                .get(name)
+                .map(|m| m.blob_sha256.as_str());
+            match backend.fetch_collection(name, expected_sha) {
                 Ok(bytes) => {
+                    if let Some(meta) = manifest.collections.get(name) {
+                        let actual = sha256_hex(&bytes);
+                        if actual != meta.blob_sha256 {
+                            return Err(SyncError::Backend(format!(
+                                "collection '{name}' failed integrity check (expected {}, got {})",
+                                meta.blob_sha256, actual
+                            )));
+                        }
+                    }
                     pieces.insert(kind, decrypt_collection(&key, kind, &bytes)?);
                 }
-                Err(SyncError::NotFound) => {}
+                Err(SyncError::NotFound) => {
+                    return Err(SyncError::Backend(format!(
+                        "collection '{name}' listed in manifest but blob is missing"
+                    )));
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -559,7 +597,7 @@ mod tests {
         )
         .unwrap();
         assert!(first.collections_uploaded.contains(&"hosts".to_string()));
-        let hosts_bytes = backend.fetch_collection("hosts").unwrap();
+        let hosts_bytes = backend.fetch_collection("hosts", None).unwrap();
 
         // فقط settings عوض شده — hosts نباید دوباره آپلود بشه
         let mut local = snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]);
@@ -571,7 +609,7 @@ mod tests {
         assert_eq!(second.blob_version, 2);
         assert!(second.collections_uploaded.contains(&"settings".to_string()));
         assert!(!second.collections_uploaded.contains(&"hosts".to_string()));
-        assert_eq!(backend.fetch_collection("hosts").unwrap(), hosts_bytes);
+        assert_eq!(backend.fetch_collection("hosts", None).unwrap(), hosts_bytes);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -680,6 +718,105 @@ mod tests {
         assert_eq!(manifest.blob_version, 1);
         assert_eq!(payload.hosts.len(), 1);
         assert_eq!(payload.hosts[0].password.as_deref(), Some("s3cret"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    #[test]
+    fn missing_collection_blob_listed_in_manifest_aborts_sync() {
+        let dir = tmp_dir("missing-col-blob");
+        let backend = LocalDirBackend::new(&dir);
+        let device_a = snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]);
+        run_sync(&backend, device_a, "hunter2", "default").unwrap();
+
+        // مانیفست هنوز hosts رو لیست می‌کنه ولی blob نیست — نباید empty merge بشه
+        let hosts_path = dir.join(CollectionKind::Hosts.file_name());
+        std::fs::remove_file(&hosts_path).unwrap();
+
+        let device_b = snapshot("dev-b", vec![host("h2", "other", "2026-01-02T00:00:00Z")]);
+        let result = run_sync(&backend, device_b, "hunter2", "default");
+        assert!(
+            matches!(&result, Err(SyncError::Backend(msg)) if msg.contains("listed in manifest")),
+            "expected Backend error for missing collection blob"
+        );
+
+        let restore = fetch_remote_payload(&backend, "hunter2");
+        assert!(
+            matches!(&restore, Err(SyncError::Backend(msg)) if msg.contains("listed in manifest")),
+            "restore path must also refuse a partial remote"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupted_stable_alias_still_reads_addressed_object() {
+        let dir = tmp_dir("corrupt-alias");
+        let backend = LocalDirBackend::new(&dir);
+        run_sync(
+            &backend,
+            snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]),
+            "hunter2",
+            "default",
+        )
+        .unwrap();
+
+        // alias پایدار رو خراب کن — شبیه بازندهٔ race که col-hosts.blob رو overwrite کرده
+        std::fs::write(dir.join("col-hosts.blob"), b"clobbered-by-loser").unwrap();
+
+        let device_b = snapshot("dev-b", vec![host("h2", "other", "2026-01-02T00:00:00Z")]);
+        let outcome = run_sync(&backend, device_b, "hunter2", "default").unwrap();
+        let mut ids: Vec<&str> = outcome.hosts.iter().map(|h| h.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["h1", "h2"],
+            "addressed blob must win over a clobbered stable alias"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn integrity_check_rejects_mismatched_collection_bytes() {
+        let dir = tmp_dir("integrity-fail");
+        let backend = LocalDirBackend::new(&dir);
+        run_sync(
+            &backend,
+            snapshot("dev-a", vec![host("h1", "prod", "2026-01-01T00:00:00Z")]),
+            "hunter2",
+            "default",
+        )
+        .unwrap();
+
+        let manifest = backend.fetch_manifest().unwrap().unwrap();
+        let sha = manifest
+            .collections
+            .get("hosts")
+            .expect("hosts meta")
+            .blob_sha256
+            .clone();
+        let addressed = dir.join(crate::sync::collections::collection_file_name(
+            "hosts",
+            Some(&sha),
+        ));
+        // هم addressed هم alias رو خراب کن تا integrity واقعاً بجنگه
+        std::fs::write(&addressed, b"not-the-ciphertext").unwrap();
+        std::fs::write(dir.join("col-hosts.blob"), b"not-the-ciphertext").unwrap();
+
+        let device_b = snapshot("dev-b", vec![host("h2", "other", "2026-01-02T00:00:00Z")]);
+        let result = run_sync(&backend, device_b, "hunter2", "default");
+        match result {
+            Err(SyncError::Backend(msg)) => {
+                assert!(
+                    msg.contains("integrity check"),
+                    "unexpected backend error: {msg}"
+                );
+            }
+            Ok(_) => panic!("expected integrity Backend error, got Ok"),
+            Err(other) => panic!("expected integrity Backend error, got {other}"),
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
