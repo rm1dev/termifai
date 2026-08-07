@@ -680,7 +680,8 @@ impl SftpEntry {
                     .write_all(&buf[..n])
                     .map_err(|e| format!("write remote: {}", e))?;
                 bytes_transferred += n as u64;
-                if last_progress.elapsed() >= PROGRESS_THROTTLE || bytes_transferred >= total_bytes {
+                if last_progress.elapsed() >= PROGRESS_THROTTLE || bytes_transferred >= total_bytes
+                {
                     last_progress = Instant::now();
                     on_progress(TransferProgress {
                         session_id: session_id.to_string(),
@@ -1782,7 +1783,6 @@ mod tests {
         assert_eq!(h.resolve(&conflict_info()).unwrap_err(), "Cancelled");
     }
 
-    #[test]
     #[test]
     fn upload_temp_path_is_sidecar_not_destination() {
         // آپلود overwrite باید اول بره تو *.termifai-uploading تا مقصد اصلی

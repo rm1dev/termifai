@@ -836,11 +836,8 @@ mod tests {
 
     #[test]
     fn rejects_ssh_option_injection_via_username() {
-        let err = validate_ssh_cli_identity(
-            "-oProxyCommand=touch /tmp/pwned #",
-            "127.0.0.1",
-        )
-        .unwrap_err();
+        let err = validate_ssh_cli_identity("-oProxyCommand=touch /tmp/pwned #", "127.0.0.1")
+            .unwrap_err();
         assert!(
             err.contains("must not start with '-'"),
             "unexpected error: {err}"

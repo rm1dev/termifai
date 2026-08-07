@@ -172,12 +172,7 @@ fn resize_session(
 #[tauri::command]
 fn close_session(state: State<AppState>, session_id: String) -> Result<(), String> {
     // اگه snippet-run یه SFTP کمکی با همین session_id باز کرده، با بستن تب باید بره
-    if let Some(flag) = state
-        .transfer_cancel_flags
-        .lock()
-        .unwrap()
-        .get(&session_id)
-    {
+    if let Some(flag) = state.transfer_cancel_flags.lock().unwrap().get(&session_id) {
         flag.store(true, Ordering::Relaxed);
     }
     {
