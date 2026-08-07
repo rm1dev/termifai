@@ -148,10 +148,8 @@ impl SyncBackend for LocalDirBackend {
             }
         }
 
-        if let Err(e) = self.cas_check(expected_blob_version) {
-            // addressedهای این تلاش orphan می‌مونن؛ بی‌خطره چون منیفست روشون اشاره نمی‌کنه
-            return Err(e);
-        }
+        // addressedهای این تلاش orphan می‌مونن؛ بی‌خطره چون منیفست روشون اشاره نمی‌کنه
+        self.cas_check(expected_blob_version)?;
 
         // Manifest last — readers that see the new index find blobs already in place.
         self.write_manifest(manifest)?;
