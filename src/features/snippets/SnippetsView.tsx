@@ -209,7 +209,9 @@ export function SnippetsView() {
   const dragSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
   );
-  const rootSnippets = visibleSnippets.filter((s) => !s.groupId);
+  const rootSnippets = visibleSnippets.filter(
+    (s) => !s.groupId || !groups.some((group) => group.id === s.groupId)
+  );
   const rootGroups = groups.filter((g) => !g.parentId);
   const isSearching = query.trim().length > 0;
 
