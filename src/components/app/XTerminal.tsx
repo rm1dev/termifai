@@ -684,10 +684,12 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     return () => disp.dispose();
   }, [findOpen]);
 
-  // When Find input is focused, xterm doesn't see keys — we get them from window
+  // وقتی فوکوس روی ورودی Find هست، xterm کلید رو نمی‌بینه — از window می‌گیریم
+  // فقط تب فعال؛ وگرنه Find مخفی شورتکات تب جاری رو می‌دزده
   useEffect(() => {
     if (!findOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      if (!isActiveRef.current) return;
       const shortcuts = shortcutsRefLocal.current;
       if (shortcuts["find-in-terminal"] && isShortcutMatch(event, shortcuts["find-in-terminal"])) {
         event.preventDefault();
@@ -1552,6 +1554,14 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     requestAnimationFrame(tick);
   }, []);
 
+  // تب غیرفعال مونده سوار — پالت/پرامپت/Find رو ببند تا کلید سراسری روی هاست مخفی شلیک نشه
+  useEffect(() => {
+    if (isActive) return;
+    setSnippetPalette(false);
+    setVariablePrompt(null);
+    if (findOpenRef.current) closeFind();
+  }, [isActive, closeFind]);
+
   // Re-fit and focus when this tab becomes active
   useEffect(() => {
     if (!isActive || isConnecting) return;
@@ -1603,6 +1613,8 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     });
 
   const executeSnippet = useCallback((snippet: Snippet, varValues?: Record<string, string>) => {
+    // تب مخفی نباید دستور بفرسته — پالت سراسری قبلاً روی هاست اشتباه شلیک می‌کرد
+    if (!isActiveRef.current) return;
     const sid = sessionRef.current;
     if (!sid) return;
     if ((snippet.kind === "command" || snippet.kind === "script") && !cursorAtLineStart()) return;
@@ -1661,10 +1673,11 @@ export function XTerminal({ sessionId, initialCommand, cwd, hostId, readyMarker,
     executeSnippet(variablePrompt.snippet, variablePrompt.values);
   }, [variablePrompt, executeSnippet]);
 
-  // Palette keyboard navigation
+  // Palette keyboard navigation — فقط تب فعال؛ تب‌های display:none سوار می‌مونن
   useEffect(() => {
     if (!snippetPalette) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      if (!isActiveRef.current) return;
       if (e.key === "Escape") {
         e.preventDefault();
         setSnippetPalette(false);
