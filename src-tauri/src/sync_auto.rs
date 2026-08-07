@@ -91,7 +91,7 @@ fn run_auto_sync(app: &AppHandle) {
     let settings = cache_to_settings(&state.settings_cache);
     // اگه یه sync دیگه قفل رو گرفته، None می‌گیریم — باید دوباره زمان‌بندی کنیم
     // وگرنه dirty پاک می‌شه/می‌مونه ولی دیگه push اتفاق نمی‌افته.
-    match sync::try_sync_now(
+    if sync::try_sync_now(
         app,
         SyncNowRequest {
             master_password: None,
@@ -99,9 +99,10 @@ fn run_auto_sync(app: &AppHandle) {
             terminal_appearance: Some(settings.terminal_appearance),
             shortcuts: Some(settings.shortcuts),
         },
-    ) {
-        None => note_dirty(),
-        Some(_) => {}
+    )
+    .is_none()
+    {
+        note_dirty();
     }
 }
 
