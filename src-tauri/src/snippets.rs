@@ -105,9 +105,6 @@ fn delete_script_file(dir: &std::path::Path, id: &str) {
 fn write_synced_script_bodies(
     dir: &std::path::Path,
     snippets: Vec<Snippet>,
-fn write_synced_script_bodies(
-    dir: &std::path::Path,
-    snippets: Vec<Snippet>,
 ) -> Result<(Vec<Snippet>, std::collections::HashSet<String>), String> {
     for snippet in &snippets {
         validate_snippet_id(&snippet.id)?;
@@ -160,7 +157,7 @@ pub fn apply_synced_snippets(
     groups: Vec<SnippetGroup>,
 ) -> Result<(), String> {
     let dir = get_snippets_dir(app)?;
-    let (vault_snippets, keep_script_ids) = write_synced_script_bodies(&dir, snippets)?;
+    let (mut vault_snippets, keep_script_ids) = write_synced_script_bodies(&dir, snippets)?;
 
     // اگه گروهی tombstone شده ولی snippet هنوز group_id داره، بیارش به root
     clear_orphan_group_ids(&mut vault_snippets, &groups);
@@ -876,7 +873,7 @@ mod tests {
         // Must not hang / grow forever on a mutual parent cycle.
         assert!(descendants.len() <= 2);
     }
-=======
+    #[test]
     fn clear_orphan_group_ids_moves_snippets_to_root() {
         let groups = vec![SnippetGroup {
             id: "alive".to_string(),
@@ -918,6 +915,5 @@ mod tests {
         clear_orphan_group_ids(&mut snippets, &groups);
         assert!(snippets[0].group_id.is_none());
         assert_eq!(snippets[1].group_id.as_deref(), Some("alive"));
->>>>>>> 901601f (fix: SSH CLI option injection, key perms, vault session forge, orphan snippets)
     }
 }
