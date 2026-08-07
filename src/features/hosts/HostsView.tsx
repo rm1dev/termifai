@@ -744,8 +744,11 @@ function HostModal({
     getHostPassword(host.id)
       .then((pw) => {
         if (cancelled) return;
+        // null یعنی vault قفل/decrypt fail — passwordLoaded رو true نکن،
+        // وگرنه effectivePassword می‌شه "" و Save پسورد ذخیره‌شده رو پاک می‌کنه.
+        if (pw == null) return;
         // Don't clobber anything the user already typed.
-        setPassword((curr) => curr || pw || "");
+        setPassword((curr) => curr || pw);
         setPasswordLoaded(true);
       })
       .catch(() => {});

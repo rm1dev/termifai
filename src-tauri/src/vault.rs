@@ -16,6 +16,7 @@ fn cell() -> &'static Mutex<Option<VaultKey>> {
 
 const KEYCHAIN_SERVICE: &str = "termifai";
 const KEYCHAIN_ACCOUNT: &str = "vault-master-password";
+const KEYCHAIN_SESSION_ACCOUNT: &str = "vault-session-token";
 
 pub fn current_key() -> MutexGuard<'static, Option<VaultKey>> {
     cell().lock().expect("vault mutex poisoned")
@@ -108,23 +109,89 @@ pub fn set_lock_policy(app: &AppHandle, policy: LockPolicy) -> Result<(), String
 }
 
 // ── Session token ─────────────────────────────────────────────────────────────
-// $TMPDIR on macOS is per-user-session and is cleared on logout/restart.
-// Writing a token there lets us detect "is this the same session?" cheaply.
+// On macOS, $TMPDIR is per-user-session and cleared on logout/restart — a simple
+// presence file there detects "same login session?".
+// On Linux, `/tmp` is shared and world-sticky: a predictable
+// `termifai-vault-session` file can be planted after reboot to skip the
+// OnRestart re-prompt while the keychain still holds the master password.
+// Linux therefore binds the session to the kernel boot_id stored in the
+// keychain instead of trusting a forgeable temp file.
 
 fn session_token_path() -> PathBuf {
+    // Prefer the per-user runtime dir when available (cleared on logout).
+    if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        let runtime = runtime.trim();
+        if !runtime.is_empty() {
+            return PathBuf::from(runtime).join("termifai-vault-session");
+        }
+    }
     std::env::temp_dir().join("termifai-vault-session")
 }
 
+fn legacy_tmp_session_token_path() -> PathBuf {
+    std::env::temp_dir().join("termifai-vault-session")
+}
+
+fn session_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_SESSION_ACCOUNT)
+        .map_err(|e| format!("Keychain unavailable: {e}"))
+}
+
+fn linux_boot_session_marker() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let boot_id = boot_id.trim();
+        if boot_id.is_empty() {
+            return None;
+        }
+        return Some(format!("boot:{boot_id}"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 fn touch_session_token() {
-    let _ = std::fs::write(session_token_path(), b"1");
+    if let Some(marker) = linux_boot_session_marker() {
+        if let Ok(entry) = session_entry() {
+            let _ = entry.set_password(&marker);
+        }
+        // فایل قدیمی و forgeable تو /tmp رو پاک کن تا کسی روش حساب نکنه
+        let _ = std::fs::remove_file(legacy_tmp_session_token_path());
+        return;
+    }
+
+    let path = session_token_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"1");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
 }
 
 fn session_alive() -> bool {
+    if let Some(marker) = linux_boot_session_marker() {
+        return session_entry()
+            .ok()
+            .and_then(|entry| entry.get_password().ok())
+            .map(|stored| stored == marker)
+            .unwrap_or(false);
+    }
     session_token_path().exists()
 }
 
 pub fn clear_session_token() {
     let _ = std::fs::remove_file(session_token_path());
+    let _ = std::fs::remove_file(legacy_tmp_session_token_path());
+    if let Ok(entry) = session_entry() {
+        let _ = entry.delete_credential();
+    }
 }
 
 // ── Vault status ──────────────────────────────────────────────────────────────
@@ -309,5 +376,15 @@ mod tests {
         assert!(is_unlocked());
         clear();
         assert!(!is_unlocked());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_boot_session_marker_is_stable_within_boot() {
+        let a = linux_boot_session_marker().expect("boot_id should be readable");
+        let b = linux_boot_session_marker().expect("boot_id should be readable");
+        assert_eq!(a, b);
+        assert!(a.starts_with("boot:"));
+        assert!(a.len() > 5);
     }
 }
