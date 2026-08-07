@@ -279,8 +279,10 @@ pub async fn start_tunnel(
         }
     }
 
-    // Target
-    command.arg(format!("{}@{}", host.user, host.hostname));
+    // Target — validate + `--` so a malicious/synced username cannot inject
+    // OpenSSH options (e.g. ProxyCommand) when the tunnel is started.
+    crate::hosts::validate_ssh_cli_identity(&host.user, &host.hostname)?;
+    crate::hosts::push_ssh_cli_destination(&mut command, &host.user, &host.hostname);
 
     // Spawn via PTY so we can handle password prompts
     let pty_system = portable_pty::native_pty_system();

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use crate::sync::backend::{SyncBackend, SyncError, TokenStore};
 use crate::sync::collections::CollectionKind;
-use crate::sync::payload::Manifest;
+use crate::sync::payload::{sha256_hex, Manifest};
 
 pub struct GoogleDriveBackend {
     token_store: Arc<dyn TokenStore>,
@@ -230,8 +230,19 @@ impl SyncBackend for GoogleDriveBackend {
         Ok(bytes)
     }
 
-    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError> {
+    fn fetch_collection(
+        &self,
+        name: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>, SyncError> {
         let token = self.get_token()?;
+        if let Some(sha) = expected_sha256.filter(|s| !s.is_empty()) {
+            let addressed = crate::sync::collections::collection_file_name(name, Some(sha));
+            if let Some(id) = find_file_id(&self.client, &token, &addressed).map_err(SyncError::Backend)?
+            {
+                return download_file(&self.client, &token, &id).map_err(SyncError::Backend);
+            }
+        }
         let file_name = CollectionKind::from_str(name)
             .map(|k| k.file_name())
             .unwrap_or_else(|| format!("col-{name}.blob"));
@@ -264,15 +275,25 @@ impl SyncBackend for GoogleDriveBackend {
         let token = self.get_token()?;
         self.cas_check(expected_blob_version)?;
 
+        // objectهای content-addressed؛ بازنده دیگه bytes برنده رو clobber نمی‌کنه
         for (name, bytes) in changed {
-            let file_name = CollectionKind::from_str(name)
-                .map(|k| k.file_name())
-                .unwrap_or_else(|| format!("col-{name}.blob"));
-            upsert_file(&self.client, &token, &file_name, bytes)?;
+            let sha = sha256_hex(bytes);
+            let addressed = crate::sync::collections::collection_file_name(name, Some(&sha));
+            upsert_file(&self.client, &token, &addressed, bytes)?;
         }
+
+        // دوباره چک — اگه کسی جلو زد، منیفست رو دست نزن (addressedها orphan می‌مونن)
+        self.cas_check(expected_blob_version)?;
 
         let manifest_bytes = serde_json::to_vec_pretty(manifest)?;
         upsert_file(&self.client, &token, "manifest.json", &manifest_bytes)?;
+
+        for (name, bytes) in changed {
+            let stable = CollectionKind::from_str(name)
+                .map(|k| k.file_name())
+                .unwrap_or_else(|| format!("col-{name}.blob"));
+            let _ = upsert_file(&self.client, &token, &stable, bytes);
+        }
 
         // Drop stale monolith if present
         if let Ok(Some(id)) = find_file_id(&self.client, &token, "vault.blob") {

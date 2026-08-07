@@ -78,7 +78,15 @@ pub trait SyncBackend: Send {
     /// manifest carries a collection index.
     fn fetch_blob(&self) -> Result<Vec<u8>, SyncError>;
     /// Fetch one Phase-C collection file (`col-<name>.blob`).
-    fn fetch_collection(&self, name: &str) -> Result<Vec<u8>, SyncError>;
+    ///
+    /// When `expected_sha256` is `Some`, backends that store content-addressed
+    /// objects (Dropbox) should prefer the immutable `col-<name>-<sha>.blob`
+    /// object so a concurrent loser cannot clobber the winner's bytes.
+    fn fetch_collection(
+        &self,
+        name: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>, SyncError>;
     /// `expected_blob_version = None` creates fresh; `Some(v)` is a
     /// compare-and-swap against the remote's current `blobVersion` where the
     /// backend supports it. A mismatch must return `Err(SyncError::Conflict)`.
